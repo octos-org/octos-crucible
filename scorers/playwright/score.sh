@@ -57,7 +57,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-[ -n "$ARTIFACT" ] && [ -n "$TESTS" ] && [ -n "$OUT" ] || usage
+if [ -z "$ARTIFACT" ] || [ -z "$TESTS" ] || [ -z "$OUT" ]; then usage; fi
 [ -f "$ARTIFACT" ] || die_usage "--artifact: no such file: $ARTIFACT"
 [ -d "$TESTS" ] || die_usage "--tests: no such directory: $TESTS"
 case "$VISIBILITY" in public|hidden) ;; *) die_usage "--visibility must be public or hidden" ;; esac
@@ -99,7 +99,7 @@ APP_SRC="$WORK/app_src"
 mkdir -p "$RESULTS" "$APP_SRC"
 [ "$RUN_AS" = "1000:1000" ] && chmod -R a+rwX "$WORK"
 
-# shellcheck disable=SC2329 # invoked via trap
+# shellcheck disable=SC2317,SC2329 # invoked via trap
 cleanup() {
   docker rm -f "$RUNNER_CTR" "$APP_CTR" >/dev/null 2>&1 || true
   docker network rm "$NET" >/dev/null 2>&1 || true

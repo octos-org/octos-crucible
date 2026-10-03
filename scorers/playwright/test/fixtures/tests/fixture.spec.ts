@@ -4,7 +4,7 @@ import { expect, test } from '@playwright/test';
 
 test('shows the heading', async ({ page }) => {
   await page.goto('/');
-  await expect(page.getByRole('heading', { name: 'Hello fixture' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Hello, world' })).toBeVisible();
 });
 
 test('button updates the page', async ({ page }) => {

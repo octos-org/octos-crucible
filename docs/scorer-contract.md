@@ -84,16 +84,36 @@ score.sh --artifact FILE --tests DIR --out result.json
 
 ## 6. Playwright 打分器（`scorers/playwright`）
 
-第一个实现，从原型评分器（arcbench-grader 的 `scripts/grade.sh` + `runner/` + `common/`）移植，行为对齐：
+第一个实现，从原型评分器（BH3GEI/arcbench-grader `main` 的 `scripts/grade.sh` + `runner/` + `common/`）移植。与旧自测站分数一致靠的是**锁定同样的参数**（下表），测试文件本身的一致性由题目包的块哈希保证。下表是固定值；`score.sh` 的超时参数只用于打分器自己的测试，正式评测（`crucible score`）不传，按默认值运行。
 
-| 项 | 值 |
-|---|---|
-| zip 检查 | 拒绝绝对路径、`..`、符号链接；≤2000 个文件；解压后 ≤50 MB；CRC 校验；不恢复权限位（与 Python `zipfile.extractall` 一致） |
-| 构建 | `docker build --network=none`，2 GB / 2 CPU，超时 600 s（`--build-timeout`）；有 buildx 时用 BuildKit |
-| 应用容器 | `--internal` 网络，512 MB、1 CPU、256 pids，`/tmp` 64 MB noexec，no-new-privileges |
-| 就绪 | 轮询 `GET /`，60 s（`--ready-timeout`） |
-| 测试 | Playwright 1.57.0 + Chromium（沙箱开启），retries 0，workers 2，单用例 60 s，整体 900 s（`--run-timeout`）；失败时截图 |
-| 重试 | 只在测试容器没产出报告就退出（打分器故障）时重试 1 次 |
+### 6.1 锁定的参数及来源
+
+| 参数 | 值 | 本仓库位置 | 旧评分器来源 |
+|---|---|---|---|
+| 基础镜像 | `node:24-bookworm-slim@sha256:0e0ff40c…f9b6`（多架构 index digest） | `image/Dockerfile` | `runner/Dockerfile`（同一 tag，旧版未钉 digest） |
+| Playwright | `@playwright/test@1.57.0` | `image/Dockerfile` | `runner/Dockerfile` `ARG PLAYWRIGHT_VERSION=1.57.0` |
+| 浏览器 | Chromium，随 Playwright 1.57.0 固定（Chromium 143.0.7499.4 / headless shell build v1200），`playwright install --with-deps chromium` | `image/Dockerfile` | `runner/Dockerfile` |
+| retries | 0 | `image/playwright.config.js` | `runner/playwright.config.js` |
+| workers | 2 | `image/playwright.config.js` | `runner/playwright.config.js` |
+| 单用例超时 | 60 s | `image/playwright.config.js` | `runner/playwright.config.js` |
+| 失败截图 | `screenshot: 'only-on-failure'`，headless，Chromium 沙箱开启 | `image/playwright.config.js` | `runner/playwright.config.js` |
+| 整体测试超时 | 900 s（含就绪等待） | `score.sh` `RUN_TIMEOUT_S` | `common/taskspec.py` `run_timeout_s` 默认值 |
+| 构建超时 | 600 s，超时即杀 | `score.sh` `BUILD_TIMEOUT_S` | `common/taskspec.py` `build_timeout_s` |
+| 就绪超时 | 60 s，每 0.5 s 轮询 `GET /`，HTTP 2xx 即就绪 | `score.sh` + `image/wait-ready.mjs` | `taskspec.py` `ready_timeout_s` + `runner/wait-ready.mjs` |
+| 应用端口 | 3000（`PORT` 环境变量） | `score.sh` `APP_PORT` | `taskspec.py` `app_port` |
+| 构建隔离 | `docker build --network=none`，2 GB 内存、2 CPU | `score.sh` 第 2 步 | `scripts/grade.sh` 第 3 步 |
+| 应用容器 | `--internal` 网络，512 MB（无 swap）、1 CPU、256 pids，`/tmp` 64 MB noexec，no-new-privileges，丢弃 NET_RAW 等 5 项 capability | `score.sh` 第 3 步 | `scripts/grade.sh` 第 4 步 |
+| 测试容器 | 2 GB、2 CPU、1024 pids、shm 1 GB，Playwright 官方 seccomp profile | `score.sh` 第 4 步、`seccomp_profile.json` | `scripts/grade.sh` 第 5 步、`runner/seccomp_profile.json` |
+| zip 检查 | 拒绝绝对路径、`..`、符号链接；≤2000 个文件；解压后 ≤50 MB；不恢复权限位 | `image/src/zip.ts` | `common/zipsafety.py`（+ Python `zipfile.extractall`） |
+| 用例展开与判定 | 每个 spec 一条；所有运行结果为 passed/expected 且 spec.ok 才算通过；错误文本去 ANSI、≤2000 字符 | `image/src/report.ts` | `common/resultshape.py` |
+| status / hidden 过滤 | 见第 4 节 | `image/src/report.ts`、`score.sh` | `scripts/parse_report.py`、`scripts/grade.sh` |
+| 重试 | 只在测试容器没产出报告就退出时重试 1 次 | `score.sh` | `scripts/grade.sh` |
+
+与旧评分器的已知差异（不影响打分）：镜像里把 `install --with-deps` 拆成两层以降低构建时的磁盘峰值；测试容器以调用者 uid 运行（便于清理）、直接调用全局 `playwright` 而不是 `npx playwright`；没有 buildx 时退回 legacy builder。
+
+### 6.2 计分
+
+每个阶段的分数固定为 **passed / total**：`total` 是 Playwright 报告里收集到的用例数，`passed` 是通过数。构建失败、应用没就绪、测试整体超时等情况下没有用例结果，`passed = total = 0`，该阶段记 0 分（展示时分母用题目包的 `expected_total`）。`system_error` 不计分，应重试。
 
 环境变量：`CRUCIBLE_SCORER_IMAGE`（用预构建镜像，默认现场构建 `image/`）、`CHROMIUM_SANDBOX=0`（宿主不支持非特权 user namespace 时关闭浏览器沙箱）、`CRUCIBLE_PRUNE_BUILD_CACHE=1`（一次性 CI 机器上打完清 build cache；默认关，因为会清掉整个 daemon 的缓存）。
 

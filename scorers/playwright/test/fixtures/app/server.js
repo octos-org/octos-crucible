@@ -4,7 +4,7 @@ const http = require('node:http');
 const page = `<!doctype html>
 <html><head><title>Fixture</title></head>
 <body>
-  <h1>Hello fixture</h1>
+  <h1>Hello, world</h1>
   <button id="b" onclick="document.getElementById('out').textContent = 'clicked'">Click me</button>
   <p id="out"></p>
 </body></html>`;
