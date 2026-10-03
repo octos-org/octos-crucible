@@ -213,62 +213,14 @@ jobs:
             --store "$STORE" --identity-env CRUCIBLE_AGE_KEY > "$RUNNER_TEMP/facts.json"
           echo "agent package fetched"
 
-      # Shared layer cache, builtin agents only. Uploaded agents (url:, git:,
-      # blob:) never read or write it: a submission could otherwise poison
-      # layers that later builds reuse. The cache needs the job's runtime
-      # token in the env of the build step; it is not a user secret, the
-      # package's RUN steps (BuildKit containers) never see it, and the
-      # build step clears it again for every later step.
-      - name: Set up the builtin agent layer cache
-        if: needs.setup.outputs.agent_kind == 'builtin'
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-        with:
-          cache-binary: false
-
-      - name: Expose the cache runtime to the build step
-        if: needs.setup.outputs.agent_kind == 'builtin'
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-        with:
-          script: |
-            for (const k of ['ACTIONS_CACHE_URL', 'ACTIONS_RESULTS_URL', 'ACTIONS_RUNTIME_TOKEN', 'ACTIONS_CACHE_SERVICE_V2']) {
-              if (process.env[k]) core.exportVariable(k, process.env[k]);
-            }
-
       - name: Build agent image (no secret on this machine)
         timeout-minutes: 60
-        env:
-          AGENT_KIND: ${{ needs.setup.outputs.agent_kind }}
         run: |
           set -euo pipefail
           # Nothing from the package runs on the host: it is the build
           # context, RUN steps execute in BuildKit containers.
-          opts=()
-          if [ "$AGENT_KIND" = builtin ]; then
-            # Scope = agent name + hash of its package + the upstream commit
-            # its Dockerfile builds (agents/<name>/upstream.json, resolved
-            # here and pinned as a build arg), so a new commit upstream never
-            # reuses stale layers.
-            name=${AGENT_SOURCE#builtin:}
-            pkg_hash=$(cd "$RUNNER_TEMP/agent-pkg" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -c1-12)
-            scope="builtin-$name-$pkg_hash"
-            up="$RUNNER_TEMP/agent-pkg/upstream.json"
-            if [ -f "$up" ]; then
-              repo=$(jq -r .repo "$up"); ref=$(jq -r .ref "$up"); arg=$(jq -r .build_arg "$up")
-              commit=$(git ls-remote "$repo" "$ref" | head -n1 | cut -f1)
-              [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::cannot resolve $repo $ref"; exit 1; }
-              opts+=(--build-arg "$arg=$commit")
-              scope="$scope-${commit:0:12}"
-            fi
-            opts+=(--cache-scope "$scope")
-            echo "layer cache scope: $scope"
-          fi
-          rc=0
-          "$CRUCIBLE" build --pkg "$RUNNER_TEMP/agent-pkg" --tag crucible-agent:run "${opts[@]}" 2> "$RUNNER_TEMP/build.log" > "$RUNNER_TEMP/build.json" || rc=$?
-          for k in ACTIONS_CACHE_URL ACTIONS_RESULTS_URL ACTIONS_RUNTIME_TOKEN ACTIONS_CACHE_SERVICE_V2; do
-            echo "$k=" >> "$GITHUB_ENV"
-          done
-          if [ "$rc" -ne 0 ]; then echo "::error::agent image build failed"; tail -c 3000 "$RUNNER_TEMP/build.log"; exit 1; fi
-          grep -cE '^#[0-9]+ CACHED' "$RUNNER_TEMP/build.log" | sed 's/^/cached build steps: /' || true
+          "$CRUCIBLE" build --pkg "$RUNNER_TEMP/agent-pkg" --tag crucible-agent:run 2> "$RUNNER_TEMP/build.log" > "$RUNNER_TEMP/build.json" \
+            || { echo "::error::agent image build failed"; tail -c 3000 "$RUNNER_TEMP/build.log"; exit 1; }
           jq -c '{size_bytes}' "$RUNNER_TEMP/build.json"
 
       - name: Fetch stage inputs (never the tests)

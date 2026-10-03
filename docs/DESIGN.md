@@ -92,7 +92,6 @@ octos-crucible 是评测 coding agent 的基础设施：运行 agent、计量、
 - 上传的代码只在容器里运行；宿主机只执行平台自己的代码。
 - 每个 job 只拿它需要的东西：生成 job 拿不到题目；打分 job 不运行 agent；只有发布 job 有写仓库权限。workflow 顶层 `permissions: {}`。
 - 所有输入经正则校验后通过 env 传入 shell，不做表达式拼接。
-- 构建缓存：`crucible` 只在 setup job 编译一次（`actions/cache` 缓存依赖与 target），作为 artifact 交给 generate 和 publish。内置 agent（`builtin:`）的镜像用 `docker buildx` 的 GitHub Actions 层缓存，作用域 = agent 名 + 包内容哈希 + 上游源码 commit（`agents/<name>/upstream.json` 声明的仓库与分支，构建时解析为 commit 并作为 build arg 固定），上游一有新 commit 就换作用域，不会复用过期的层。用户上传的 agent（`url:`/`git:`/`blob:`）不读也不写共享缓存，防止一个提交投毒其他构建所复用的层。缓存所需的运行时令牌只在构建步骤的环境里，构建完即清空。
 - 已知残余风险：容器逃逸可拿到该机器上的模型 key 和私钥。缓解：机器一次性使用、key 用完即删、钥匙可更换。
 - 已知残余风险：只有一对钥匙，题目包的 inputs 块和 tests 块用同一把公钥加密，生成 job 为了解开 inputs 块持有私钥，因此技术上也能解开 tests 块。"生成 job 拿不到题目"靠的是生成 job 只下载 inputs 块（`crucible taskset inputs` 只读 `inputs_blob`），不是密码学隔离。要做到密码学隔离需为 tests 块单设一把只在打分 job 使用的钥匙。
 

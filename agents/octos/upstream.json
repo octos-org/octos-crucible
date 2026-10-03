@@ -1,5 +1,0 @@
-{
-  "repo": "https://github.com/octos-org/octos-arc",
-  "ref": "refs/heads/main",
-  "build_arg": "AGENT_REF"
-}

@@ -39,72 +39,10 @@ pub fn docker() -> Command {
     c
 }
 
-/// Optional build settings. `cache_scope` turns on the shared GitHub
-/// Actions layer cache (`docker buildx`, `type=gha`): the workflow passes it
-/// for builtin agents only. Uploaded agents never read or write a shared
-/// cache, so one submission cannot poison the layers another one builds on.
-#[derive(Debug, Default)]
-pub struct BuildOpts {
-    /// `KEY=VALUE` build args (e.g. a builtin agent's pinned upstream commit).
-    pub build_args: Vec<String>,
-    pub cache_scope: Option<String>,
-}
-
-/// Environment the buildx `gha` cache backend needs (GitHub Actions only).
-const GHA_CACHE_ENV: [&str; 4] = [
-    "ACTIONS_CACHE_URL",
-    "ACTIONS_RESULTS_URL",
-    "ACTIONS_RUNTIME_TOKEN",
-    "ACTIONS_CACHE_SERVICE_V2",
-];
-
-fn check_opts(o: &BuildOpts) -> Result<()> {
-    for a in &o.build_args {
-        let ok = a.split_once('=').is_some_and(|(k, v)| {
-            !k.is_empty()
-                && k.chars()
-                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
-                && !v.is_empty()
-                && v.len() <= 200
-                && v.chars()
-                    .all(|c| c.is_ascii_alphanumeric() || "._/-".contains(c))
-        });
-        if !ok {
-            bail!("--build-arg must be KEY=VALUE ([A-Z0-9_]=[A-Za-z0-9._/-]+)");
-        }
-    }
-    if let Some(s) = &o.cache_scope {
-        let ok = !s.is_empty()
-            && s.len() <= 128
-            && s.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
-            && s.chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "._-".contains(c));
-        if !ok {
-            bail!("--cache-scope must match [a-z0-9][a-z0-9._-]{{0,127}}");
-        }
-    }
-    Ok(())
-}
-
-pub fn build_args(pkg: &Path, tag: &str, buildkit: bool, o: &BuildOpts) -> Vec<String> {
-    let mut a: Vec<String> = match &o.cache_scope {
-        Some(scope) => vec![
-            "buildx".into(),
-            "build".into(),
-            "--load".into(),
-            "--cache-from".into(),
-            format!("type=gha,scope={scope}"),
-            "--cache-to".into(),
-            format!("type=gha,mode=max,scope={scope}"),
-        ],
-        None => vec!["build".into()],
-    };
-    a.extend(["--label".into(), "crucible.agent=1".into()]);
+pub fn build_args(pkg: &Path, tag: &str, buildkit: bool) -> Vec<String> {
+    let mut a: Vec<String> = vec!["build".into(), "--label".into(), "crucible.agent=1".into()];
     if buildkit {
         a.push("--progress=plain".into());
-    }
-    for b in &o.build_args {
-        a.extend(["--build-arg".into(), b.clone()]);
     }
     a.extend([
         "-t".into(),
@@ -115,24 +53,12 @@ pub fn build_args(pkg: &Path, tag: &str, buildkit: bool, o: &BuildOpts) -> Vec<S
     a
 }
 
-pub fn build(pkg: &Path, tag: &str, opts: &BuildOpts) -> Result<BuildFacts> {
+pub fn build(pkg: &Path, tag: &str) -> Result<BuildFacts> {
     crate::agentpkg::validate(pkg)?;
-    check_opts(opts)?;
     // DOCKER_BUILDKIT=0 only for local smoke tests on hosts without buildx.
     let buildkit = std::env::var("DOCKER_BUILDKIT").map_or(true, |v| v != "0");
-    if opts.cache_scope.is_some() && !buildkit {
-        bail!("--cache-scope needs BuildKit");
-    }
-    let mut cmd = docker();
-    if opts.cache_scope.is_some() {
-        for k in GHA_CACHE_ENV {
-            if let Some(v) = std::env::var_os(k) {
-                cmd.env(k, v);
-            }
-        }
-    }
-    let status = cmd
-        .args(build_args(pkg, tag, buildkit, opts))
+    let status = docker()
+        .args(build_args(pkg, tag, buildkit))
         .env("DOCKER_BUILDKIT", if buildkit { "1" } else { "0" })
         // Build output goes to stderr so stdout stays machine-readable.
         .stdout(Stdio::from(std::io::stderr()))
@@ -193,68 +119,11 @@ fn agent_build_json(tag: &str) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn args() {
-        let a = build_args(
-            Path::new("/tmp/pkg"),
-            "crucible-agent:run",
-            true,
-            &BuildOpts::default(),
-        );
-        assert_eq!(a[0], "build");
+        let a = super::build_args(std::path::Path::new("/tmp/pkg"), "crucible-agent:run", true);
         assert_eq!(a.last().unwrap(), "/tmp/pkg");
         assert!(a.contains(&"--".to_string()));
-        assert!(
-            !a.iter()
-                .any(|x| x.contains("secret") || x.contains("cache"))
-        );
-    }
-
-    #[test]
-    fn cached_args() {
-        let o = BuildOpts {
-            build_args: vec!["AGENT_REF=0123abc".into()],
-            cache_scope: Some("builtin-octos-0123abc".into()),
-        };
-        check_opts(&o).unwrap();
-        let a = build_args(Path::new("/tmp/pkg"), "t", true, &o);
-        assert_eq!(&a[..3], ["buildx", "build", "--load"]);
-        assert!(a.contains(&"type=gha,scope=builtin-octos-0123abc".to_string()));
-        assert!(a.contains(&"type=gha,mode=max,scope=builtin-octos-0123abc".to_string()));
-        assert!(
-            a.windows(2)
-                .any(|w| w == ["--build-arg", "AGENT_REF=0123abc"])
-        );
-        assert_eq!(a.last().unwrap(), "/tmp/pkg");
-    }
-
-    #[test]
-    fn opts_rejected() {
-        for o in [
-            BuildOpts {
-                build_args: vec!["x=1".into()],
-                cache_scope: None,
-            },
-            BuildOpts {
-                build_args: vec!["A=$(id)".into()],
-                cache_scope: None,
-            },
-            BuildOpts {
-                build_args: vec!["A".into()],
-                cache_scope: None,
-            },
-            BuildOpts {
-                build_args: vec![],
-                cache_scope: Some("Bad,scope=x".into()),
-            },
-            BuildOpts {
-                build_args: vec![],
-                cache_scope: Some("-x".into()),
-            },
-        ] {
-            assert!(check_opts(&o).is_err(), "{o:?}");
-        }
+        assert!(!a.iter().any(|x| x.contains("secret")));
     }
 }

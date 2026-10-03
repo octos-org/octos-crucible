@@ -140,12 +140,6 @@ enum Cmd {
         pkg: PathBuf,
         #[arg(long, default_value = "crucible-agent:run")]
         tag: String,
-        /// KEY=VALUE build arg (repeatable).
-        #[arg(long = "build-arg")]
-        build_arg: Vec<String>,
-        /// Shared GitHub Actions layer cache scope (builtin agents only).
-        #[arg(long)]
-        cache_scope: Option<String>,
     },
     /// Run the agent stage by stage. Reads {"api_key","endpoint"} as one JSON line on stdin.
     Run(Box<run::RunArgs>),
@@ -390,17 +384,8 @@ async fn run(cmd: Cmd) -> Result<()> {
             println!("{}", serde_json::to_string(&facts)?);
             Ok(())
         }
-        Cmd::Build {
-            pkg,
-            tag,
-            build_arg,
-            cache_scope,
-        } => {
-            let opts = build::BuildOpts {
-                build_args: build_arg,
-                cache_scope,
-            };
-            let facts = build::build(&pkg, &tag, &opts)?;
+        Cmd::Build { pkg, tag } => {
+            let facts = build::build(&pkg, &tag)?;
             println!("{}", serde_json::to_string(&facts)?);
             Ok(())
         }
