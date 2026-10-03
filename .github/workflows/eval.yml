@@ -323,7 +323,6 @@ jobs:
               --out-dir "$RUNNER_TEMP/run/$REPLICA" --scratch-dir "$RUNNER_TEMP/scratch" \
               --pricing config/pricing.json --egress-allow config/egress.json \
               2> >(progress)
-          wait $! || true
 
       - name: Stop containers and sandbox network
         if: always()
