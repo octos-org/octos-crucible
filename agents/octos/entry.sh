@@ -19,9 +19,14 @@ echo "Actions ARC-Bench workspace assembled successfully." > /workspace/executio
 # Octos raises the budget to 200 s per requirement node if that is larger;
 # the platform stops the container at DEADLINE_S regardless, and octos
 # delivers accepted progress to /work every minute.
-reserve=300
-budget=$(( ${DEADLINE_S:-3600} - reserve - 1200 ))
-[ "$budget" -lt 600 ] && budget=600
+# Short stages (e.g. the 600 s demo-todo smoke task) scale both down so the
+# run still ends near the deadline; ARC-sized stages keep 300 + 1200 s.
+deadline=${DEADLINE_S:-3600}
+reserve=$(( deadline / 6 )); [ "$reserve" -gt 300 ] && reserve=300
+tail_s=$(( deadline / 3 )); [ "$tail_s" -gt 1200 ] && tail_s=1200
+budget=$(( deadline - reserve - tail_s ))
+floor=$(( deadline / 2 )); [ "$floor" -gt 600 ] && floor=600
+[ "$budget" -lt "$floor" ] && budget=$floor
 export OCTOS_TIME_BUDGET="${OCTOS_TIME_BUDGET:-$budget}"
 export OCTOS_ARC_FINAL_RESERVE="${OCTOS_ARC_FINAL_RESERVE:-$reserve}"
 

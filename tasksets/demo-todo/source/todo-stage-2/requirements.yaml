@@ -1,0 +1,63 @@
+id: ROOT
+name: Todo List - Stage 2
+type: FOLDER
+dependencies: []
+description: This product is a minimal single-page todo list web application served
+  at the application home page `/`. Every quoted user-interface name is the exact
+  English accessible name of the control. The application already exists from the
+  previous stage and must keep working unchanged; the home page shows the level-1
+  heading “Todos”, a list named “Todo list” with one list item per todo (oldest first),
+  a textbox named “New todo” and a button named “Add” that add a todo (also with Enter),
+  and the message “Todo text is required” for an empty text. Todos are stored by the
+  backend, shared by all browser sessions, and remain after a page reload. This stage
+  adds completing and deleting todos; both changes are stored in the backend.
+children:
+- id: REQ-2
+  name: Todo Management
+  type: FOLDER
+  dependencies: []
+  description: Every list item in “Todo list” gains a completion checkbox and a delete
+    button. A todo now has a text and a completed flag; todos created before this
+    stage, and new todos, start as not completed.
+  children:
+  - id: REQ-2-1
+    name: Mark a Todo Complete
+    type: ATOMIC
+    dependencies: []
+    description: |-
+      Each list item contains one checkbox (role `checkbox`, for example `<input type="checkbox">`) whose accessible name is exactly the todo's text (for example wrapped in a `<label>` together with the text, or `aria-label` set to the text). The checkbox is unchecked for a todo that is not completed. Checking it marks the todo completed in the backend and its text is shown struck through (`text-decoration: line-through`); unchecking it marks the todo not completed again and removes the strike-through. The completed state is kept after a page reload.
+    scenarios:
+    - name: 'REQ-2-1: Mark a Todo Complete - Scenario 1'
+      steps:
+      - keyword: GIVEN
+        content: 'A todo `Pay rent` has been added and is shown with an unchecked checkbox
+          named `Pay rent`.'
+      - keyword: WHEN
+        content: 'The visitor checks the checkbox `Pay rent` and reloads the page.'
+      - keyword: THEN
+        content: 'The checkbox `Pay rent` is checked.'
+    - name: 'REQ-2-1: Mark a Todo Complete - Scenario 2'
+      steps:
+      - keyword: GIVEN
+        content: 'The todo `Pay rent` is completed.'
+      - keyword: WHEN
+        content: 'The visitor unchecks the checkbox `Pay rent` and reloads the page.'
+      - keyword: THEN
+        content: 'The checkbox `Pay rent` is unchecked.'
+  - id: REQ-2-2
+    name: Delete a Todo
+    type: ATOMIC
+    dependencies:
+    - REQ-2-1
+    description: |-
+      Each list item contains one button whose accessible name is “Delete ” followed by the todo's text (for example `aria-label="Delete Pay rent"`; the visible label may be “Delete” or an icon). Clicking it removes that todo from the backend and its list item from “Todo list” immediately, without a confirmation dialog. Other todos are not affected. The deleted todo stays gone after a page reload.
+    scenarios:
+    - name: 'REQ-2-2: Delete a Todo - Scenario 1'
+      steps:
+      - keyword: GIVEN
+        content: 'Todos `Old task` and `Keep task` have been added.'
+      - keyword: WHEN
+        content: 'The visitor clicks the button “Delete Old task”.'
+      - keyword: THEN
+        content: 'The list no longer shows `Old task` and still shows `Keep task`; the
+          same holds after the page is reloaded.'
