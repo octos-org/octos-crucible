@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "name": "hello-world",
+  "description": "Placeholder task for smoke runs: a page that says \"Hello, world\" (stage 1) and then also \"Stage 2\" (stage 2). Requirements and tests are public (source/). Scored with Playwright browser tests (1 / 1).",
+  "scorer": {"name": "playwright"},
+  "aggregate": "sum",
+  "total_time_limit_s": 360,
+  "stages": [
+    {"id": "stage-1", "dir": "hello-stage-1", "inputs": ["requirements.yaml"], "tests": ["tests"], "output": "web-app", "time_limit_s": 180, "expected_total": 1},
+    {"id": "stage-2", "dir": "hello-stage-2", "inputs": ["requirements.yaml"], "tests": ["tests"], "output": "web-app", "time_limit_s": 180, "expected_total": 1}
+  ]
+}

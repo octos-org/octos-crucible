@@ -1,0 +1,22 @@
+id: ROOT
+name: Hello World - Stage 2
+type: FOLDER
+dependencies: []
+description: This product is a minimal web page served at the application home page
+  `/`. The page already exists from the previous stage and visibly shows “Hello, world”;
+  it must keep doing so. This stage adds one more line of text.
+children:
+- id: REQ-2
+  name: Stage 2 Line
+  type: ATOMIC
+  dependencies: []
+  description: |-
+    The application home page `/` visibly shows, in addition to the existing text “Hello, world”, a separate line with exactly the text “Stage 2” (for example a paragraph below the heading).
+  scenarios:
+  - name: 'REQ-2: Stage 2 Line - Scenario 1'
+    steps:
+    - keyword: GIVEN
+      content: 'A visitor opens the application home page in a fresh browser session.'
+    - keyword: THEN
+      content: 'The page visibly shows the text “Hello, world” and, as a separate line,
+        the text “Stage 2”.'

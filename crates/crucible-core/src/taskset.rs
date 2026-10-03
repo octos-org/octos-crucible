@@ -1,7 +1,18 @@
 //! `taskset.json`: the stages of a task set, its scorer and how stage
 //! scores add up.
+//!
+//! Each stage has two sealed blobs in the store: `inputs_blob` (a zip of
+//! what the agent gets in `/req`) and `tests_blob` (a zip of the hidden test
+//! material, read only by the scoring job). The generation job downloads
+//! only `inputs_blob`.
 
 use serde::{Deserialize, Serialize};
+
+use crate::blob::BlobRef;
+
+/// Platform limit on the summed stage time of one run (all stages run back
+/// to back on one machine, inside a 6 h GitHub job).
+pub const MAX_TOTAL_TIME_S: u64 = 18_000;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskSet {
@@ -12,6 +23,9 @@ pub struct TaskSet {
     pub scorer: ScorerRef,
     #[serde(default)]
     pub aggregate: Aggregate,
+    /// Declared wall clock of a whole run; at least the sum of the stage
+    /// limits and at most [`MAX_TOTAL_TIME_S`].
+    pub total_time_limit_s: u64,
     pub stages: Vec<Stage>,
 }
 
@@ -34,9 +48,10 @@ pub enum Aggregate {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Stage {
     pub id: String,
-    /// Paths inside the taskset package handed to the agent for this stage
-    /// (read-only); typically the stage's requirement document.
-    pub inputs: Vec<String>,
+    /// Sealed zip unpacked read-only into `/req` for this stage.
+    pub inputs_blob: BlobRef,
+    /// Sealed zip of the hidden test material for this stage.
+    pub tests_blob: BlobRef,
     pub output: OutputKind,
     pub time_limit_s: u64,
     /// Number of tests the scorer is expected to report. A mismatch is
@@ -47,9 +62,10 @@ pub struct Stage {
 
 /// What the agent must leave in its working directory at the end of a stage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "kebab-case")]
 pub enum OutputKind {
-    /// A runnable web app (frontend + backend) served for browser tests.
+    /// A runnable web app (frontend + backend) served for browser tests;
+    /// packaged as a zip with a Dockerfile at its root.
     WebApp,
     /// Arbitrary files, scored by a script or unit tests.
     Files,
@@ -69,19 +85,21 @@ pub enum TaskSetError {
     DuplicateStage(String),
     #[error("taskset: stage {0:?} needs time_limit_s > 0")]
     TimeLimit(String),
-    #[error("taskset: stage {0:?} input {1:?} must be a relative path without '..'")]
-    Input(String, String),
+    #[error("taskset: stage {0:?} has an invalid blob reference")]
+    Blob(String),
+    #[error("taskset: stage limits add up to {sum_s}s, more than total_time_limit_s {total_s}s")]
+    StagesExceedTotal { sum_s: u64, total_s: u64 },
     #[error("taskset: total time {total_s}s exceeds the platform limit {max_s}s")]
     TooLong { total_s: u64, max_s: u64 },
 }
 
 impl TaskSet {
-    pub fn total_time_s(&self) -> u64 {
+    /// Sum of the stage limits.
+    pub fn stage_time_s(&self) -> u64 {
         self.stages.iter().map(|s| s.time_limit_s).sum()
     }
 
-    /// Registration check. `max_total_s` is the platform's per-run wall
-    /// clock limit (all stages run back to back on one machine).
+    /// Registration check against the platform's per-run limit.
     pub fn validate(&self, max_total_s: u64) -> Result<(), TaskSetError> {
         if self.schema != 1 {
             return Err(TaskSetError::Schema);
@@ -103,20 +121,20 @@ impl TaskSet {
             if s.time_limit_s == 0 {
                 return Err(TaskSetError::TimeLimit(s.id.clone()));
             }
-            for i in &s.inputs {
-                let bad = i.is_empty()
-                    || i.starts_with('/')
-                    || i.contains('\\')
-                    || i.split('/').any(|c| c == "..");
-                if bad {
-                    return Err(TaskSetError::Input(s.id.clone(), i.clone()));
-                }
+            if !s.inputs_blob.is_valid() || !s.tests_blob.is_valid() {
+                return Err(TaskSetError::Blob(s.id.clone()));
             }
         }
-        let total_s = self.total_time_s();
-        if total_s > max_total_s {
+        let sum_s = self.stage_time_s();
+        if sum_s > self.total_time_limit_s {
+            return Err(TaskSetError::StagesExceedTotal {
+                sum_s,
+                total_s: self.total_time_limit_s,
+            });
+        }
+        if self.total_time_limit_s > max_total_s {
             return Err(TaskSetError::TooLong {
-                total_s,
+                total_s: self.total_time_limit_s,
                 max_s: max_total_s,
             });
         }
@@ -128,47 +146,78 @@ impl TaskSet {
 mod tests {
     use super::*;
 
-    const GITHUB: &str = r#"{
-      "schema": 1,
-      "name": "github-full",
-      "scorer": {"name": "playwright"},
-      "aggregate": "sum",
-      "stages": [
-        {"id": "stage-1", "inputs": ["stage-1/requirements.md"], "output": "web_app", "time_limit_s": 3600, "expected_total": 30},
-        {"id": "stage-2", "inputs": ["stage-2/requirements.md"], "output": "web_app", "time_limit_s": 3600, "expected_total": 29}
-      ]
-    }"#;
+    fn blob(c: char) -> String {
+        format!(
+            r#"{{"sha256":"{}","key_id":"1ffa702796eb5ee8"}}"#,
+            c.to_string().repeat(64)
+        )
+    }
+
+    fn github() -> String {
+        format!(
+            r#"{{
+          "schema": 1,
+          "name": "github-full",
+          "scorer": {{"name": "playwright"}},
+          "aggregate": "sum",
+          "total_time_limit_s": 9600,
+          "stages": [
+            {{"id": "stage-1", "inputs_blob": {a}, "tests_blob": {b}, "output": "web-app", "time_limit_s": 4800, "expected_total": 30}},
+            {{"id": "stage-2", "inputs_blob": {c}, "tests_blob": {d}, "output": "web-app", "time_limit_s": 4800, "expected_total": 29}}
+          ]
+        }}"#,
+            a = blob('a'),
+            b = blob('b'),
+            c = blob('c'),
+            d = blob('d')
+        )
+    }
 
     #[test]
     fn parse_and_validate() {
-        let t: TaskSet = serde_json::from_str(GITHUB).unwrap();
-        assert_eq!(t.total_time_s(), 7200);
-        t.validate(6 * 3600).unwrap();
+        let t: TaskSet = serde_json::from_str(&github()).unwrap();
+        assert_eq!(t.stage_time_s(), 9600);
+        assert_eq!(t.stages[0].output, OutputKind::WebApp);
+        t.validate(MAX_TOTAL_TIME_S).unwrap();
         assert_eq!(
             t.validate(3600),
             Err(TaskSetError::TooLong {
-                total_s: 7200,
+                total_s: 9600,
                 max_s: 3600
             })
         );
+        let mut t2 = t.clone();
+        t2.total_time_limit_s = 9000;
+        assert!(matches!(
+            t2.validate(MAX_TOTAL_TIME_S),
+            Err(TaskSetError::StagesExceedTotal { .. })
+        ));
+        let mut t3 = t;
+        t3.total_time_limit_s = MAX_TOTAL_TIME_S + 1;
+        assert!(matches!(
+            t3.validate(MAX_TOTAL_TIME_S),
+            Err(TaskSetError::TooLong { .. })
+        ));
     }
 
     #[test]
     fn rejects_bad_stages() {
-        let mut t: TaskSet = serde_json::from_str(GITHUB).unwrap();
+        let base: TaskSet = serde_json::from_str(&github()).unwrap();
+        let mut t = base.clone();
         t.stages[1].id = "stage-1".into();
         assert!(matches!(
             t.validate(1 << 20),
             Err(TaskSetError::DuplicateStage(_))
         ));
-        let mut t: TaskSet = serde_json::from_str(GITHUB).unwrap();
-        t.stages[0].inputs = vec!["../secret".into()];
-        assert!(matches!(t.validate(1 << 20), Err(TaskSetError::Input(..))));
-        let mut t: TaskSet = serde_json::from_str(GITHUB).unwrap();
+        let mut t = base.clone();
+        t.stages[0].tests_blob.sha256 = "xyz".into();
+        assert!(matches!(t.validate(1 << 20), Err(TaskSetError::Blob(_))));
+        let mut t = base;
         t.stages[0].time_limit_s = 0;
         assert!(matches!(
             t.validate(1 << 20),
             Err(TaskSetError::TimeLimit(_))
         ));
+        assert!(serde_json::from_str::<OutputKind>("\"web_app\"").is_err());
     }
 }

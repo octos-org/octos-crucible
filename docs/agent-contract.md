@@ -46,27 +46,39 @@ my-agent/
 | `version` | 否 | 自由文本，记入评测清单；缺省 `"0"` |
 | `entrypoint` | 否 | 每个阶段执行的命令（字符串数组）；缺省用镜像自己的 ENTRYPOINT/CMD |
 | `streaming` | 否 | agent 以 `stream: true` 调模型时设为 `true`。计量代理会在请求没带 `stream_options` 时补上 `include_usage`，以便统计 token |
+| `app_start_cmd` | 否 | 仅用于产出类型 `web-app` 且 `/work` 根目录没有 `Dockerfile` 时：平台生成的 Dockerfile 的 CMD（在 `backend/` 下执行）。缺省 `["npm", "start"]` |
 
 类型定义见 `crates/crucible-core/src/agent.rs`（`AgentSpec`）。
 
+内置 agent 若从另一个仓库构建，可在包里带 `upstream.json`（`{"repo", "ref", "build_arg"}`）：平台构建前用 `git ls-remote` 把 `ref` 解析为完整 commit，经 `--build-arg <build_arg>=<commit>` 构建，构建后核对镜像里 `/agent-build.json` 的 `commit` 与之相同（不同则失败），并把它记入评测清单。上传的 agent 忽略此文件。
+
 ## 运行环境
 
-每个阶段，平台在同一个容器配置下执行一次 `entrypoint`：
+每个阶段，平台在同一个容器配置下执行一次 `entrypoint`（每阶段一个新容器，同一个镜像）。
 
-| | |
+| 环境变量 | 含义 |
 |---|---|
-| 当前目录 `/work` | 工作目录，可写；阶段之间保留 |
-| `/req` | 本阶段的需求（题目包为该阶段声明的 inputs），只读 |
-| `HOME` | 可写；阶段之间保留 |
-| `OPENAI_BASE_URL` | 计量代理地址，只提供 `POST {base}/chat/completions` |
+| `REQ_DIR` | 需求目录，固定为 `/req`，只读：本阶段的需求（题目包为该阶段声明的 inputs） |
+| `WORK_DIR` | 工作目录，固定为 `/work`，也是当前目录；可写；阶段之间原样保留 |
+| `OPENAI_BASE_URL` | 计量代理地址（如 `http://172.31.250.1:8787/v1`），只提供 `POST {base}/chat/completions` |
 | `OPENAI_API_KEY` | `dummy`。真 key 只在计量代理里，从不进入容器 |
 | `MODEL` | 要请求的模型名；请求其他模型返回 403 |
-| `DEADLINE_S` | 本阶段的时限（秒），请在此之前自行退出 |
-| `HTTPS_PROXY` / `HTTP_PROXY` | 出网代理，只能访问 npm 和 PyPI |
+| `DEADLINE_S` | 本阶段的时限（秒，从容器启动算起），请在此之前自行退出 |
 
-限制：2 GB 内存、1 核、非 root、`cap-drop ALL`、`no-new-privileges`。除计量代理和白名单软件源外没有网络。看不到测试。超时后先 SIGTERM，再 SIGKILL。阶段内平台每 15 分钟对 `/work` 自动快照；被强制结束时用最后一份快照打分，agent 无需配合。
+另外：`HOME=/home/agent`（可写，阶段之间保留）；`HTTPS_PROXY`/`HTTP_PROXY`（出网代理，只能访问 npm 和 PyPI）；`NO_PROXY` 包含计量代理地址。
 
-计量代理的返回：上游的 429/500 原样透传；用户设置了预算且已用完时返回 429，`error.type` 为 `budget_exceeded`。
+限制：2 GB 内存（无 swap）、1 核、1024 个进程、非 root、`cap-drop ALL`、`no-new-privileges`。除计量代理和白名单软件源外没有网络，也没有 DNS。看不到测试。到时限先 SIGTERM，30 秒后 SIGKILL。阶段内平台每 15 分钟对 `/work` 自动快照；agent 自行退出时用 `/work` 的最终状态作为该阶段产出，被强制结束时用最后一份快照，agent 无需配合。
+
+计量代理的返回：上游的 429/500 原样透传；用户设置了预算且已用完时返回 429，`error.type` 为 `budget_exceeded`。预算按整次评测计，跨阶段累计。
+
+## 产出
+
+阶段结束时 `/work` 的内容按题目包声明的产出类型打包（符号链接一律丢弃，`.git` 不打包）：
+
+- `web-app`：打成根目录带 `Dockerfile` 的 zip，打分器用 `--network=none` 构建并在 3000 端口访问。
+  - `/work` 根目录有 `Dockerfile`：整个 `/work` 原样打包。
+  - 否则（ARC-Bench 约定）：打包 `frontend/` 与 `backend/`（不含 `frontend/node_modules`），平台补一个 Dockerfile：`FROM node:24-bookworm-slim`、`WORKDIR /app/backend`、`PORT=3000`、`CMD <app_start_cmd>`。运行时需要的依赖（如 `backend/node_modules`、前端 `dist/`）要留在 `/work` 里。
+- `files`：整个 `/work`。
 
 ## 示例：my-agent
 

@@ -17,6 +17,8 @@ Design: [docs/DESIGN.md](docs/DESIGN.md) · Agent packages: [docs/agent-contract
 | `crucible-report` | usage pricing, multi-replica / multi-stage statistics |
 | `crucible-cli` | the `crucible` binary |
 
+Other directories: `agents/` (builtin agent packages, same format as uploads), `tasksets/<name>/` (`source.json` = how a source tree is cut into sealed inputs/tests blobs; `taskset.json` = the registered result of `crucible taskset pack`), `tools/sandbox-net.sh` (agent network sandbox on the runner), `.github/workflows/eval.yml` (generation: setup → generate × replicas → publish).
+
 Config: `config/pricing.json` (public prices, USD per 1M tokens), `config/egress.json` (package registries the agent may reach).
 
 ## Build and test

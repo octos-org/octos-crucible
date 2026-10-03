@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "name": "arcbench-github",
+  "description": "ARC-Bench GitHub task: a simplified GitHub collaboration platform built in three cumulative stages (identity and organizations; repositories and code; collaboration). Scored with Playwright browser tests (30 / 29 / 41).",
+  "scorer": {"name": "playwright"},
+  "aggregate": "sum",
+  "total_time_limit_s": 15600,
+  "stages": [
+    {"id": "stage-1", "dir": "github-stage-1", "inputs": ["requirements.yaml", "reference"], "tests": ["tests"], "output": "web-app", "time_limit_s": 4800, "expected_total": 30},
+    {"id": "stage-2", "dir": "github-stage-2", "inputs": ["requirements.yaml", "reference"], "tests": ["tests"], "output": "web-app", "time_limit_s": 4800, "expected_total": 29},
+    {"id": "stage-3", "dir": "github-stage-3", "inputs": ["requirements.yaml", "reference"], "tests": ["tests"], "output": "web-app", "time_limit_s": 6000, "expected_total": 41}
+  ]
+}

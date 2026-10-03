@@ -34,6 +34,6 @@ sha2 = "0.10"
 hex = "0.4"
 age = "0.12"
 zip = { version = "8.6", default-features = false, features = ["aes-crypto", "deflate"] }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 tempfile = "3"
 wiremock = "0.6"

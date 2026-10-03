@@ -1,0 +1,40 @@
+{
+  "schema": 1,
+  "name": "hello-world",
+  "description": "Placeholder task for smoke runs: a page that says \"Hello, world\" (stage 1) and then also \"Stage 2\" (stage 2). Requirements and tests are public (source/). Scored with Playwright browser tests (1 / 1).",
+  "scorer": {
+    "name": "playwright"
+  },
+  "aggregate": "sum",
+  "total_time_limit_s": 360,
+  "stages": [
+    {
+      "id": "stage-1",
+      "inputs_blob": {
+        "sha256": "cfde08648104255de8a0fab14a7a80c8e1a7c59e12f261e9b2933edcd5498324",
+        "key_id": "1ffa702796eb5ee8"
+      },
+      "tests_blob": {
+        "sha256": "c7079409ecf2f6eb8b2bca9002ce751293a32746e7edf73f8df69cfec1592e7f",
+        "key_id": "1ffa702796eb5ee8"
+      },
+      "output": "web-app",
+      "time_limit_s": 180,
+      "expected_total": 1
+    },
+    {
+      "id": "stage-2",
+      "inputs_blob": {
+        "sha256": "21737d1bb3fab7fac0d73e710194d841ab5e1c163541ab72a7bd2ab84a022e49",
+        "key_id": "1ffa702796eb5ee8"
+      },
+      "tests_blob": {
+        "sha256": "487430f434cbe794b1fc70bbf5ec6496a0f3c1e145a07472c7742ca7fe8441b9",
+        "key_id": "1ffa702796eb5ee8"
+      },
+      "output": "web-app",
+      "time_limit_s": 180,
+      "expected_total": 1
+    }
+  ]
+}

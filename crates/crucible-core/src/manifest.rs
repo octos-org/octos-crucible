@@ -3,6 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::blob::BlobRef;
 use crate::score::ScoreStatus;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -14,10 +15,46 @@ pub struct Manifest {
     pub taskset: String,
     pub agent: AgentRef,
     pub model: String,
-    /// Scores and statistics are private unless the submitter opts in.
+    /// `agent` (the platform ran an agent) or `app` (an uploaded output
+    /// was only scored).
     #[serde(default)]
-    pub public: bool,
+    pub mode: Mode,
+    /// Who submitted it, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<Owner>,
+    /// Scores and statistics are private unless the submitter opts in;
+    /// only then is the manifest published in clear.
+    #[serde(default, alias = "public")]
+    pub score_public: bool,
+    /// Which stages were run (all of the taskset's unless a dev run asked
+    /// for the first N).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stages_run: Option<u32>,
+    /// GitHub Actions run that produced this evaluation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<RunRef>,
     pub replicas: Vec<ReplicaEntry>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    #[default]
+    Agent,
+    App,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Owner {
+    pub github_id: u64,
+    pub login: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunRef {
+    pub repository: String,
+    pub run_id: u64,
+    pub run_attempt: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,20 +64,36 @@ pub struct AgentRef {
     /// The uploaded package, when it is not a builtin agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub package: Option<BlobRef>,
-}
-
-/// A stored file: content address plus the key that sealed it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BlobRef {
-    /// Lower-case hex SHA-256 of the stored (sealed) bytes.
-    pub sha256: String,
-    pub key_id: String,
+    /// Source revision recorded by the agent image build, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReplicaEntry {
     pub replica: u32,
+    /// Timestamps of the generation job, from the GitHub API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<JobTiming>,
+    /// Why the replica produced no usable result, if it did not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<String>,
     pub stages: Vec<StageEntry>,
+}
+
+/// GitHub's own timestamps for a job and for its agent-run step.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JobTiming {
+    pub job_id: u64,
+    pub started_at: String,
+    pub completed_at: String,
+    pub wall_s: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_step_started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_step_completed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_step_wall_s: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -60,6 +113,15 @@ pub struct StageEntry {
     pub output: Option<BlobRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logs: Option<BlobRef>,
+    /// How the stage ended: `exited` (agent stopped by itself), `deadline`
+    /// (stopped at the time limit) or `aborted` (the run was cancelled).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i64>,
+    /// `final` (work dir at the end) or `snapshot` (last periodic snapshot).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,11 +155,21 @@ mod tests {
                 name: "octos".into(),
                 version: "1".into(),
                 package: None,
+                commit: None,
             },
             model: "glm-5.3".into(),
-            public: false,
+            mode: Mode::Agent,
+            owner: Some(Owner {
+                github_id: 1,
+                login: "octocat".into(),
+            }),
+            score_public: false,
+            stages_run: None,
+            run: None,
             replicas: vec![ReplicaEntry {
                 replica: 1,
+                job: None,
+                failure: None,
                 stages: vec![StageEntry {
                     stage: "stage-1".into(),
                     score: Some(StageScore {
@@ -113,10 +185,17 @@ mod tests {
                         key_id: "k".into(),
                     }),
                     logs: None,
+                    ended: Some("exited".into()),
+                    exit_code: Some(0),
+                    checkpoint_source: Some("final".into()),
                 }],
             }],
         };
         let json = serde_json::to_string(&m).unwrap();
         assert_eq!(serde_json::from_str::<Manifest>(&json).unwrap(), m);
+        assert!(json.contains("\"mode\":\"agent\""));
+        // Older manifests used `public`.
+        let old = json.replace("\"score_public\":false", "\"public\":true");
+        assert!(serde_json::from_str::<Manifest>(&old).unwrap().score_public);
     }
 }

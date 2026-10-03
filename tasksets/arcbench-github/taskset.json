@@ -1,0 +1,54 @@
+{
+  "schema": 1,
+  "name": "arcbench-github",
+  "description": "ARC-Bench GitHub task: a simplified GitHub collaboration platform built in three cumulative stages (identity and organizations; repositories and code; collaboration). Scored with Playwright browser tests (30 / 29 / 41).",
+  "scorer": {
+    "name": "playwright"
+  },
+  "aggregate": "sum",
+  "total_time_limit_s": 15600,
+  "stages": [
+    {
+      "id": "stage-1",
+      "inputs_blob": {
+        "sha256": "3638b47fb5e471642d555b83a808bd7837b9a8c4cc934ae42b8aa851e3d64b4e",
+        "key_id": "1ffa702796eb5ee8"
+      },
+      "tests_blob": {
+        "sha256": "0c145098b68df96f4723ba2324b91565a2fbd17073244c85b5edd02e7cac7aa8",
+        "key_id": "1ffa702796eb5ee8"
+      },
+      "output": "web-app",
+      "time_limit_s": 4800,
+      "expected_total": 30
+    },
+    {
+      "id": "stage-2",
+      "inputs_blob": {
+        "sha256": "d27fb60a68a62eddf43d6fe0a6b8226606da6e87eef43c29f669548bd41a410e",
+        "key_id": "1ffa702796eb5ee8"
+      },
+      "tests_blob": {
+        "sha256": "018ea5211aea3bd9fad0aab57d074af1d0121ccc93873c2ed3534e170d8b5240",
+        "key_id": "1ffa702796eb5ee8"
+      },
+      "output": "web-app",
+      "time_limit_s": 4800,
+      "expected_total": 29
+    },
+    {
+      "id": "stage-3",
+      "inputs_blob": {
+        "sha256": "6345ef81fb97c2a3fd4c7bee0e5457cb6bee26ed429b04c3d7b6665c8c343efa",
+        "key_id": "1ffa702796eb5ee8"
+      },
+      "tests_blob": {
+        "sha256": "fd903c8e357e561d8e31418991f1eb71911cae9707d7def3045232eb217c46fe",
+        "key_id": "1ffa702796eb5ee8"
+      },
+      "output": "web-app",
+      "time_limit_s": 6000,
+      "expected_total": 41
+    }
+  ]
+}
