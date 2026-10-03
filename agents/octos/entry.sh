@@ -30,8 +30,17 @@ floor=$(( deadline / 2 )); [ "$floor" -gt 600 ] && floor=600
 export OCTOS_TIME_BUDGET="${OCTOS_TIME_BUDGET:-$budget}"
 export OCTOS_ARC_FINAL_RESERVE="${OCTOS_ARC_FINAL_RESERVE:-$reserve}"
 
+# run_submission.py writes the agent's output to files only (everything,
+# including its own steps, to /workspace/execution.debug.log), never to its
+# stdout. Mirror that file to stdout so it reaches the platform's agent.log,
+# live, so it is there also when the container is stopped at the deadline.
+tail -n +1 -F /workspace/execution.debug.log 2>/dev/null &
+tail_pid=$!
+
 rc=0
 python3 /opt/arcbench/run_submission.py || rc=$?
+sleep 1
+kill "$tail_pid" 2>/dev/null || true
 echo "run_submission exit code: $rc"
 tail -c 2000 /work/.arc/run-summary.json 2>/dev/null || true
 exit "$rc"

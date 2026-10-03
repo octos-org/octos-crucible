@@ -4,7 +4,7 @@ import { api } from "../api";
 import { submitEval, STEP_TEXT, type Step } from "../submit";
 import type { Mode, TaskSet } from "../types";
 import { ErrorBox, Loading, useAsync } from "../ui";
-import { CONSENT_TEXT, MAX_REPLICAS, emptyForm, validate, type Errors, type FormInput } from "../validate";
+import { CONSENT_TEXT, MAX_REPLICAS, MIN_PASSWORD, emptyForm, validate, type Errors, type FormInput } from "../validate";
 import { fmtDuration } from "../stats";
 
 function fmtSize(n: number): string {
@@ -353,6 +353,8 @@ export function Submit() {
               <>
                 产出会打包成 AES-256 加密的 zip，用此密码解压。需用 <b>7-Zip</b>、<b>Keka</b> 或{" "}
                 <b>The Unarchiver</b>，系统自带的解压工具打不开。平台不保存此密码，忘记无法找回。
+                <br />
+                至少 {MIN_PASSWORD} 个字符。产出 zip 存放在公开位置，只靠此密码保护，请使用强密码。
               </>
             }
           >
