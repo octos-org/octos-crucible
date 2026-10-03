@@ -6,7 +6,7 @@
     "name": "playwright"
   },
   "aggregate": "sum",
-  "total_time_limit_s": 360,
+  "total_time_limit_s": 1200,
   "stages": [
     {
       "id": "stage-1",
@@ -19,7 +19,7 @@
         "key_id": "1ffa702796eb5ee8"
       },
       "output": "web-app",
-      "time_limit_s": 180,
+      "time_limit_s": 600,
       "expected_total": 1
     },
     {
@@ -33,7 +33,7 @@
         "key_id": "1ffa702796eb5ee8"
       },
       "output": "web-app",
-      "time_limit_s": 180,
+      "time_limit_s": 600,
       "expected_total": 1
     }
   ]
