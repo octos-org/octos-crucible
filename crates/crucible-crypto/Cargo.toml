@@ -1,0 +1,16 @@
+[package]
+name = "crucible-crypto"
+description = "Envelope encryption (age X25519) and password-protected zips"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+crucible-core.workspace = true
+thiserror.workspace = true
+age.workspace = true
+sha2.workspace = true
+hex.workspace = true
+zip.workspace = true

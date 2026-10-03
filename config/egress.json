@@ -1,0 +1,8 @@
+{
+  "_comment": "Hosts the agent container may reach through `crucible egress` (HTTPS CONNECT, port 443 only). Everything else, the model upstream included, is unreachable from the container; the model goes through the meter. Exact host names, no wildcards; each must resolve to public addresses only.",
+  "allow_hosts": [
+    "registry.npmjs.org",
+    "pypi.org",
+    "files.pythonhosted.org"
+  ]
+}

@@ -1,0 +1,39 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/octos-org/octos-crucible"
+
+[workspace.dependencies]
+crucible-core = { path = "crates/crucible-core" }
+crucible-metering = { path = "crates/crucible-metering" }
+crucible-meter = { path = "crates/crucible-meter" }
+crucible-egress = { path = "crates/crucible-egress" }
+crucible-crypto = { path = "crates/crucible-crypto" }
+crucible-store = { path = "crates/crucible-store" }
+crucible-report = { path = "crates/crucible-report" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "2"
+anyhow = "1"
+url = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "fs"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2"] }
+humantime = "2"
+sha2 = "0.10"
+hex = "0.4"
+age = "0.12"
+zip = { version = "8.6", default-features = false, features = ["aes-crypto", "deflate"] }
+clap = { version = "4", features = ["derive"] }
+tempfile = "3"
+wiremock = "0.6"
