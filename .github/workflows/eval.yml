@@ -9,10 +9,23 @@ name: eval
 #             sandbox network -> crucible run (credential on stdin; meter +
 #             egress per stage; container 2g/1cpu/non-root/cap-drop ALL) ->
 #             seal checkpoints and logs to the platform key -> artifact
+#   score     runs no agent code, holds only the platform key: per replica
+#             and stage, opens the checkpoint and the stage's tests blob into
+#             temp dirs, runs scorers/<scorer>/score.sh (hidden visibility),
+#             checks total == expected_total; the tests are deleted after
+#             each stage. Only score.json (status/passed/total) leaves it.
 #   publish   the only job with contents: write; runs no agent code:
 #             stores the sealed files as blobs, builds the manifest (times
-#             from GitHub's job/step timestamps), archives it sealed, and
-#             commits it in clear to the data branch only if score_public.
+#             from GitHub's job/step timestamps, scores, total_score),
+#             packs the submitter's download zip (download password from the
+#             Worker credential), archives the manifest sealed, commits it in
+#             clear to the data branch only if score_public, delivers it to
+#             the Worker and deletes the credential.
+#
+# Worker (docs/api.md): the origin of options.results_url, else the
+# repository variable CRUCIBLE_WORKER_URL. Progress (building,
+# running:<stage>, scoring) and results are reported only when results_url
+# is set (runs the Worker dispatched).
 #
 # Rules: top-level permissions are empty; inputs are validated by
 # `crucible plan` and reach shells only through env; actions are pinned by
@@ -46,7 +59,7 @@ on:
         type: string
         default: "1"
       cred_source:
-        description: "github-secret (development) | workers-kv (step 4)"
+        description: "github-secret (development) | workers-kv"
         type: string
         default: github-secret
       eval_id:
@@ -91,6 +104,7 @@ jobs:
       score_public: ${{ steps.plan.outputs.score_public }}
       owner: ${{ steps.plan.outputs.owner }}
       results_url: ${{ steps.plan.outputs.results_url }}
+      worker_url: ${{ steps.plan.outputs.worker_url }}
       matrix: ${{ steps.plan.outputs.matrix }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -131,10 +145,20 @@ jobs:
           IN_SCORE_PUBLIC: ${{ inputs.score_public }}
           IN_OWNER: ${{ inputs.owner }}
           IN_OPTIONS: ${{ inputs.options }}
+          IN_WORKER_URL: ${{ vars.CRUCIBLE_WORKER_URL }}
         run: |
           set -euo pipefail
           # The agent source may be a signed URL: keep it out of the log.
           "$RUNNER_TEMP/bin/crucible" plan --root . 2>&1 | grep -v '^agent_source=' || exit 1
+
+      - name: Report status (building)
+        if: steps.plan.outputs.results_url != ''
+        env:
+          CRUCIBLE_WORKER_TOKEN: ${{ secrets.CRUCIBLE_WORKER_TOKEN }}
+          WORKER_URL: ${{ steps.plan.outputs.worker_url }}
+          EVAL_ID: ${{ steps.plan.outputs.eval_id }}
+        run: |
+          "$RUNNER_TEMP/bin/crucible" worker --worker-url "$WORKER_URL" --eval-id "$EVAL_ID" status building
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -163,6 +187,9 @@ jobs:
       BUDGET: ${{ needs.setup.outputs.budget }}
       TASKSET_PATH: ${{ needs.setup.outputs.taskset_path }}
       STAGES: ${{ needs.setup.outputs.stages }}
+      EVAL_ID: ${{ needs.setup.outputs.eval_id }}
+      WORKER_URL: ${{ needs.setup.outputs.worker_url }}
+      RESULTS_URL: ${{ needs.setup.outputs.results_url }}
       STORE: github:${{ github.repository }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -262,22 +289,41 @@ jobs:
         env:
           DEV_MODEL_CRED: ${{ secrets.DEV_MODEL_CRED }}
           CRUCIBLE_AGE_KEY: ${{ secrets.CRUCIBLE_AGE_KEY }}
+          CRUCIBLE_WORKER_TOKEN: ${{ secrets.CRUCIBLE_WORKER_TOKEN }}
         run: |
           set -euo pipefail
           ep=()
           if [ -n "$ENDPOINT" ]; then ep=(--endpoint "$ENDPOINT"); fi
+          src=(--source "$CRED_SOURCE")
+          if [ "$CRED_SOURCE" = workers-kv ]; then
+            # The envelope's eval_id must equal this run's.
+            src+=(--worker-url "$WORKER_URL" --eval-id "$EVAL_ID")
+          fi
+          # Progress: replica 1 reports running:<stage> as each stage starts
+          # (`crucible run` logs "[<stage>] start, ..." on stderr).
+          progress() {
+            while IFS= read -r line; do
+              printf '%s\n' "$line" >&2
+              if [ "$REPLICA" = 1 ] && [ -n "$RESULTS_URL" ] && [[ "$line" =~ ^\[([a-z0-9-]+)\]\ start, ]]; then
+                "$CRUCIBLE" worker --worker-url "$WORKER_URL" --eval-id "$EVAL_ID" \
+                  status "running:${BASH_REMATCH[1]}" >&2 || true
+              fi
+            done
+          }
           # The opened credential goes through this pipe only: never a file,
-          # never an env var. `crucible run` itself gets neither secret.
-          "$CRUCIBLE" cred open --source "$CRED_SOURCE" --sealed-env DEV_MODEL_CRED \
+          # never an env var. `crucible run` itself gets no secret.
+          "$CRUCIBLE" cred open "${src[@]}" --sealed-env DEV_MODEL_CRED \
               --identity-env CRUCIBLE_AGE_KEY "${ep[@]}" \
-            | env -u DEV_MODEL_CRED -u CRUCIBLE_AGE_KEY "$CRUCIBLE" run \
+            | env -u DEV_MODEL_CRED -u CRUCIBLE_AGE_KEY -u CRUCIBLE_WORKER_TOKEN "$CRUCIBLE" run \
               --image crucible-agent:run \
               --agent-json "$RUNNER_TEMP/agent-pkg/agent.json" \
               --taskset "$TASKSET_PATH" --stages "$STAGES" \
               --inputs-dir "$RUNNER_TEMP/inputs" \
               --model "$MODEL" --budget "$BUDGET" \
               --out-dir "$RUNNER_TEMP/run/$REPLICA" --scratch-dir "$RUNNER_TEMP/scratch" \
-              --pricing config/pricing.json --egress-allow config/egress.json
+              --pricing config/pricing.json --egress-allow config/egress.json \
+              2> >(progress)
+          wait $! || true
 
       - name: Stop containers and sandbox network
         if: always()
@@ -307,8 +353,84 @@ jobs:
           retention-days: 3
           if-no-files-found: warn
 
-  publish:
+  score:
     needs: [setup, generate]
+    if: always() && needs.setup.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    env:
+      EVAL_ID: ${{ needs.setup.outputs.eval_id }}
+      TASKSET_PATH: ${{ needs.setup.outputs.taskset_path }}
+      STAGES: ${{ needs.setup.outputs.stages }}
+      WORKER_URL: ${{ needs.setup.outputs.worker_url }}
+      STORE: github:${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /config/
+            /scorers/
+            /tasksets/
+            !/tasksets/*/source/
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: crucible-bin
+          path: ${{ runner.temp }}/bin
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: gen-r*
+          merge-multiple: true
+          path: ${{ runner.temp }}/results
+
+      - name: Report status (scoring)
+        if: needs.setup.outputs.results_url != ''
+        env:
+          CRUCIBLE_WORKER_TOKEN: ${{ secrets.CRUCIBLE_WORKER_TOKEN }}
+        run: |
+          chmod 0755 "$RUNNER_TEMP/bin/crucible"
+          "$RUNNER_TEMP/bin/crucible" worker --worker-url "$WORKER_URL" --eval-id "$EVAL_ID" status scoring
+
+      # Chromium's own sandbox needs unprivileged user namespaces, which
+      # ubuntu-24.04 restricts via AppArmor. Throwaway VM.
+      - name: Prepare the scorer
+        run: |
+          set -euo pipefail
+          chmod 0755 "$RUNNER_TEMP/bin/crucible"
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          scorer=$(jq -r .scorer.name "$TASKSET_PATH")
+          [[ "$scorer" =~ ^[a-z0-9][a-z0-9-]*$ ]] || { echo "::error::bad scorer name"; exit 1; }
+          if [ -d "scorers/$scorer/image" ]; then
+            docker build -q -t "crucible-scorer-$scorer:run" "scorers/$scorer/image" >/dev/null
+            echo "CRUCIBLE_SCORER_IMAGE=crucible-scorer-$scorer:run" >> "$GITHUB_ENV"
+          fi
+
+      - name: Score stage checkpoints
+        env:
+          CRUCIBLE_AGE_KEY: ${{ secrets.CRUCIBLE_AGE_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+          CRUCIBLE_PRUNE_BUILD_CACHE: "1"
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/results" "$RUNNER_TEMP/scores"
+          "$RUNNER_TEMP/bin/crucible" score --taskset "$TASKSET_PATH" --stages "$STAGES" \
+            --results "$RUNNER_TEMP/results" --out "$RUNNER_TEMP/scores" \
+            --store "$STORE" --identity-env CRUCIBLE_AGE_KEY --scorers-dir scorers
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: scores
+          path: ${{ runner.temp }}/scores
+          retention-days: 3
+          if-no-files-found: warn
+
+  publish:
+    needs: [setup, generate, score]
     if: always() && needs.setup.result == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -324,6 +446,8 @@ jobs:
       OWNER: ${{ needs.setup.outputs.owner }}
       SCORE_PUBLIC: ${{ needs.setup.outputs.score_public }}
       RESULTS_URL: ${{ needs.setup.outputs.results_url }}
+      WORKER_URL: ${{ needs.setup.outputs.worker_url }}
+      CRED_SOURCE: ${{ needs.setup.outputs.cred_source }}
       BUDGET: ${{ needs.setup.outputs.budget }}
       STORE: github:${{ github.repository }}
     steps:
@@ -334,6 +458,8 @@ jobs:
           sparse-checkout: |
             /config/
             /tasksets/
+            !/tasksets/*/source/
+            /tools/
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -345,6 +471,12 @@ jobs:
           pattern: gen-r*
           merge-multiple: true
           path: ${{ runner.temp }}/results
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: needs.score.result == 'success'
+        with:
+          name: scores
+          path: ${{ runner.temp }}/scores
 
       - name: Store sealed outputs as blobs
         env:
@@ -370,61 +502,59 @@ jobs:
           if [ -n "$BUDGET" ] && jq -e '.price' <<< "$BUDGET" >/dev/null; then
             price=(--price-json "$(jq -c '.price' <<< "$BUDGET")")
           fi
+          mkdir -p "$RUNNER_TEMP/scores"
           "$CRUCIBLE" manifest --eval-id "$EVAL_ID" --taskset "$TASKSET_PATH" --stages "$STAGES" \
             --model "$MODEL" --results "$RUNNER_TEMP/results" --replicas "$replicas" \
+            --scores "$RUNNER_TEMP/scores" \
             --jobs "$RUNNER_TEMP/jobs.json" --identity-env CRUCIBLE_AGE_KEY \
             --owner "$OWNER" --score-public "$SCORE_PUBLIC" \
             --pricing config/pricing.json "${price[@]}" --out "$RUNNER_TEMP/manifest.json"
-          jq -c '{eval_id, stages_run, replicas: [.replicas[] | {replica, failure, stages: [.stages[] | {stage, wall_s, ended, checkpoint_source}]}]}' "$RUNNER_TEMP/manifest.json"
+          jq -c '{eval_id, stages_run, total_score, replicas: [.replicas[] | {replica, failure, stages: [.stages[] | {stage, score, wall_s, ended, checkpoint_source}]}]}' "$RUNNER_TEMP/manifest.json"
 
-      # Results sink (a): always archive the manifest, sealed, as a blob.
-      - name: Archive the manifest (sealed)
+      # The submitter's download: an AES-256 zip under the download
+      # password from the credential (workers-kv only; dev credentials have
+      # none). Recorded as `download` in the manifest for the Worker.
+      - name: Pack the download zip
+        if: needs.setup.outputs.cred_source == 'workers-kv'
         env:
+          CRUCIBLE_AGE_KEY: ${{ secrets.CRUCIBLE_AGE_KEY }}
+          CRUCIBLE_WORKER_TOKEN: ${{ secrets.CRUCIBLE_WORKER_TOKEN }}
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          set -euo pipefail
-          pub=$(jq -r '.current as $c | .keys[] | select(.key_id == $c) | .public_key' config/keys.json)
-          "$CRUCIBLE" seal --recipient "$pub" --in "$RUNNER_TEMP/manifest.json" --out "$RUNNER_TEMP/manifest.sealed"
-          sha=$("$CRUCIBLE" put --store "$STORE" "$RUNNER_TEMP/manifest.sealed")
-          echo "manifest archived as blob $sha"
-          { echo "## eval $EVAL_ID"; echo; echo "manifest blob: \`$sha\`"; } >> "$GITHUB_STEP_SUMMARY"
+          "$CRUCIBLE" download-zip --worker-url "$WORKER_URL" --eval-id "$EVAL_ID" \
+            --results "$RUNNER_TEMP/results" --identity-env CRUCIBLE_AGE_KEY \
+            --store "$STORE" --manifest "$RUNNER_TEMP/manifest.json"
 
-      # Results sink (b): the manifest in clear, only if the submitter opted in.
-      - name: Publish the manifest on the data branch
-        if: needs.setup.outputs.score_public == 'true'
+      # Results sinks (a) sealed archive, always; (b) data branch, only if
+      # score_public.
+      - name: Archive and publish the manifest
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          d="$RUNNER_TEMP/data"
-          git init -q "$d"
-          cd "$d"
-          git remote add origin "https://github.com/$GITHUB_REPOSITORY.git"
-          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)"
-          g() { git -c "http.https://github.com/.extraheader=$auth" "$@"; }
-          for attempt in 1 2 3 4 5; do
-            if g ls-remote --exit-code origin refs/heads/data >/dev/null; then
-              g fetch -q --depth 1 origin data
-              git checkout -q -B data FETCH_HEAD
-            else
-              git checkout -q --orphan data
-            fi
-            mkdir -p evals
-            cp "$RUNNER_TEMP/manifest.json" "evals/$EVAL_ID.json"
-            git add "evals/$EVAL_ID.json"
-            git -c user.name="crucible-bot" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-              commit -q -m "eval $EVAL_ID" || { echo "manifest unchanged"; break; }
-            if g push -q origin HEAD:refs/heads/data; then
-              echo "published evals/$EVAL_ID.json on data"
-              break
-            fi
-            echo "push raced, retrying ($attempt)"
-            sleep $((attempt * 3))
-          done
+        run: tools/publish-manifest.sh "$RUNNER_TEMP/manifest.json"
 
-      # Results sink (c), step 4: POST the manifest to the Worker, which
-      # keeps it in KV for the submitter (Authorization: secret
-      # CRUCIBLE_WORKER_TOKEN).
-      - name: Deliver the manifest to the Worker (step 4)
+      # Results sink (c): the Worker (KV), for the submitter.
+      - name: Deliver the manifest to the Worker
         if: needs.setup.outputs.results_url != ''
-        run: echo "::notice::results_url is set; delivery to the Worker is not implemented yet (step 4)"
+        env:
+          CRUCIBLE_WORKER_TOKEN: ${{ secrets.CRUCIBLE_WORKER_TOKEN }}
+        run: |
+          "$CRUCIBLE" worker --worker-url "$WORKER_URL" --eval-id "$EVAL_ID" \
+            results --manifest "$RUNNER_TEMP/manifest.json"
+
+      - name: Report failure to the Worker
+        if: failure() && needs.setup.outputs.results_url != ''
+        env:
+          CRUCIBLE_WORKER_TOKEN: ${{ secrets.CRUCIBLE_WORKER_TOKEN }}
+        run: |
+          chmod 0755 "$RUNNER_TEMP/bin/crucible"
+          "$RUNNER_TEMP/bin/crucible" worker --worker-url "$WORKER_URL" --eval-id "$EVAL_ID" status failed
+
+      # The model key and download password are deleted when the run ends,
+      # whatever happened (KV also expires them after 24 h).
+      - name: Delete the credential
+        if: always() && needs.setup.outputs.cred_source == 'workers-kv'
+        env:
+          CRUCIBLE_WORKER_TOKEN: ${{ secrets.CRUCIBLE_WORKER_TOKEN }}
+        run: |
+          chmod 0755 "$RUNNER_TEMP/bin/crucible"
+          "$RUNNER_TEMP/bin/crucible" worker --worker-url "$WORKER_URL" --eval-id "$EVAL_ID" delete-cred

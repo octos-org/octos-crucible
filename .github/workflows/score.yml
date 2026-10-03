@@ -1,0 +1,257 @@
+name: score
+
+# Quick feedback (app mode): score an uploaded output on one stage of a
+# taskset. Inputs as docs/api.md (SCORE_WORKFLOW).
+#
+#   score     runs no agent code, holds only the platform key: fetches the
+#             sealed upload and the stage's tests blob, opens both into temp
+#             dirs, runs scorers/<scorer>/score.sh (hidden visibility),
+#             checks total == expected_total. Only score.json leaves it.
+#   publish   the only job with contents: write: builds the manifest
+#             (mode app), archives it sealed, commits it in clear to the data
+#             branch only if score_public, delivers it to the Worker.
+#
+# Rules as eval.yml: top-level permissions are empty; inputs are validated by
+# `crucible plan-score` and reach shells only through env; actions pinned.
+
+on:
+  workflow_dispatch:
+    inputs:
+      eval_id:
+        description: "[a-z0-9][a-z0-9-]{7,63}; empty = dev-<run id>-<attempt>"
+        type: string
+        default: ""
+      artifact_source:
+        description: "blob:<sha256> of the sealed upload (a zip)"
+        type: string
+        required: true
+      taskset:
+        type: string
+        required: true
+        default: hello-world
+      stage:
+        description: "stage number, from 1"
+        type: string
+        required: true
+        default: "1"
+      cred_source:
+        description: "none | workers-kv (only deleted at the end)"
+        type: string
+        default: none
+      score_public:
+        description: "publish the manifest in clear on the data branch"
+        type: string
+        default: "false"
+      owner:
+        description: "<github_id>:<login> of the submitter (optional)"
+        type: string
+        default: ""
+      results_url:
+        description: "<worker>/internal/results/<eval_id>; empty = do not report to the Worker"
+        type: string
+        default: ""
+
+run-name: score ${{ inputs.taskset }} stage ${{ inputs.stage }} ${{ inputs.eval_id }}
+
+permissions: {}
+
+jobs:
+  score:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    outputs:
+      eval_id: ${{ steps.plan.outputs.eval_id }}
+      artifact_hash: ${{ steps.plan.outputs.artifact_hash }}
+      taskset_path: ${{ steps.plan.outputs.taskset_path }}
+      stage: ${{ steps.plan.outputs.stage }}
+      stage_id: ${{ steps.plan.outputs.stage_id }}
+      cred_source: ${{ steps.plan.outputs.cred_source }}
+      score_public: ${{ steps.plan.outputs.score_public }}
+      owner: ${{ steps.plan.outputs.owner }}
+      results_url: ${{ steps.plan.outputs.results_url }}
+      worker_url: ${{ steps.plan.outputs.worker_url }}
+    env:
+      STORE: github:${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /Cargo.toml
+            /Cargo.lock
+            /crates/
+            /config/
+            /scorers/
+            /tasksets/
+            !/tasksets/*/source/
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: crucible-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'crates/**/*.rs') }}
+          restore-keys: |
+            crucible-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-
+            crucible-${{ runner.os }}-
+
+      - name: Build crucible
+        run: |
+          set -euo pipefail
+          rustup update stable --no-self-update >/dev/null
+          rustup default stable >/dev/null
+          cargo build --release --locked -p crucible-cli
+          mkdir -p "$RUNNER_TEMP/bin"
+          cp target/release/crucible "$RUNNER_TEMP/bin/crucible"
+          echo "CRUCIBLE=$RUNNER_TEMP/bin/crucible" >> "$GITHUB_ENV"
+
+      - name: Validate inputs and plan
+        id: plan
+        env:
+          IN_EVAL_ID: ${{ inputs.eval_id }}
+          IN_ARTIFACT_SOURCE: ${{ inputs.artifact_source }}
+          IN_TASKSET: ${{ inputs.taskset }}
+          IN_STAGE: ${{ inputs.stage }}
+          IN_CRED_SOURCE: ${{ inputs.cred_source }}
+          IN_SCORE_PUBLIC: ${{ inputs.score_public }}
+          IN_OWNER: ${{ inputs.owner }}
+          IN_RESULTS_URL: ${{ inputs.results_url }}
+          IN_WORKER_URL: ${{ vars.CRUCIBLE_WORKER_URL }}
+        run: '"$CRUCIBLE" plan-score --root .'
+
+      - name: Report status (scoring)
+        if: steps.plan.outputs.results_url != ''
+        env:
+          CRUCIBLE_WORKER_TOKEN: ${{ secrets.CRUCIBLE_WORKER_TOKEN }}
+          WORKER_URL: ${{ steps.plan.outputs.worker_url }}
+          EVAL_ID: ${{ steps.plan.outputs.eval_id }}
+        run: '"$CRUCIBLE" worker --worker-url "$WORKER_URL" --eval-id "$EVAL_ID" status scoring'
+
+      # Chromium's own sandbox needs unprivileged user namespaces, which
+      # ubuntu-24.04 restricts via AppArmor. Throwaway VM.
+      - name: Prepare the scorer
+        env:
+          TASKSET_PATH: ${{ steps.plan.outputs.taskset_path }}
+        run: |
+          set -euo pipefail
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          scorer=$(jq -r .scorer.name "$TASKSET_PATH")
+          [[ "$scorer" =~ ^[a-z0-9][a-z0-9-]*$ ]] || { echo "::error::bad scorer name"; exit 1; }
+          if [ -d "scorers/$scorer/image" ]; then
+            docker build -q -t "crucible-scorer-$scorer:run" "scorers/$scorer/image" >/dev/null
+            echo "CRUCIBLE_SCORER_IMAGE=crucible-scorer-$scorer:run" >> "$GITHUB_ENV"
+          fi
+
+      - name: Score the upload
+        env:
+          CRUCIBLE_AGE_KEY: ${{ secrets.CRUCIBLE_AGE_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+          CRUCIBLE_PRUNE_BUILD_CACHE: "1"
+          HASH: ${{ steps.plan.outputs.artifact_hash }}
+          TASKSET_PATH: ${{ steps.plan.outputs.taskset_path }}
+          STAGE: ${{ steps.plan.outputs.stage }}
+          STAGE_ID: ${{ steps.plan.outputs.stage_id }}
+        run: |
+          set -euo pipefail
+          # Same layout as an agent run: <results>/1/<stage>/checkpoint.sealed.
+          d="$RUNNER_TEMP/results/1/$STAGE_ID"
+          mkdir -p "$d" "$RUNNER_TEMP/scores"
+          "$CRUCIBLE" get --store "$STORE" "$HASH" --out "$d/checkpoint.sealed"
+          "$CRUCIBLE" score --taskset "$TASKSET_PATH" --stage "$STAGE" \
+            --results "$RUNNER_TEMP/results" --out "$RUNNER_TEMP/scores" \
+            --store "$STORE" --identity-env CRUCIBLE_AGE_KEY --scorers-dir scorers
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: score-files
+          path: |
+            ${{ runner.temp }}/bin/crucible
+            ${{ runner.temp }}/scores
+          retention-days: 3
+          if-no-files-found: error
+
+  publish:
+    needs: score
+    if: always() && needs.score.outputs.eval_id != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      EVAL_ID: ${{ needs.score.outputs.eval_id }}
+      HASH: ${{ needs.score.outputs.artifact_hash }}
+      TASKSET_PATH: ${{ needs.score.outputs.taskset_path }}
+      STAGE: ${{ needs.score.outputs.stage }}
+      STAGE_ID: ${{ needs.score.outputs.stage_id }}
+      OWNER: ${{ needs.score.outputs.owner }}
+      SCORE_PUBLIC: ${{ needs.score.outputs.score_public }}
+      WORKER_URL: ${{ needs.score.outputs.worker_url }}
+      STORE: github:${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /config/
+            /tasksets/
+            !/tasksets/*/source/
+            /tools/
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: score-files
+          path: ${{ runner.temp }}/files
+
+      - name: Build the manifest
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CRUCIBLE_AGE_KEY: ${{ secrets.CRUCIBLE_AGE_KEY }}
+        run: |
+          set -euo pipefail
+          chmod 0755 "$RUNNER_TEMP/files/bin/crucible"
+          echo "CRUCIBLE=$RUNNER_TEMP/files/bin/crucible" >> "$GITHUB_ENV"
+          CRUCIBLE="$RUNNER_TEMP/files/bin/crucible"
+          d="$RUNNER_TEMP/results/1/$STAGE_ID"
+          mkdir -p "$d" "$RUNNER_TEMP/files/scores"
+          # The upload's blob reference (hash + key id) goes into the manifest.
+          "$CRUCIBLE" get --store "$STORE" "$HASH" --out "$d/checkpoint.sealed"
+          "$CRUCIBLE" manifest --mode app --eval-id "$EVAL_ID" --taskset "$TASKSET_PATH" \
+            --stage "$STAGE" --results "$RUNNER_TEMP/results" --scores "$RUNNER_TEMP/files/scores" \
+            --identity-env CRUCIBLE_AGE_KEY --owner "$OWNER" --score-public "$SCORE_PUBLIC" \
+            --pricing config/pricing.json --out "$RUNNER_TEMP/manifest.json"
+          jq -c '{eval_id, mode, total_score, stages: [.replicas[].stages[] | {stage, score}]}' "$RUNNER_TEMP/manifest.json"
+
+      - name: Archive and publish the manifest
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: tools/publish-manifest.sh "$RUNNER_TEMP/manifest.json"
+
+      - name: Deliver the manifest to the Worker
+        if: needs.score.outputs.results_url != ''
+        env:
+          CRUCIBLE_WORKER_TOKEN: ${{ secrets.CRUCIBLE_WORKER_TOKEN }}
+        run: |
+          "$CRUCIBLE" worker --worker-url "$WORKER_URL" --eval-id "$EVAL_ID" \
+            results --manifest "$RUNNER_TEMP/manifest.json"
+
+      - name: Report failure to the Worker
+        if: failure() && needs.score.outputs.results_url != ''
+        env:
+          CRUCIBLE_WORKER_TOKEN: ${{ secrets.CRUCIBLE_WORKER_TOKEN }}
+        run: |
+          chmod 0755 "$RUNNER_TEMP/files/bin/crucible"
+          "$RUNNER_TEMP/files/bin/crucible" worker --worker-url "$WORKER_URL" --eval-id "$EVAL_ID" status failed
+
+      - name: Delete the credential
+        if: always() && needs.score.outputs.cred_source == 'workers-kv'
+        env:
+          CRUCIBLE_WORKER_TOKEN: ${{ secrets.CRUCIBLE_WORKER_TOKEN }}
+        run: |
+          chmod 0755 "$RUNNER_TEMP/files/bin/crucible"
+          "$RUNNER_TEMP/files/bin/crucible" worker --worker-url "$WORKER_URL" --eval-id "$EVAL_ID" delete-cred
