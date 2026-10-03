@@ -609,14 +609,16 @@ impl<'a, B: Backend> App<'a, B> {
                 Ok(Some(run)) => run,
                 Ok(None) => return false,
                 Err(e) => {
-                    self.b.log(&format!("refresh {}: {}", rec.eval_id, e.message));
+                    self.b
+                        .log(&format!("refresh {}: {}", rec.eval_id, e.message));
                     return false;
                 }
             },
             Some(id) => match gh.run(id).await {
                 Ok(run) => run,
                 Err(e) => {
-                    self.b.log(&format!("refresh {}: {}", rec.eval_id, e.message));
+                    self.b
+                        .log(&format!("refresh {}: {}", rec.eval_id, e.message));
                     return false;
                 }
             },
@@ -627,7 +629,11 @@ impl<'a, B: Backend> App<'a, B> {
         } else {
             None
         };
-        let estimate = match view_run(&run, job.as_deref(), rec.stage_names.first().map(String::as_str)) {
+        let estimate = match view_run(
+            &run,
+            job.as_deref(),
+            rec.stage_names.first().map(String::as_str),
+        ) {
             RunView::Status(s) => Some(s),
             RunView::CompletedOk => {
                 // Results are posted from inside the run; allow for KV
@@ -743,7 +749,10 @@ impl<'a, B: Backend> App<'a, B> {
             ));
         }
         if is_terminal(&rec.status) {
-            return Err(ApiError::conflict(format!("eval is already {}", rec.status)));
+            return Err(ApiError::conflict(format!(
+                "eval is already {}",
+                rec.status
+            )));
         }
         rec.status = body.status;
         rec.updated_at = rfc3339(self.b.now_s());

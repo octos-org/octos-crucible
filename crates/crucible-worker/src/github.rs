@@ -525,7 +525,10 @@ mod tests {
         let st = |s: &str| RunView::Status(s.into());
         let busy = run("in_progress", None);
         assert_eq!(view_run(&run("queued", None), None, None), st("queued"));
-        assert_eq!(view_run(&busy, Some("setup"), Some("stage-1")), st("building"));
+        assert_eq!(
+            view_run(&busy, Some("setup"), Some("stage-1")),
+            st("building")
+        );
         assert_eq!(
             view_run(&busy, Some("generate r1"), Some("stage-1")),
             st("running:stage-1")
@@ -575,7 +578,8 @@ mod tests {
           "total_time_limit_s":15600,"stages":[
           {"id":"stage-1","inputs_blob":{"sha256":"aa","key_id":"k"},"tests_blob":{"sha256":"bb","key_id":"k"},"output":"web-app","time_limit_s":4800,"expected_total":30},
           {"id":"stage-2","inputs_blob":{"sha256":"aa","key_id":"k"},"tests_blob":{"sha256":"bb","key_id":"k"},"output":"web-app","time_limit_s":4800}]}"#;
-        let file = serde_json::json!({"sha": "fedcba9876543210", "content": b64_encode(json.as_bytes())});
+        let file =
+            serde_json::json!({"sha": "fedcba9876543210", "content": b64_encode(json.as_bytes())});
         let t = parse_taskset_file("arcbench-github", &file).unwrap();
         assert_eq!(t.stages.len(), 2);
         assert_eq!(t.stages[1].total, None);

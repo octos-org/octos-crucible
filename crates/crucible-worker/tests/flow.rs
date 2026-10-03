@@ -138,11 +138,17 @@ impl Mock {
                     .insert(body["tag_name"].as_str().unwrap().into(), id);
                 ok(201, release_json(id))
             }
-            ("POST", "actions/workflows/eval.yml/dispatches") => {
+            (
+                "POST",
+                p @ ("actions/workflows/eval.yml/dispatches"
+                | "actions/workflows/score.yml/dispatches"),
+            ) => {
                 let body: Value = serde_json::from_slice(r.body.as_ref().unwrap()).unwrap();
                 assert_eq!(body["ref"], "main");
                 let eval_id = body["inputs"]["eval_id"].as_str().unwrap().to_string();
-                gh.dispatches.push(body["inputs"].clone());
+                let mut inputs = body["inputs"].clone();
+                inputs["_workflow"] = json!(p.split('/').nth(2).unwrap());
+                gh.dispatches.push(inputs);
                 let id = 9000 + gh.runs.len() as u64;
                 gh.runs.push((id, eval_id, "queued".into(), None));
                 HttpResponse {
@@ -150,7 +156,10 @@ impl Mock {
                     body: vec![],
                 }
             }
-            ("GET", p) if p.starts_with("actions/workflows/eval.yml/runs?") => {
+            ("GET", p)
+                if p.starts_with("actions/workflows/eval.yml/runs?")
+                    || p.starts_with("actions/workflows/score.yml/runs?") =>
+            {
                 assert!(p.contains("event=workflow_dispatch"));
                 let runs: Vec<Value> = gh.runs.iter().map(run_json).collect();
                 ok(
@@ -649,33 +658,51 @@ fn full_flow() {
     assert_eq!(t.as_user("POST", "/evals", &alice, &body).status, 409);
 
     let inputs = t.mock.gh.borrow().dispatches[0].clone();
+    let results_url = format!("https://crucible.example.workers.dev/internal/results/{EID}");
     assert_eq!(
         inputs,
         json!({
-            "eval_id": EID, "mode": "agent", "agent_source": format!("blob:{hash}"),
-            "taskset": "github-full", "stages": "2", "model": "glm-5.3", "replicas": "2",
-            "budget": "{\"max_cost_usd\":5.0}", "cred_source": "kv", "owner_id": "42",
-            "owner_login": "octocat", "score_public": "true",
-            "results_url": format!("https://crucible.example.workers.dev/internal/results/{EID}")
+            "_workflow": "eval.yml",
+            "agent_source": format!("blob:{hash}"), "taskset": "github-full",
+            "model": "glm-5.3", "endpoint": "", "replicas": "2",
+            "cred_source": "workers-kv", "eval_id": EID, "score_public": "true",
+            "owner": "42:octocat",
+            "options": json!({"stages": 2, "results_url": results_url, "budget": {"max_cost_usd": 5.0}}).to_string()
         })
     );
     let input_text = inputs.to_string();
     assert!(!input_text.contains(&b64_encode(&cred)) && !input_text.contains("ciphertext"));
 
-    // Status before and while running.
-    let r = t.as_user("GET", &format!("/evals/{EID}"), &alice, b"");
-    assert_eq!(json_of(&r)["status"], "queued");
+    // Status before and while running (estimated from GitHub).
+    let detail = |tok: &str| json_of(&t.as_user("GET", &format!("/evals/{EID}"), tok, b""));
+    let r = detail(&alice);
+    assert_eq!(r["status"], "queued");
     assert!(
-        json_of(&r)["run_url"]
+        r["run_url"]
             .as_str()
             .unwrap()
             .ends_with("/actions/runs/9000")
     );
     t.mock.gh.borrow_mut().runs[0].2 = "in_progress".into();
-    let r = json_of(&t.as_user("GET", &format!("/evals/{EID}"), &alice, b""));
+    assert_eq!(detail(&alice)["status"], "running:stage-1");
+    // Precise progress reported by the workflow wins and never regresses.
+    let status_path = format!("/internal/status/{EID}");
+    let report = |s: &str| {
+        t.as_user(
+            "POST",
+            &status_path,
+            WORKER_TOKEN,
+            &serde_json::to_vec(&json!({"status": s})).unwrap(),
+        )
+    };
+    assert_eq!(report("running:stage-2").status, 200);
+    assert_eq!(detail(&alice)["status"], "running:stage-2");
+    assert_eq!(report("done").status, 400);
+    assert_eq!(report("running:Stage 2").status, 400);
     assert_eq!(
-        (r["status"].as_str(), r["phase"].as_str()),
-        (Some("running"), Some("generate (replica 1)"))
+        t.as_user("POST", &status_path, &alice, b"{\"status\":\"scoring\"}")
+            .status,
+        401
     );
     assert_eq!(
         t.as_user("GET", &format!("/evals/{EID}"), &bob, b"").status,
@@ -726,24 +753,42 @@ fn full_flow() {
     let mbody = serde_json::to_vec(&manifest).unwrap();
     assert_eq!(t.as_user("POST", &results, &alice, &mbody).status, 401);
     assert_eq!(t.as_user("POST", &results, WORKER_TOKEN, b"{}").status, 400);
+    // A partial manifest while the run continues.
+    let mut partial = manifest.clone();
+    partial["status"] = json!("scoring");
+    partial.as_object_mut().unwrap().remove("download");
+    let r = t.as_user(
+        "POST",
+        &results,
+        WORKER_TOKEN,
+        &serde_json::to_vec(&partial).unwrap(),
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let r = json_of(&t.as_user("GET", &format!("/evals/{EID}"), &alice, b""));
+    assert_eq!(r["status"], "scoring");
+    assert_eq!(r["total_score"], 0.9);
+    assert_eq!(r["download_available"], false);
+
     let r = t.as_user("POST", &results, WORKER_TOKEN, &mbody);
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
 
     let r = json_of(&t.as_user("GET", &format!("/evals/{EID}"), &alice, b""));
-    assert_eq!(r["status"], "succeeded");
+    assert_eq!(r["status"], "done");
     assert_eq!(
         r["manifest"]["replicas"][0]["stages"][0]["score"]["passed"],
         27
     );
-    assert_eq!(r["total_score"], 27.0);
+    assert_eq!(r["total_score"], 0.9);
     assert_eq!(r["download_available"], true);
     assert!(r["manifest"].get("download").is_none());
+    // Settled: further progress reports are refused.
+    assert_eq!(report("scoring").status, 409);
 
     let list = json_of(&t.as_user("GET", "/evals", &alice, b""));
     assert_eq!(list.as_array().unwrap().len(), 1);
     assert_eq!(list[0]["eval_id"], EID);
-    assert_eq!(list[0]["status"], "succeeded");
-    assert_eq!(list[0]["total_score"], 27.0);
+    assert_eq!(list[0]["status"], "done");
+    assert_eq!(list[0]["total_score"], 0.9);
     assert_eq!(json_of(&t.as_user("GET", "/evals", &bob, b"")), json!([]));
     assert_eq!(t.as_user("GET", "/evals?all=1", &bob, b"").status, 403);
     assert_eq!(
@@ -802,7 +847,7 @@ fn app_mode_and_failures() {
     let hash = json_of(&r)["hash"].as_str().unwrap().to_string();
     let eval = json!({
         "mode": "app", "eval_id": EID, "upload_hash": hash, "taskset": "github-full",
-        "stages": 1, "score_public": false, "consent": true
+        "stages": 2, "score_public": false, "consent": true
     });
     let r = t.as_user(
         "POST",
@@ -812,14 +857,26 @@ fn app_mode_and_failures() {
     );
     assert_eq!(r.status, 201);
     let inputs = t.mock.gh.borrow().dispatches[0].clone();
-    assert_eq!(inputs["cred_source"], "none");
-    assert_eq!(inputs["stages"], "1");
-    assert_eq!(inputs["model"], "");
+    assert_eq!(
+        inputs,
+        json!({
+            "_workflow": "score.yml", "eval_id": EID,
+            "artifact_source": format!("blob:{hash}"), "taskset": "github-full",
+            "stage": "2", "cred_source": "none", "score_public": "false",
+            "owner": "42:octocat",
+            "results_url": format!("https://crucible.example.workers.dev/internal/results/{EID}")
+        })
+    );
     assert!(
         block_on(t.mock.kv_get(&format!("cred/{EID}")))
             .unwrap()
             .is_none()
     );
+    // While the scoring job runs.
+    t.mock.gh.borrow_mut().runs[0].2 = "in_progress".into();
+    let r = json_of(&t.as_user("GET", &format!("/evals/{EID}"), &alice, b""));
+    assert_eq!(r["status"], "running:stage-2");
+    assert_eq!(r["stage_names"], json!(["stage-2"]));
 
     // A failed run settles the eval.
     t.mock.gh.borrow_mut().runs[0].2 = "completed".into();
@@ -828,6 +885,56 @@ fn app_mode_and_failures() {
     assert_eq!(r["status"], "failed");
     let list = json_of(&t.as_user("GET", "/evals", &alice, b""));
     assert_eq!(list[0]["status"], "failed");
+
+    // Stage numbers are checked against the taskset.
+    let mut bad = eval.clone();
+    bad["eval_id"] = json!("2b7e6a52-1f3c-4d2a-9e8b-7c6d5e4f3a21");
+    bad["stages"] = json!(3);
+    assert_eq!(
+        t.as_user("POST", "/evals", &alice, &serde_json::to_vec(&bad).unwrap())
+            .status,
+        400
+    );
+}
+
+#[test]
+fn success_without_results_fails_after_grace() {
+    let t = T::new();
+    let alice = token(42, "octocat");
+    let art = sealed(b"site");
+    let r = t.call(
+        "POST",
+        "/uploads",
+        &[
+            ("Authorization", &format!("Bearer {alice}")),
+            ("X-Upload-Kind", "app"),
+        ],
+        &art,
+    );
+    let hash = json_of(&r)["hash"].as_str().unwrap().to_string();
+    let eval = json!({
+        "mode": "app", "eval_id": EID, "upload_hash": hash, "taskset": "github-full",
+        "stages": 1, "score_public": false, "consent": true
+    });
+    assert_eq!(
+        t.as_user(
+            "POST",
+            "/evals",
+            &alice,
+            &serde_json::to_vec(&eval).unwrap()
+        )
+        .status,
+        201
+    );
+    t.mock.gh.borrow_mut().runs[0].2 = "completed".into();
+    t.mock.gh.borrow_mut().runs[0].3 = Some("success".into());
+    let status =
+        || json_of(&t.as_user("GET", &format!("/evals/{EID}"), &alice, b""))["status"].clone();
+    assert_eq!(status(), "queued");
+    t.mock.now.set(NOW + 300);
+    assert_eq!(status(), "queued");
+    t.mock.now.set(NOW + 601);
+    assert_eq!(status(), "failed");
 }
 
 #[test]

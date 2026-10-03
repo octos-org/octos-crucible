@@ -297,8 +297,7 @@ fn check_budget(b: &Budget) -> Result<(), ApiError> {
             "budget.max_tokens must be between 1 and 10000000000",
         ));
     }
-    if b
-        .max_cost_usd
+    if b.max_cost_usd
         .is_some_and(|v| !v.is_finite() || v <= 0.0 || v > 10_000.0)
     {
         return Err(ApiError::bad_request(
@@ -447,7 +446,9 @@ pub fn parse_results(body: &[u8], eval_id: &str) -> Result<Results, ApiError> {
     let manifest: Manifest = serde_json::from_value(raw.clone())
         .map_err(|e| ApiError::bad_request(format!("not a manifest: {e}")))?;
     if manifest.eval_id != eval_id {
-        return Err(ApiError::bad_request("manifest.eval_id does not match the URL"));
+        return Err(ApiError::bad_request(
+            "manifest.eval_id does not match the URL",
+        ));
     }
     Ok(Results {
         manifest: raw,
@@ -517,10 +518,24 @@ mod tests {
 
     #[test]
     fn statuses() {
-        for s in ["queued", "building", "running:stage-1", "scoring", "done", "failed"] {
+        for s in [
+            "queued",
+            "building",
+            "running:stage-1",
+            "scoring",
+            "done",
+            "failed",
+        ] {
             assert!(is_status(s), "{s}");
         }
-        for s in ["running", "running:", "running:Stage 1", "succeeded", "cancelled", ""] {
+        for s in [
+            "running",
+            "running:",
+            "running:Stage 1",
+            "succeeded",
+            "cancelled",
+            "",
+        ] {
             assert!(!is_status(s), "{s}");
         }
         assert!(is_terminal("done") && is_terminal("failed") && !is_terminal("scoring"));
@@ -536,13 +551,22 @@ mod tests {
         assert_eq!(v.stages, Some(2));
         assert!(v.cred.unwrap().starts_with(b"{\"crucible_envelope\":1"));
         let v = check(&with(
-            with(with(agent_body(), "replicas", Value::Null), "budget", Value::Null),
+            with(
+                with(agent_body(), "replicas", Value::Null),
+                "budget",
+                Value::Null,
+            ),
             "stages",
             Value::Null,
         ))
         .unwrap();
         assert_eq!((v.replicas, v.stages, v.budget), (1, None, None));
-        assert_eq!(check(&with(agent_body(), "replicas", 10.into())).unwrap().replicas, 10);
+        assert_eq!(
+            check(&with(agent_body(), "replicas", 10.into()))
+                .unwrap()
+                .replicas,
+            10
+        );
     }
 
     #[test]
@@ -560,12 +584,24 @@ mod tests {
             ("model", "$(id)".into(), "bad_request"),
             ("replicas", 0.into(), "bad_request"),
             ("replicas", 11.into(), "bad_request"),
-            ("budget", serde_json::json!({"max_cost_usd": -1}), "bad_request"),
-            ("budget", serde_json::json!({"max_requests": 0}), "bad_request"),
+            (
+                "budget",
+                serde_json::json!({"max_cost_usd": -1}),
+                "bad_request",
+            ),
+            (
+                "budget",
+                serde_json::json!({"max_requests": 0}),
+                "bad_request",
+            ),
             ("budget", serde_json::json!({"other": 1}), "bad_request"),
             ("cred_envelope", Value::Null, "bad_request"),
             ("cred_envelope", "!!!".into(), "bad_request"),
-            ("cred_envelope", b64_encode(b"plaintext key").into(), "bad_request"),
+            (
+                "cred_envelope",
+                b64_encode(b"plaintext key").into(),
+                "bad_request",
+            ),
             ("mode", "both".into(), "bad_request"),
             ("extra", 1.into(), "bad_request"),
         ];
@@ -575,8 +611,12 @@ mod tests {
         }
         let mut other = Envelope::new("0000000000000000").header_line();
         other.extend_from_slice(b"x");
-        let err = check(&with(agent_body(), "cred_envelope", b64_encode(&other).into()))
-            .unwrap_err();
+        let err = check(&with(
+            agent_body(),
+            "cred_envelope",
+            b64_encode(&other).into(),
+        ))
+        .unwrap_err();
         assert_eq!(err.code, "wrong_key");
         let big = b64_encode(&vec![b'x'; MAX_CRED + 1]);
         assert!(check(&with(agent_body(), "cred_envelope", big.into())).is_err());
@@ -589,12 +629,17 @@ mod tests {
             "taskset": "github-full", "stages": 2, "score_public": true, "consent": true
         });
         let v = check(&app).unwrap();
-        assert_eq!((v.mode, v.replicas, v.stages, v.cred), (Mode::App, 1, Some(2), None));
+        assert_eq!(
+            (v.mode, v.replicas, v.stages, v.cred),
+            (Mode::App, 1, Some(2), None)
+        );
         // A sealed credential (download password) is optional in app mode.
-        assert!(check(&with(app.clone(), "cred_envelope", sealed_cred().into()))
-            .unwrap()
-            .cred
-            .is_some());
+        assert!(
+            check(&with(app.clone(), "cred_envelope", sealed_cred().into()))
+                .unwrap()
+                .cred
+                .is_some()
+        );
         assert!(check(&with(app.clone(), "stages", Value::Null)).is_err());
         assert!(check(&with(app.clone(), "replicas", 2.into())).is_err());
         assert!(check(&with(app.clone(), "budget", serde_json::json!({}))).is_err());
