@@ -1,0 +1,10 @@
+Build the application described by the requirements in `/req` inside the current workspace `/work`, then stop.
+
+- `/req` is read-only and holds the requirements for this round: read every file in it (e.g. `requirements.yaml`, `prerequisites.md`, screenshots under `reference/`). In `requirements.yaml`, FOLDER nodes give context and ATOMIC nodes are work items with scenarios; implement every ATOMIC requirement. Follow the wording and UI names the requirements use.
+- `/work` may already contain an application from earlier rounds. If it does, extend it in place: keep everything that already works, and add or change only what the new requirements need. If `/work` is empty, start from scratch.
+- Unless the requirements prescribe something else, build a web app with this layout: a Node.js backend in `backend/server.js` (CommonJS, Node built-in modules only, zero npm dependencies) that serves the frontend from `frontend/` and provides the API and its own persistence (e.g. JSON files under `backend/`). It must listen on `process.env.PORT || 3000`, start offline with `node server.js` from `backend/`, and be ready within a few seconds. No CDN assets and no build step at runtime.
+- Any predefined data the requirements describe must be seeded by the app itself on first start.
+- Implement for general inputs; do not hardcode example values.
+- Keep generated files small and avoid long-running commands; there is a time limit. Do not leave background servers running when you finish.
+
+When done, make sure `node backend/server.js` starts cleanly (start it, check it responds, stop it), then reply with one short sentence.

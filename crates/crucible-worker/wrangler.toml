@@ -11,16 +11,16 @@ command = "worker-build --release"
 [[kv_namespaces]]
 binding = "CRUCIBLE_KV"
 # `wrangler kv namespace create CRUCIBLE_KV` prints the id to put here.
-id = "REPLACE_WITH_KV_NAMESPACE_ID"
+id = "fe1bef190c3c4a6cbbe7917e68705863"
 
 [vars]
 PAGES_ORIGIN = "https://octos-org.github.io"
 PAGES_URL = "https://octos-org.github.io/octos-crucible/"
 GITHUB_REPO = "octos-org/octos-crucible"
 # Comma-separated GitHub numeric user ids.
-ADMIN_GITHUB_IDS = ""
+ADMIN_GITHUB_IDS = "58540850"
 # Optional:
-# WORKER_URL = "https://crucible.<account>.workers.dev"   # base of results_url
+WORKER_URL = "https://crucible-worker.stratosphericus.workers.dev"
 # EVAL_WORKFLOW = "eval.yml"
 # SCORE_WORKFLOW = "score.yml"
 # EVAL_REF = "main"
