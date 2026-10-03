@@ -17,7 +17,9 @@ mod package;
 mod plan;
 mod publish;
 mod run;
+mod score;
 mod taskset_cmd;
+mod worker;
 mod zipdir;
 
 use keys::{Store, load_identities};
@@ -118,6 +120,8 @@ enum Cmd {
     },
     /// Validate the eval.yml dispatch inputs (IN_* env vars); write job outputs.
     Plan(Box<PlanArgs>),
+    /// Validate the score.yml dispatch inputs (IN_* env vars); write job outputs.
+    PlanScore(Box<PlanScoreArgs>),
     /// Fetch and validate an agent package: builtin:<name> | url:<https zip> | git:<https url>@<ref> | blob:<sha256>.
     Fetch {
         #[arg(long)]
@@ -188,8 +192,83 @@ enum Cmd {
     },
     /// Build the evaluation manifest from sealed outputs, usage and job timestamps.
     Manifest(Box<ManifestArgs>),
-    /// TODO (step 3): score stage checkpoints.
-    Score,
+    /// Score stage checkpoints with the taskset's scorer: <results>/<replica>/<stage>/checkpoint.sealed -> <out>/<replica>/<stage>/score.json.
+    Score(Box<ScoreArgs>),
+    /// AES-256 zip of every stage's output and logs, locked with the
+    /// download password from the Worker credential; stored as a plain blob
+    /// and recorded as `download` in the manifest. Skipped (exit 0) when the
+    /// credential has no download password.
+    DownloadZip(Box<DownloadZipArgs>),
+    /// The Worker's internal endpoints (token from CRUCIBLE_WORKER_TOKEN).
+    Worker {
+        /// The Worker (`https://...`; only its origin is used).
+        #[arg(long)]
+        worker_url: String,
+        #[arg(long)]
+        eval_id: String,
+        #[command(subcommand)]
+        cmd: WorkerCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorkerCmd {
+    /// Report progress: building | running:<stage> | scoring | failed. Best effort: a failure is a warning.
+    Status { status: String },
+    /// POST the manifest (with its `download`) and the final status.
+    Results {
+        #[arg(long)]
+        manifest: PathBuf,
+        /// `done` or `failed`; default: `done` if any stage was scored, else `failed`.
+        #[arg(long)]
+        status: Option<String>,
+    },
+    /// Delete the credential (idempotent). Best effort.
+    DeleteCred,
+}
+
+#[derive(clap::Args)]
+struct ScoreArgs {
+    #[arg(long)]
+    taskset: PathBuf,
+    /// Score the first N stages.
+    #[arg(long, conflicts_with = "stage")]
+    stages: Option<usize>,
+    /// Score only stage K (1-based).
+    #[arg(long)]
+    stage: Option<usize>,
+    #[arg(long)]
+    results: PathBuf,
+    #[arg(long)]
+    out: PathBuf,
+    /// Store of the tests blobs.
+    #[arg(long)]
+    store: String,
+    #[arg(long)]
+    identity: Vec<PathBuf>,
+    #[arg(long)]
+    identity_env: Vec<String>,
+    /// Directory of scorers (`<dir>/<taskset scorer>/score.sh`).
+    #[arg(long, default_value = "scorers")]
+    scorers_dir: PathBuf,
+}
+
+#[derive(clap::Args)]
+struct DownloadZipArgs {
+    #[arg(long)]
+    worker_url: String,
+    #[arg(long)]
+    eval_id: String,
+    /// `<dir>/<replica>/<stage>/{checkpoint,logs}.sealed`.
+    #[arg(long)]
+    results: PathBuf,
+    #[arg(long)]
+    identity_env: Vec<String>,
+    #[arg(long)]
+    store: String,
+    /// Manifest to record the download in (rewritten in place).
+    #[arg(long)]
+    manifest: PathBuf,
 }
 
 #[derive(clap::Args)]
@@ -347,25 +426,7 @@ async fn run(cmd: Cmd) -> Result<()> {
                 github_output,
             } = *args;
             let out = plan::plan(&inputs, &root)?;
-            let mut text = String::new();
-            for (k, v) in &out {
-                if v.contains('\n') {
-                    bail!("output {k} contains a newline");
-                }
-                text.push_str(&format!("{k}={v}\n"));
-            }
-            match github_output {
-                Some(p) => {
-                    let mut f = std::fs::OpenOptions::new()
-                        .append(true)
-                        .create(true)
-                        .open(&p)?;
-                    f.write_all(text.as_bytes())?;
-                    eprint!("{text}");
-                }
-                None => print!("{text}"),
-            }
-            Ok(())
+            write_plan(&out, github_output.as_deref())
         }
         Cmd::Fetch {
             source,
@@ -434,25 +495,45 @@ async fn run(cmd: Cmd) -> Result<()> {
             );
             Ok(())
         }
-        Cmd::Cred { cmd } => match cmd {
-            CredCmd::Open {
-                source,
-                sealed_env,
-                identity,
-                identity_env,
-                endpoint,
-            } => {
-                let src = cred::CredSource::parse(&source)?;
-                let sealed = cred::read_sealed(src, &sealed_env)?;
-                let keys = load_identities(&identity, &identity_env)?;
-                let line = cred::open_credential(&sealed, &keys, endpoint.as_deref())?;
-                let mut out = std::io::stdout().lock();
-                out.write_all(line.as_bytes())?;
-                out.write_all(b"\n")?;
-                out.flush()?;
-                Ok(())
+        Cmd::Cred { cmd } => {
+            match cmd {
+                CredCmd::Open {
+                    source,
+                    sealed_env,
+                    identity,
+                    identity_env,
+                    endpoint,
+                    worker_url,
+                    eval_id,
+                } => {
+                    let src = cred::CredSource::parse(&source)?;
+                    let keys = load_identities(&identity, &identity_env)?;
+                    let (sealed, expect) =
+                        match src {
+                            cred::CredSource::GithubSecret => {
+                                (cred::read_sealed(src, &sealed_env, None).await?, None)
+                            }
+                            cred::CredSource::WorkersKv => {
+                                let (url, id) =
+                                    worker_url.as_deref().zip(eval_id.as_deref()).ok_or_else(
+                                        || anyhow!("workers-kv needs --worker-url and --eval-id"),
+                                    )?;
+                                let w = worker::Worker::from_env(url)?;
+                                (
+                                    cred::read_sealed(src, &sealed_env, Some((&w, id))).await?,
+                                    Some(id),
+                                )
+                            }
+                        };
+                    let line = cred::open_credential(&sealed, &keys, endpoint.as_deref(), expect)?;
+                    let mut out = std::io::stdout().lock();
+                    out.write_all(line.as_bytes())?;
+                    out.write_all(b"\n")?;
+                    out.flush()?;
+                    Ok(())
+                }
             }
-        },
+        }
         Cmd::SealOutputs {
             replica_dir,
             keys,
@@ -482,8 +563,126 @@ async fn run(cmd: Cmd) -> Result<()> {
             eprintln!("stored {} sealed files", files.len());
             Ok(())
         }
-        Cmd::Score => bail!("not implemented yet (step 3, see docs/DESIGN.md section 10)"),
+        Cmd::PlanScore(args) => {
+            let out = plan::plan_score(&args.inputs, &args.root)?;
+            write_plan(&out, args.github_output.as_deref())
+        }
+        Cmd::Score(a) => {
+            let ts = taskset_cmd::load(&a.taskset)?;
+            ts.validate(crucible_core::taskset::MAX_TOTAL_TIME_S)?;
+            let n = ts.stages.len();
+            let stages: Vec<usize> = match (a.stage, a.stages) {
+                (Some(k), _) if (1..=n).contains(&k) => vec![k - 1],
+                (Some(_), _) => bail!("--stage must be 1..={n}"),
+                (None, s) => (0..s.unwrap_or(n).min(n)).collect(),
+            };
+            if !crucible_core::is_slug(&ts.scorer.name, 64) {
+                bail!("bad scorer name");
+            }
+            let scorer = a.scorers_dir.join(&ts.scorer.name).join("score.sh");
+            let keys = load_identities(&a.identity, &a.identity_env)?;
+            let store = Store::parse(&a.store)?;
+            let done = score::score(&score::ScoreOpts {
+                taskset: &ts,
+                stages,
+                results: &a.results,
+                out: &a.out,
+                store: &store,
+                keys: &keys,
+                scorer: &scorer,
+            })
+            .await?;
+            eprintln!("scored {} stage checkpoints", done.len());
+            Ok(())
+        }
+        Cmd::DownloadZip(a) => {
+            let w = worker::Worker::from_env(&a.worker_url)?;
+            let keys = load_identities(&[], &a.identity_env)?;
+            let sealed = w.get_cred(&a.eval_id).await?;
+            let Some(password) = cred::download_password(&sealed, &keys, &a.eval_id)? else {
+                eprintln!("no download password: skipping the download zip");
+                return Ok(());
+            };
+            let zip = publish::download_zip(&a.results, &keys, &password)?;
+            drop(password);
+            let sha256 = Store::parse(&a.store)?.put(&zip).await?;
+            let mut m: crucible_core::Manifest =
+                serde_json::from_slice(&std::fs::read(&a.manifest)?)?;
+            m.download = Some(crucible_core::manifest::DownloadRef { sha256 });
+            std::fs::write(&a.manifest, serde_json::to_string_pretty(&m)? + "\n")?;
+            eprintln!("download zip stored ({} bytes)", zip.len());
+            Ok(())
+        }
+        Cmd::Worker {
+            worker_url,
+            eval_id,
+            cmd,
+        } => {
+            let w = worker::Worker::from_env(&worker_url)?;
+            match cmd {
+                WorkerCmd::Status { status } => {
+                    match w.status(&eval_id, &status).await {
+                        Ok(()) => eprintln!("status {status} reported"),
+                        Err(e) => println!("::warning::status {status} not reported: {e:#}"),
+                    }
+                    Ok(())
+                }
+                WorkerCmd::DeleteCred => {
+                    match w.delete_cred(&eval_id).await {
+                        Ok(()) => eprintln!("credential deleted"),
+                        Err(e) => println!("::warning::credential not deleted: {e:#}"),
+                    }
+                    Ok(())
+                }
+                WorkerCmd::Results { manifest, status } => {
+                    let raw: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(&manifest)?)?;
+                    let m: crucible_core::Manifest = serde_json::from_value(raw.clone())?;
+                    if m.eval_id != eval_id {
+                        bail!("manifest eval_id does not match --eval-id");
+                    }
+                    let scored = m
+                        .replicas
+                        .iter()
+                        .flat_map(|r| &r.stages)
+                        .any(|s| s.score.is_some_and(|s| s.status.is_scored()));
+                    let status = match status.as_deref() {
+                        None => if scored { "done" } else { "failed" }.to_owned(),
+                        Some(s @ ("done" | "failed")) => s.to_owned(),
+                        Some(_) => bail!("--status must be done or failed"),
+                    };
+                    w.results(&eval_id, &raw, &status).await?;
+                    eprintln!("results delivered ({status})");
+                    Ok(())
+                }
+            }
+        }
     }
+}
+
+fn write_plan(
+    out: &std::collections::BTreeMap<&str, String>,
+    github_output: Option<&Path>,
+) -> Result<()> {
+    let mut text = String::new();
+    for (k, v) in out {
+        if v.contains('\n') {
+            bail!("output {k} contains a newline");
+        }
+        text.push_str(&format!("{k}={v}\n"));
+    }
+    match github_output {
+        Some(p) => {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(p)?;
+            f.write_all(text.as_bytes())?;
+            eprint!("{text}");
+        }
+        None => print!("{text}"),
+    }
+    Ok(())
 }
 
 #[derive(clap::Args)]
@@ -494,6 +693,16 @@ struct PlanArgs {
     #[arg(long, default_value = ".")]
     root: PathBuf,
     /// Append key=value lines here (GitHub's $GITHUB_OUTPUT); else stdout.
+    #[arg(long, env = "GITHUB_OUTPUT")]
+    github_output: Option<PathBuf>,
+}
+
+#[derive(clap::Args)]
+struct PlanScoreArgs {
+    #[command(flatten)]
+    inputs: plan::ScorePlanInputs,
+    #[arg(long, default_value = ".")]
+    root: PathBuf,
     #[arg(long, env = "GITHUB_OUTPUT")]
     github_output: Option<PathBuf>,
 }
@@ -543,7 +752,7 @@ enum TasksetCmd {
 enum CredCmd {
     /// Print the opened credential as one JSON line (pipe it into `crucible run`).
     Open {
-        /// `github-secret` (development) or `workers-kv` (step 4).
+        /// `github-secret` (development) or `workers-kv`.
         #[arg(long)]
         source: String,
         /// Environment variable holding the sealed credential.
@@ -556,6 +765,12 @@ enum CredCmd {
         /// Overrides the endpoint stored in the credential.
         #[arg(long)]
         endpoint: Option<String>,
+        /// workers-kv: the Worker (token from CRUCIBLE_WORKER_TOKEN).
+        #[arg(long)]
+        worker_url: Option<String>,
+        /// workers-kv: the evaluation; must match the one inside the credential.
+        #[arg(long)]
+        eval_id: Option<String>,
     },
 }
 
@@ -565,17 +780,27 @@ struct ManifestArgs {
     eval_id: String,
     #[arg(long)]
     taskset: PathBuf,
+    /// `agent` (generated by an agent) or `app` (an uploaded output).
+    #[arg(long, default_value = "agent")]
+    mode: String,
+    /// agent: the first N stages ran.
     #[arg(long)]
     stages: Option<usize>,
+    /// app: the stage (1-based) the upload was scored on.
     #[arg(long)]
+    stage: Option<usize>,
+    #[arg(long, default_value = "")]
     model: String,
+    /// `<dir>/<replica>/<stage>/score.json` from `crucible score`.
+    #[arg(long)]
+    scores: Option<PathBuf>,
     /// Private key(s) to read the sealed logs and agent facts.
     #[arg(long)]
     identity_env: Vec<String>,
     /// `<dir>/<replica>/<stage>/{usage.jsonl,timing.json,*.sealed}`.
     #[arg(long)]
     results: PathBuf,
-    #[arg(long)]
+    #[arg(long, default_value_t = 1)]
     replicas: u32,
     /// GitHub `GET .../actions/runs/{id}/attempts/{n}/jobs` response.
     #[arg(long)]
@@ -645,16 +870,91 @@ async fn taskset(cmd: TasksetCmd) -> Result<()> {
 }
 
 fn manifest(a: ManifestArgs) -> Result<()> {
+    use crucible_core::manifest::Mode;
     let ts = taskset_cmd::load(&a.taskset)?;
     let (pricing, user) = a.price.load()?;
     let keys = load_identities(&[], &a.identity_env)?;
+    let mode = match a.mode.as_str() {
+        "agent" => Mode::Agent,
+        "app" => Mode::App,
+        _ => bail!("--mode must be agent or app"),
+    };
+    let (stages_run, agent) = match mode {
+        Mode::Agent => (
+            a.stages.unwrap_or(ts.stages.len()).min(ts.stages.len()),
+            agent_ref(&a, &keys)?,
+        ),
+        Mode::App => (
+            a.stage
+                .filter(|k| (1..=ts.stages.len()).contains(k))
+                .ok_or_else(|| anyhow!("app mode needs --stage 1..={}", ts.stages.len()))?,
+            crucible_core::manifest::AgentRef {
+                name: "uploaded-output".into(),
+                version: "-".into(),
+                package: None,
+                commit: None,
+            },
+        ),
+    };
+    let jobs = match &a.jobs {
+        Some(p) => Some(std::fs::read_to_string(p)?),
+        None => None,
+    };
+    let run = match (&a.repository, a.run_id) {
+        (Some(repo), Some(id)) => Some(crucible_core::manifest::RunRef {
+            repository: repo.clone(),
+            run_id: id,
+            run_attempt: a.run_attempt.unwrap_or(1),
+        }),
+        _ => None,
+    };
+    let m = publish::build_manifest(&publish::ManifestInputs {
+        eval_id: &a.eval_id,
+        created_at: humantime::format_rfc3339_seconds(std::time::SystemTime::now()).to_string(),
+        taskset: &ts,
+        mode,
+        stages_run,
+        model: &a.model,
+        agent,
+        results: &a.results,
+        replicas: a.replicas,
+        jobs_json: jobs.as_deref(),
+        run_step: &a.run_step,
+        run,
+        pricing: &pricing,
+        user_price: user,
+        owner: match a.owner.trim() {
+            "" => None,
+            o if plan::owner_ok(o) => {
+                let (id, login) = o.split_once(':').expect("checked");
+                Some(crucible_core::manifest::Owner {
+                    github_id: id.parse()?,
+                    login: login.into(),
+                })
+            }
+            _ => bail!("--owner must be <github_id>:<login>"),
+        },
+        score_public: a.score_public.trim() == "true",
+        keys: &keys,
+        scores: a.scores.as_deref(),
+    })?;
+    std::fs::write(&a.out, serde_json::to_string_pretty(&m)? + "\n")?;
+    Ok(())
+}
+
+/// The agent of an agent-mode run, from the sealed facts of the first
+/// replica that left them.
+fn agent_ref(
+    a: &ManifestArgs,
+    keys: &[crucible_crypto::PrivateKey],
+) -> Result<crucible_core::manifest::AgentRef> {
     // Agent facts: from the first replica that sealed them.
     let mut facts = serde_json::Value::Null;
     let mut build: Option<serde_json::Value> = None;
     for r in 1..=a.replicas {
         let p = a.results.join(r.to_string()).join("agent.sealed");
         if p.is_file() {
-            for (name, data) in publish::read_sealed_zip(&p, &keys)? {
+            for (name, data) in publish::read_sealed_zip(&p, keys)? {
                 match name.as_str() {
                     "facts.json" => facts = serde_json::from_slice(&data)?,
                     "build.json" => build = serde_json::from_slice(&data).ok(),
@@ -682,54 +982,12 @@ fn manifest(a: ManifestArgs) -> Result<()> {
         (Some(sha256), Some(key_id)) => Some(crucible_core::BlobRef { sha256, key_id }),
         _ => None,
     };
-    let agent = crucible_core::manifest::AgentRef {
+    Ok(crucible_core::manifest::AgentRef {
         name: text(&facts["agent"]["name"]).ok_or_else(|| anyhow!("facts: agent.name missing"))?,
         version: text(&facts["agent"]["version"]).unwrap_or_else(|| "0".into()),
         package,
         commit,
-    };
-    let jobs = match &a.jobs {
-        Some(p) => Some(std::fs::read_to_string(p)?),
-        None => None,
-    };
-    let run = match (&a.repository, a.run_id) {
-        (Some(repo), Some(id)) => Some(crucible_core::manifest::RunRef {
-            repository: repo.clone(),
-            run_id: id,
-            run_attempt: a.run_attempt.unwrap_or(1),
-        }),
-        _ => None,
-    };
-    let m = publish::build_manifest(&publish::ManifestInputs {
-        eval_id: &a.eval_id,
-        created_at: humantime::format_rfc3339_seconds(std::time::SystemTime::now()).to_string(),
-        taskset: &ts,
-        stages_run: a.stages.unwrap_or(ts.stages.len()).min(ts.stages.len()),
-        model: &a.model,
-        agent,
-        results: &a.results,
-        replicas: a.replicas,
-        jobs_json: jobs.as_deref(),
-        run_step: &a.run_step,
-        run,
-        pricing: &pricing,
-        user_price: user,
-        owner: match a.owner.trim() {
-            "" => None,
-            o if plan::owner_ok(o) => {
-                let (id, login) = o.split_once(':').expect("checked");
-                Some(crucible_core::manifest::Owner {
-                    github_id: id.parse()?,
-                    login: login.into(),
-                })
-            }
-            _ => bail!("--owner must be <github_id>:<login>"),
-        },
-        score_public: a.score_public.trim() == "true",
-        keys: &keys,
-    })?;
-    std::fs::write(&a.out, serde_json::to_string_pretty(&m)? + "\n")?;
-    Ok(())
+    })
 }
 
 /// A missing log means no requests were made (prototype behaviour).

@@ -34,6 +34,41 @@ pub struct Manifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run: Option<RunRef>,
     pub replicas: Vec<ReplicaEntry>,
+    /// 0–1: Σpassed / Σtotal over every scored stage of every replica
+    /// ([`Manifest::compute_total_score`]); absent when nothing was scored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_score: Option<f64>,
+    /// The submitter's download: an AES-256 zip (download password) of the
+    /// stage outputs and logs, stored as a plain blob so the Worker can hand
+    /// out its address (`GET /evals/:id/download`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download: Option<DownloadRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DownloadRef {
+    /// SHA-256 of the stored zip (its blob name).
+    pub sha256: String,
+}
+
+impl Manifest {
+    /// Σpassed / Σtotal over every stage score of every replica, rounded to
+    /// 4 decimals; `None` when the sum of totals is 0. Unscored outcomes
+    /// (`system_error`, `rejected`) are recorded as 0/0, so they add nothing.
+    pub fn compute_total_score(&self) -> Option<f64> {
+        let (passed, total) = self
+            .replicas
+            .iter()
+            .flat_map(|r| r.stages.iter())
+            .filter_map(|s| s.score)
+            .fold((0u64, 0u64), |(p, t), s| {
+                (p + u64::from(s.passed), t + u64::from(s.total))
+            });
+        if total == 0 {
+            return None;
+        }
+        Some((passed as f64 / total as f64 * 10_000.0).round() / 10_000.0)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,6 +201,8 @@ mod tests {
             score_public: false,
             stages_run: None,
             run: None,
+            total_score: Some(0.9),
+            download: None,
             replicas: vec![ReplicaEntry {
                 replica: 1,
                 job: None,
@@ -191,6 +228,7 @@ mod tests {
                 }],
             }],
         };
+        assert_eq!(m.compute_total_score(), Some(0.9));
         let json = serde_json::to_string(&m).unwrap();
         assert_eq!(serde_json::from_str::<Manifest>(&json).unwrap(), m);
         assert!(json.contains("\"mode\":\"agent\""));

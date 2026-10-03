@@ -49,7 +49,41 @@ pub struct PlanInputs {
     /// 10 inputs, so the optional knobs share one).
     #[arg(long, env = "IN_OPTIONS", default_value = "")]
     pub options: String,
+    /// The Worker when `results_url` does not name one (repository
+    /// variable `CRUCIBLE_WORKER_URL`).
+    #[arg(long, env = "IN_WORKER_URL", default_value = "")]
+    pub worker_url: String,
     /// Used for the default eval id.
+    #[arg(long, env = "GITHUB_RUN_ID", default_value = "")]
+    pub run_id: String,
+    #[arg(long, env = "GITHUB_RUN_ATTEMPT", default_value = "1")]
+    pub run_attempt: String,
+}
+
+/// Inputs of `score.yml` (upload an output, score one stage).
+#[derive(Debug, Clone, Default, clap::Args)]
+pub struct ScorePlanInputs {
+    #[arg(long, env = "IN_EVAL_ID", default_value = "")]
+    pub eval_id: String,
+    /// `blob:<sha256>` of the sealed upload.
+    #[arg(long, env = "IN_ARTIFACT_SOURCE", default_value = "")]
+    pub artifact_source: String,
+    #[arg(long, env = "IN_TASKSET", default_value = "")]
+    pub taskset: String,
+    /// 1-based stage number.
+    #[arg(long, env = "IN_STAGE", default_value = "")]
+    pub stage: String,
+    /// `none` or `workers-kv` (only used to delete the credential).
+    #[arg(long, env = "IN_CRED_SOURCE", default_value = "none")]
+    pub cred_source: String,
+    #[arg(long, env = "IN_SCORE_PUBLIC", default_value = "false")]
+    pub score_public: String,
+    #[arg(long, env = "IN_OWNER", default_value = "")]
+    pub owner: String,
+    #[arg(long, env = "IN_RESULTS_URL", default_value = "")]
+    pub results_url: String,
+    #[arg(long, env = "IN_WORKER_URL", default_value = "")]
+    pub worker_url: String,
     #[arg(long, env = "GITHUB_RUN_ID", default_value = "")]
     pub run_id: String,
     #[arg(long, env = "GITHUB_RUN_ATTEMPT", default_value = "1")]
@@ -132,6 +166,115 @@ pub fn eval_id_ok(id: &str) -> bool {
     id.len() >= 8 && crucible_core::is_slug(id, 64)
 }
 
+fn check_url(what: &str, url: &str) -> Result<()> {
+    if url.is_empty() {
+        return Ok(());
+    }
+    validate_endpoint(url, false).map_err(|e| anyhow!("{what}: {e}"))?;
+    if url.bytes().any(|b| !b.is_ascii_graphic()) {
+        bail!("{what} has unsupported characters");
+    }
+    Ok(())
+}
+
+/// The Worker: the origin of `results_url` when given, else `fallback`.
+fn worker_url(results_url: &str, fallback: &str) -> Result<String> {
+    if !results_url.is_empty() {
+        return crate::worker::origin(results_url);
+    }
+    let f = fallback.trim().trim_end_matches('/');
+    if f.is_empty() {
+        return Ok(String::new());
+    }
+    check_url("worker_url", f)?;
+    crate::worker::origin(f)
+}
+
+fn eval_id_or_default(id: &str, run_id: &str, run_attempt: &str) -> Result<String> {
+    match id.trim() {
+        "" => {
+            let run: u64 = run_id
+                .trim()
+                .parse()
+                .map_err(|_| anyhow!("eval_id is empty and GITHUB_RUN_ID is not set"))?;
+            let attempt: u32 = run_attempt.trim().parse().unwrap_or(1);
+            Ok(format!("dev-{run}-{attempt}"))
+        }
+        id if eval_id_ok(id) => Ok(id.to_owned()),
+        _ => bail!("eval_id must match [a-z0-9][a-z0-9-]{{7,63}}"),
+    }
+}
+
+fn load_taskset(root: &Path, name: &str) -> Result<(String, crucible_core::TaskSet)> {
+    if !crucible_core::is_slug(name, 64) {
+        bail!("taskset must match [a-z0-9][a-z0-9-]{{0,63}}");
+    }
+    let ts_path = format!("tasksets/{name}/taskset.json");
+    if !root.join(&ts_path).is_file() {
+        bail!("unknown taskset {name:?}");
+    }
+    let ts = crate::taskset_cmd::load(&root.join(&ts_path))?;
+    ts.validate(MAX_TOTAL_TIME_S)?;
+    Ok((ts_path, ts))
+}
+
+fn score_public(s: &str) -> Result<bool> {
+    match s.trim() {
+        "" | "false" => Ok(false),
+        "true" => Ok(true),
+        _ => bail!("score_public must be true or false"),
+    }
+}
+
+/// Validate the `score.yml` inputs.
+pub fn plan_score(inp: &ScorePlanInputs, root: &Path) -> Result<BTreeMap<&'static str, String>> {
+    let hash = inp
+        .artifact_source
+        .trim()
+        .strip_prefix("blob:")
+        .filter(|h| crucible_core::blob::is_sha256_hex(h))
+        .ok_or_else(|| anyhow!("artifact_source must be blob:<sha256>"))?;
+    let (ts_path, ts) = load_taskset(root, inp.taskset.trim())?;
+    let stage: usize = inp
+        .stage
+        .trim()
+        .parse()
+        .ok()
+        .filter(|n| (1..=ts.stages.len()).contains(n))
+        .ok_or_else(|| anyhow!("stage must be 1..={}", ts.stages.len()))?;
+    let cred = match inp.cred_source.trim() {
+        "" | "none" => "none",
+        "workers-kv" => "workers-kv",
+        _ => bail!("cred_source must be none or workers-kv"),
+    };
+    let results_url = inp.results_url.trim();
+    check_url("results_url", results_url)?;
+    let worker = worker_url(results_url, &inp.worker_url)?;
+    if cred == "workers-kv" && worker.is_empty() {
+        bail!("cred_source workers-kv needs a Worker (results_url or CRUCIBLE_WORKER_URL)");
+    }
+    let owner = inp.owner.trim();
+    if !owner.is_empty() && !owner_ok(owner) {
+        bail!("owner must be <github_id>:<login>");
+    }
+    let mut out = BTreeMap::new();
+    out.insert(
+        "eval_id",
+        eval_id_or_default(&inp.eval_id, &inp.run_id, &inp.run_attempt)?,
+    );
+    out.insert("artifact_hash", hash.to_owned());
+    out.insert("taskset", ts.name.clone());
+    out.insert("taskset_path", ts_path);
+    out.insert("stage", stage.to_string());
+    out.insert("stage_id", ts.stages[stage - 1].id.clone());
+    out.insert("cred_source", cred.to_owned());
+    out.insert("score_public", score_public(&inp.score_public)?.to_string());
+    out.insert("owner", owner.to_owned());
+    out.insert("results_url", results_url.to_owned());
+    out.insert("worker_url", worker);
+    Ok(out)
+}
+
 pub fn plan(inp: &PlanInputs, root: &Path) -> Result<BTreeMap<&'static str, String>> {
     let source = Source::parse(inp.agent_source.trim())?;
     if let Source::Builtin(name) = &source
@@ -159,10 +302,7 @@ pub fn plan(inp: &PlanInputs, root: &Path) -> Result<BTreeMap<&'static str, Stri
         bail!("replicas must be 1..={MAX_REPLICAS}");
     }
     let cred = inp.cred_source.trim();
-    match CredSource::parse(cred)? {
-        CredSource::GithubSecret => {}
-        CredSource::WorkersKv => bail!("cred_source workers-kv is not implemented yet (step 4)"),
-    }
+    let cred_source = CredSource::parse(cred)?;
     let opts: Options = if inp.options.trim().is_empty() {
         Options::default()
     } else {
@@ -181,32 +321,18 @@ pub fn plan(inp: &PlanInputs, root: &Path) -> Result<BTreeMap<&'static str, Stri
         (None, s) => s.to_owned(),
     };
     let results_url = opts.results_url.unwrap_or_default();
-    if !results_url.is_empty() {
-        validate_endpoint(&results_url, false).map_err(|e| anyhow!("results_url: {e}"))?;
-        if results_url.bytes().any(|b| !b.is_ascii_graphic()) {
-            bail!("results_url has unsupported characters");
-        }
+    check_url("results_url", &results_url)?;
+    let worker = worker_url(&results_url, &inp.worker_url)?;
+    if cred_source == CredSource::WorkersKv && worker.is_empty() {
+        bail!("cred_source workers-kv needs a Worker (results_url or CRUCIBLE_WORKER_URL)");
     }
-    let score_public = match inp.score_public.trim() {
-        "" | "false" => false,
-        "true" => true,
-        _ => bail!("score_public must be true or false"),
-    };
+    let score_public = score_public(&inp.score_public)?;
     let owner = inp.owner.trim();
     if !owner.is_empty() && !owner_ok(owner) {
         bail!("owner must be <github_id>:<login>");
     }
 
-    let name = inp.taskset.trim();
-    if !crucible_core::is_slug(name, 64) {
-        bail!("taskset must match [a-z0-9][a-z0-9-]{{0,63}}");
-    }
-    let ts_path = format!("tasksets/{name}/taskset.json");
-    if !root.join(&ts_path).is_file() {
-        bail!("unknown taskset {name:?}");
-    }
-    let ts = crate::taskset_cmd::load(&root.join(&ts_path))?;
-    ts.validate(MAX_TOTAL_TIME_S)?;
+    let (ts_path, ts) = load_taskset(root, inp.taskset.trim())?;
     let n = match stages_raw.as_str() {
         "" => ts.stages.len(),
         s => s
@@ -221,19 +347,7 @@ pub fn plan(inp: &PlanInputs, root: &Path) -> Result<BTreeMap<&'static str, Stri
         bail!("{n} stages need a {run_min}-minute run step, more than {MAX_RUN_STEP_MIN}");
     }
 
-    let eval_id = match inp.eval_id.trim() {
-        "" => {
-            let run: u64 = inp
-                .run_id
-                .trim()
-                .parse()
-                .map_err(|_| anyhow!("eval_id is empty and GITHUB_RUN_ID is not set"))?;
-            let attempt: u32 = inp.run_attempt.trim().parse().unwrap_or(1);
-            format!("dev-{run}-{attempt}")
-        }
-        id if eval_id_ok(id) => id.to_owned(),
-        _ => bail!("eval_id must match [a-z0-9][a-z0-9-]{{7,63}}"),
-    };
+    let eval_id = eval_id_or_default(&inp.eval_id, &inp.run_id, &inp.run_attempt)?;
 
     let mut out = BTreeMap::new();
     out.insert("agent_source", inp.agent_source.trim().to_owned());
@@ -257,6 +371,7 @@ pub fn plan(inp: &PlanInputs, root: &Path) -> Result<BTreeMap<&'static str, Stri
     out.insert("score_public", score_public.to_string());
     out.insert("owner", owner.to_owned());
     out.insert("results_url", results_url);
+    out.insert("worker_url", worker);
     out.insert(
         "matrix",
         serde_json::to_string(
@@ -331,6 +446,60 @@ mod tests {
         assert_eq!(out["score_public"], "true");
         assert_eq!(out["owner"], "123456:octo-cat");
         assert!(out["results_url"].starts_with("https://"));
+        assert_eq!(out["worker_url"], "https://crucible.example.workers.dev");
+        assert_eq!(plan(&good(), r.path()).unwrap()["worker_url"], "");
+        let mut i = good();
+        i.cred_source = "workers-kv".into();
+        i.worker_url = "https://w.example.dev/".into();
+        let out = plan(&i, r.path()).unwrap();
+        assert_eq!(
+            (out["cred_source"].as_str(), out["worker_url"].as_str()),
+            ("workers-kv", "https://w.example.dev")
+        );
+    }
+
+    #[test]
+    fn plans_score() {
+        let r = root();
+        let good = || ScorePlanInputs {
+            artifact_source: format!("blob:{}", "ab".repeat(32)),
+            taskset: "demo".into(),
+            stage: "2".into(),
+            cred_source: "none".into(),
+            run_id: "9".into(),
+            ..Default::default()
+        };
+        let out = plan_score(&good(), r.path()).unwrap();
+        assert_eq!(out["stage_id"], "stage-2");
+        assert_eq!(out["artifact_hash"], "ab".repeat(32));
+        assert_eq!(out["eval_id"], "dev-9-1");
+        assert_eq!(out["worker_url"], "");
+        let mut i = good();
+        i.results_url = "https://w.example.dev/internal/results/x".into();
+        i.cred_source = "workers-kv".into();
+        assert_eq!(
+            plan_score(&i, r.path()).unwrap()["worker_url"],
+            "https://w.example.dev"
+        );
+        type Case = (&'static str, Box<dyn Fn(&mut ScorePlanInputs)>);
+        let cases: Vec<Case> = vec![
+            (
+                "source",
+                Box::new(|i| i.artifact_source = "url:https://x".into()),
+            ),
+            ("hash", Box::new(|i| i.artifact_source = "blob:AB".into())),
+            ("stage 0", Box::new(|i| i.stage = "0".into())),
+            ("stage 4", Box::new(|i| i.stage = "4".into())),
+            ("cred", Box::new(|i| i.cred_source = "github-secret".into())),
+            ("kv", Box::new(|i| i.cred_source = "workers-kv".into())),
+            ("public", Box::new(|i| i.score_public = "yes".into())),
+            ("owner", Box::new(|i| i.owner = "x".into())),
+        ];
+        for (why, f) in cases {
+            let mut i = good();
+            f(&mut i);
+            assert!(plan_score(&i, r.path()).is_err(), "{why}");
+        }
     }
 
     #[test]
@@ -360,7 +529,14 @@ mod tests {
             ("replicas 21", Box::new(|i| i.replicas = "21".into())),
             ("replicas text", Box::new(|i| i.replicas = "1;id".into())),
             ("cred", Box::new(|i| i.cred_source = "env".into())),
-            ("kv", Box::new(|i| i.cred_source = "workers-kv".into())),
+            (
+                "kv without a Worker",
+                Box::new(|i| i.cred_source = "workers-kv".into()),
+            ),
+            (
+                "worker http",
+                Box::new(|i| i.worker_url = "http://w.example.dev".into()),
+            ),
             (
                 "budget",
                 Box::new(|i| i.budget = r#"{"max_requests":0}"#.into()),
