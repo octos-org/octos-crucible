@@ -35,6 +35,12 @@ RUN set -eu; \
 COPY runner-spec.json /workspace/runner-spec.json
 COPY entry.sh /opt/agent/entry.sh
 RUN ln -s /work /workspace/template && chmod 1777 /workspace && chmod 0755 /opt/agent/entry.sh
+# The runner image points pip/npm at a regional mirror (repo.huaweicloud.com)
+# that the sandbox does not allow; use the official registries, which the
+# egress allow-list (config/egress.json) does.
+ENV PIP_INDEX_URL=https://pypi.org/simple \
+    PIP_TRUSTED_HOST= \
+    npm_config_registry=https://registry.npmjs.org/
 ENV OCTOS_CACHE_DIR=/opt/octos-cache \
     ARC_DEBUG=1 \
     PIP_TARGET=/tmp/arcbench-agent-deps \

@@ -6,7 +6,7 @@
   "aggregate": "sum",
   "total_time_limit_s": 360,
   "stages": [
-    {"id": "stage-1", "dir": "hello-stage-1", "inputs": ["requirements.yaml"], "tests": ["tests"], "output": "web-app", "time_limit_s": 180, "expected_total": 1},
-    {"id": "stage-2", "dir": "hello-stage-2", "inputs": ["requirements.yaml"], "tests": ["tests"], "output": "web-app", "time_limit_s": 180, "expected_total": 1}
+    {"id": "stage-1", "dir": "hello-stage-1", "inputs": ["requirements.yaml"], "tests": ["tests"], "output": "web-app", "time_limit_s": 600, "expected_total": 1},
+    {"id": "stage-2", "dir": "hello-stage-2", "inputs": ["requirements.yaml"], "tests": ["tests"], "output": "web-app", "time_limit_s": 600, "expected_total": 1}
   ]
 }
