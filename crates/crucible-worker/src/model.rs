@@ -393,18 +393,7 @@ impl EvalRecord {
 /// 0–1: Σpassed / Σtotal over every scored stage of every replica, rounded
 /// to 4 decimals. `None` when nothing was scored.
 pub fn total_score(m: &Manifest) -> Option<f64> {
-    let (passed, total) = m
-        .replicas
-        .iter()
-        .flat_map(|r| r.stages.iter())
-        .filter_map(|s| s.score)
-        .fold((0u64, 0u64), |(p, t), s| {
-            (p + u64::from(s.passed), t + u64::from(s.total))
-        });
-    if total == 0 {
-        return None;
-    }
-    Some((passed as f64 / total as f64 * 10_000.0).round() / 10_000.0)
+    m.compute_total_score()
 }
 
 /// Body of `POST /internal/results/:id`.

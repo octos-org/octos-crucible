@@ -139,16 +139,24 @@ fn report_over_run_dir() {
 }
 
 #[test]
-fn score_is_still_todo() {
+fn help_lists_every_command() {
     let help = crucible(&["--help"], None);
     let text = String::from_utf8_lossy(&help.stdout);
-    assert!(
-        text.lines()
-            .any(|l| l.trim_start().starts_with("score") && l.contains("TODO"))
-    );
+    // Missing required arguments: usage error.
     assert_eq!(crucible(&["score"], None).status.code(), Some(2));
     for cmd in [
-        "plan", "fetch", "build", "run", "package", "taskset", "cred", "manifest",
+        "plan",
+        "plan-score",
+        "fetch",
+        "build",
+        "run",
+        "package",
+        "taskset",
+        "cred",
+        "manifest",
+        "score",
+        "download-zip",
+        "worker",
     ] {
         assert!(
             text.lines()

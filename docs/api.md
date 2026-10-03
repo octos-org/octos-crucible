@@ -144,7 +144,7 @@ workflow 通过 `/internal/status` 上报的精确状态优先。估计值只能
 | `GET /internal/cred/:id` | → `200 application/octet-stream`：KV 中原样保存的 envelope 字节（即 `cred_envelope` 经 base64 解码后的内容）。不存在或已过期返回 404。`crucible cred open` 同时接受原始字节和 base64。 |
 | `DELETE /internal/cred/:id` | → 204（幂等）。 |
 | `POST /internal/status/:id` | `{"status": "building" \| "running:<阶段名>" \| "scoring" \| "failed"}` → `200 {"ok":true,"status"}`。评测已结束时返回 409。 |
-| `POST /internal/results/:id` | 请求体是一个 crucible-core `Manifest`（`eval_id` 必须与 URL 一致），外加两个可选的顶层字段：`download: {"sha256": "<密码 zip 的哈希>"}`，以及 `status`（默认 `done`；如果只是回传部分结果、run 还在继续，可填 `running:<阶段>` 或 `scoring`）。不超过 2 MiB。Worker 存下 manifest（去掉这两个字段），更新状态；进入终态时删除凭据。→ `200 {"ok":true,"status"}` |
+| `POST /internal/results/:id` | 请求体是一个 crucible-core `Manifest`（`eval_id` 必须与 URL 一致；`download` 就是 Manifest 自带的字段，由 `crucible download-zip` 写入），外加两个可选的顶层字段：`download: {"sha256": "<密码 zip 的哈希>"}`，以及 `status`（默认 `done`；如果只是回传部分结果、run 还在继续，可填 `running:<阶段>` 或 `scoring`）。不超过 2 MiB。Worker 存下 manifest（去掉这两个字段），更新状态；进入终态时删除凭据。→ `200 {"ok":true,"status"}` |
 
 ## 触发参数（workflow_dispatch）
 
@@ -165,7 +165,7 @@ workflow 通过 `/internal/status` 上报的精确状态优先。估计值只能
 | `owner` | `<github_id>:<login>` |
 | `options` | JSON 字符串 `{"stages": N, "results_url": "<worker>/internal/results/<eval_id>", "budget"?: {...}}` |
 
-**app 模式 → `SCORE_WORKFLOW`（默认 `score.yml`，该 workflow 尚未实现，以下为本文约定）**
+**app 模式 → `SCORE_WORKFLOW`（默认 `score.yml`）**
 
 `eval_id`，`artifact_source` = `blob:<upload_hash>`，`taskset`，`stage`（从 1 开始的序号），`cred_source`（有凭据时为 `workers-kv`，否则为 `none`），`score_public`，`owner`，`results_url`。
 

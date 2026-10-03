@@ -6,7 +6,11 @@
 //! - `github-secret` (development): a repository secret holding the
 //!   credential sealed to the platform key (`crucible seal` output, raw or
 //!   base64), opened with the platform private key.
-//! - `workers-kv` (step 4): the user's sealed credential from Workers KV.
+//! - `workers-kv`: the user's sealed credential from Workers KV, fetched
+//!   with `GET <worker>/internal/cred/<eval_id>` (Bearer
+//!   `CRUCIBLE_WORKER_TOKEN`). It is `{api_key, endpoint, download_password,
+//!   eval_id}`; the eval id inside must match the run's, so a credential
+//!   cannot be replayed into another evaluation.
 
 use anyhow::{Result, anyhow, bail};
 use crucible_core::netpolicy::validate_endpoint;
@@ -29,10 +33,37 @@ impl CredSource {
     }
 }
 
+/// What the meter gets.
 #[derive(Deserialize, Serialize)]
 struct Cred {
     api_key: String,
     endpoint: String,
+}
+
+/// The whole opened credential.
+#[derive(Deserialize)]
+struct FullCred {
+    api_key: String,
+    endpoint: String,
+    #[serde(default)]
+    download_password: Option<String>,
+    #[serde(default)]
+    eval_id: Option<String>,
+}
+
+/// Open a sealed credential and check the eval id inside (required when
+/// `expect_eval_id` is given).
+fn open_full(sealed: &[u8], keys: &[PrivateKey], expect_eval_id: Option<&str>) -> Result<FullCred> {
+    let plain = crucible_crypto::open(keys, &sealed_bytes(sealed)?)?;
+    let cred: FullCred = serde_json::from_slice(&plain)
+        .map_err(|_| anyhow!("credential is not {{\"api_key\",\"endpoint\"}} JSON"))?;
+    drop(plain);
+    if let Some(want) = expect_eval_id
+        && cred.eval_id.as_deref() != Some(want)
+    {
+        bail!("credential belongs to another evaluation");
+    }
+    Ok(cred)
 }
 
 fn b64_val(c: u8) -> Option<u32> {
@@ -106,11 +137,13 @@ pub fn open_credential(
     sealed: &[u8],
     keys: &[PrivateKey],
     endpoint: Option<&str>,
+    expect_eval_id: Option<&str>,
 ) -> Result<String> {
-    let plain = crucible_crypto::open(keys, &sealed_bytes(sealed)?)?;
-    let mut cred: Cred = serde_json::from_slice(&plain)
-        .map_err(|_| anyhow!("credential is not {{\"api_key\",\"endpoint\"}} JSON"))?;
-    drop(plain);
+    let full = open_full(sealed, keys, expect_eval_id)?;
+    let mut cred = Cred {
+        api_key: full.api_key,
+        endpoint: full.endpoint,
+    };
     if let Some(e) = endpoint.filter(|e| !e.trim().is_empty()) {
         cred.endpoint = e.trim().to_owned();
     }
@@ -121,8 +154,25 @@ pub fn open_credential(
     Ok(serde_json::to_string(&cred)?)
 }
 
-/// Read the sealed credential for `source`.
-pub fn read_sealed(source: CredSource, sealed_env: &str) -> Result<Vec<u8>> {
+/// The download password of a sealed credential (eval id checked); `None`
+/// when it has none.
+pub fn download_password(
+    sealed: &[u8],
+    keys: &[PrivateKey],
+    expect_eval_id: &str,
+) -> Result<Option<String>> {
+    Ok(open_full(sealed, keys, Some(expect_eval_id))?
+        .download_password
+        .filter(|p| !p.is_empty()))
+}
+
+/// Read the sealed credential for `source`; `workers-kv` needs the Worker
+/// and the eval id.
+pub async fn read_sealed(
+    source: CredSource,
+    sealed_env: &str,
+    worker: Option<(&crate::worker::Worker, &str)>,
+) -> Result<Vec<u8>> {
     match source {
         CredSource::GithubSecret => {
             let v =
@@ -139,7 +189,11 @@ pub fn read_sealed(source: CredSource, sealed_env: &str) -> Result<Vec<u8>> {
             }
             Ok(bytes)
         }
-        CredSource::WorkersKv => bail!("cred_source workers-kv is not implemented yet (step 4)"),
+        CredSource::WorkersKv => {
+            let (w, eval_id) =
+                worker.ok_or_else(|| anyhow!("workers-kv needs --worker-url and --eval-id"))?;
+            w.get_cred(eval_id).await
+        }
     }
 }
 
@@ -167,7 +221,7 @@ mod tests {
         let sk = PrivateKey::generate();
         let plain = br#"{"api_key":"sk-SECRET","endpoint":"https://api.z.ai/api/coding/paas/v4"}"#;
         let sealed = crucible_crypto::seal(&sk.public(), plain).unwrap();
-        let line = open_credential(&sealed, std::slice::from_ref(&sk), None).unwrap();
+        let line = open_credential(&sealed, std::slice::from_ref(&sk), None, None).unwrap();
         assert!(line.contains("sk-SECRET") && line.contains("api.z.ai"));
         assert!(!line.contains('\n'));
         let b64: String = {
@@ -189,10 +243,36 @@ mod tests {
             b64.as_bytes(),
             std::slice::from_ref(&sk),
             Some("https://api.example.com/v1"),
+            None,
         )
         .unwrap();
         assert!(line.contains("api.example.com"));
-        assert!(open_credential(&sealed, &[sk], Some("http://127.0.0.1/v1")).is_err());
-        assert!(open_credential(b"garbage", &[PrivateKey::generate()], None).is_err());
+        assert!(open_credential(&sealed, &[sk], Some("http://127.0.0.1/v1"), None).is_err());
+        assert!(open_credential(b"garbage", &[PrivateKey::generate()], None, None).is_err());
+    }
+
+    #[test]
+    fn eval_id_checked_and_password_kept_out_of_the_meter_line() {
+        let sk = PrivateKey::generate();
+        let keys = std::slice::from_ref(&sk);
+        let plain = br#"{"api_key":"sk-S","endpoint":"https://api.z.ai/v4","download_password":"pw-1","eval_id":"ev-0000001"}"#;
+        let sealed = crucible_crypto::seal(&sk.public(), plain).unwrap();
+        let line = open_credential(&sealed, keys, None, Some("ev-0000001")).unwrap();
+        assert!(!line.contains("pw-1") && !line.contains("ev-0000001"));
+        assert!(open_credential(&sealed, keys, None, Some("ev-0000002")).is_err());
+        assert_eq!(
+            download_password(&sealed, keys, "ev-0000001")
+                .unwrap()
+                .as_deref(),
+            Some("pw-1")
+        );
+        assert!(download_password(&sealed, keys, "other-eval").is_err());
+        // Development credentials carry no eval id.
+        let dev = crucible_crypto::seal(
+            &sk.public(),
+            br#"{"api_key":"k","endpoint":"https://a.b/v1"}"#,
+        )
+        .unwrap();
+        assert!(open_credential(&dev, keys, None, Some("ev-0000001")).is_err());
     }
 }

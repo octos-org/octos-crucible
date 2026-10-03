@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use crucible_core::TaskSet;
 use crucible_core::manifest::{
-    AgentRef, BlobRef, JobTiming, Manifest, ReplicaEntry, RunRef, StageEntry, UsageTotals,
+    AgentRef, BlobRef, JobTiming, Manifest, Mode, ReplicaEntry, RunRef, StageEntry, StageScore,
+    UsageTotals,
 };
 use crucible_crypto::{PrivateKey, PublicKey};
 use crucible_metering::{Price, Pricing};
@@ -191,6 +192,9 @@ pub struct ManifestInputs<'a> {
     pub eval_id: &'a str,
     pub created_at: String,
     pub taskset: &'a TaskSet,
+    /// `agent`: the first `stages_run` stages ran. `app`: only stage
+    /// `stages_run` (1-based) of an uploaded output was scored.
+    pub mode: Mode,
     pub stages_run: usize,
     pub model: &'a str,
     pub agent: AgentRef,
@@ -206,6 +210,8 @@ pub struct ManifestInputs<'a> {
     pub score_public: bool,
     /// To read numbers from sealed logs.
     pub keys: &'a [PrivateKey],
+    /// `<dir>/<replica>/<stage>/score.json` from `crucible score`.
+    pub scores: Option<&'a Path>,
 }
 
 pub fn build_manifest(m: &ManifestInputs) -> Result<Manifest> {
@@ -219,11 +225,31 @@ pub fn build_manifest(m: &ManifestInputs) -> Result<Manifest> {
         let job = jobs.as_ref().and_then(|j| job_timing(j, r, m.run_step));
         let mut stages = Vec::new();
         let mut failure = None;
-        for st in m.taskset.stages.iter().take(m.stages_run) {
+        let stages_iter: Vec<&crucible_core::taskset::Stage> = match m.mode {
+            Mode::Agent => m.taskset.stages.iter().take(m.stages_run).collect(),
+            Mode::App => m
+                .taskset
+                .stages
+                .get(m.stages_run.wrapping_sub(1))
+                .into_iter()
+                .collect(),
+        };
+        if stages_iter.is_empty() {
+            bail!("no stage selected");
+        }
+        for st in stages_iter {
             let sdir = rdir.join(&st.id);
+            let score = match m.scores {
+                Some(dir) => crate::score::read_score(dir, r, &st.id)?.map(|s| StageScore {
+                    status: s.status,
+                    passed: s.passed,
+                    total: s.total,
+                }),
+                None => None,
+            };
             let (usage_raw, timing_raw) = stage_numbers(&sdir, m.keys)?;
             let timing: Option<Timing> = timing_raw.and_then(|b| serde_json::from_slice(&b).ok());
-            if timing.is_none() && failure.is_none() {
+            if m.mode == Mode::Agent && timing.is_none() && failure.is_none() {
                 failure = Some(format!("stage {} did not run", st.id));
             }
             let records = usage_raw
@@ -231,12 +257,12 @@ pub fn build_manifest(m: &ManifestInputs) -> Result<Manifest> {
                 .unwrap_or_default();
             let t = crucible_report::usage::summarise(&records, m.pricing, m.user_price).total;
             let output = blob(&sdir.join("checkpoint.sealed"))?;
-            if timing.is_some() && output.is_none() && failure.is_none() {
+            if (timing.is_some() || m.mode == Mode::App) && output.is_none() && failure.is_none() {
                 failure = Some(format!("stage {} left no checkpoint", st.id));
             }
             stages.push(StageEntry {
                 stage: st.id.clone(),
-                score: None,
+                score,
                 wall_s: timing.as_ref().map(|t| t.wall_s),
                 usage: UsageTotals {
                     requests: t.requests,
@@ -270,20 +296,52 @@ pub fn build_manifest(m: &ManifestInputs) -> Result<Manifest> {
             stages,
         });
     }
-    Ok(Manifest {
+    let mut manifest = Manifest {
         schema: 1,
         eval_id: m.eval_id.into(),
         created_at: m.created_at.clone(),
         taskset: m.taskset.name.clone(),
         agent: m.agent.clone(),
         model: m.model.into(),
-        mode: crucible_core::manifest::Mode::Agent,
+        mode: m.mode,
         owner: m.owner.clone(),
         score_public: m.score_public,
-        stages_run: Some(m.stages_run as u32),
+        stages_run: (m.mode == Mode::Agent).then_some(m.stages_run as u32),
         run: m.run.clone(),
         replicas,
-    })
+        total_score: None,
+        download: None,
+    };
+    manifest.total_score = manifest.compute_total_score();
+    Ok(manifest)
+}
+
+/// The submitter's download: every stage's output and logs of every
+/// replica, as `r<replica>/<stage>/{output,logs}.zip` in one AES-256 zip
+/// locked with the download password.
+pub fn download_zip(results: &Path, keys: &[PrivateKey], password: &str) -> Result<Vec<u8>> {
+    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+    for f in sealed_files(results)? {
+        let rel = f.strip_prefix(results)?;
+        let parts: Vec<&str> = rel.iter().filter_map(|c| c.to_str()).collect();
+        let name = match parts.as_slice() {
+            [r, stage, "checkpoint.sealed"] => format!("r{r}/{stage}/output.zip"),
+            [r, stage, "logs.sealed"] => format!("r{r}/{stage}/logs.zip"),
+            _ => continue,
+        };
+        let plain = crucible_crypto::open(keys, &std::fs::read(&f)?)
+            .with_context(|| format!("opening {}", f.display()))?;
+        files.push((name, plain));
+    }
+    if files.is_empty() {
+        bail!("no stage outputs to package");
+    }
+    let zip = crucible_crypto::write_password_zip(
+        Cursor::new(Vec::new()),
+        files.iter().map(|(n, d)| (n.as_str(), d.as_slice())),
+        password,
+    )?;
+    Ok(zip.into_inner())
 }
 
 /// All `*.sealed` files under `dir`, sorted.
@@ -379,6 +437,7 @@ mod tests {
             eval_id: "dev-1-1",
             created_at: "2026-10-03T10:06:00Z".into(),
             taskset: &ts,
+            mode: Mode::Agent,
             stages_run: 1,
             model: "glm-5.3-flash",
             agent: AgentRef {
@@ -397,6 +456,7 @@ mod tests {
             owner: None,
             score_public: false,
             keys: std::slice::from_ref(&sk),
+            scores: None,
         };
         let m = build_manifest(&inputs).unwrap();
         let r = &m.replicas[0];
@@ -412,7 +472,38 @@ mod tests {
         assert_eq!(s.output.as_ref().unwrap().key_id, sk.public().key_id());
         assert_eq!(s.output.as_ref().unwrap().sha256, done[1].2);
         assert!(s.score.is_none());
+        assert!(m.total_score.is_none());
         assert_eq!(r.stages.len(), 1);
+
+        // With scores: the stage score and the total.
+        let scores = d.path().join("scores/1/stage-1");
+        std::fs::create_dir_all(&scores).unwrap();
+        std::fs::write(
+            scores.join("score.json"),
+            r#"{"status":"failed","passed":2,"total":3,"detail":"1/3 tests failed"}"#,
+        )
+        .unwrap();
+        let scores_dir = d.path().join("scores");
+        let scored = build_manifest(&ManifestInputs {
+            scores: Some(&scores_dir),
+            created_at: inputs.created_at.clone(),
+            agent: inputs.agent.clone(),
+            run: inputs.run.clone(),
+            owner: inputs.owner.clone(),
+            ..inputs
+        })
+        .unwrap();
+        let sc = scored.replicas[0].stages[0].score.unwrap();
+        assert_eq!((sc.passed, sc.total), (2, 3));
+        assert_eq!(scored.total_score, Some(0.6667));
+
+        // The download: outputs and logs under a password.
+        let z = download_zip(&d.path().join("results"), std::slice::from_ref(&sk), "pw").unwrap();
+        let files = crucible_crypto::read_password_zip(&z, "pw").unwrap();
+        let names: Vec<&str> = files.iter().map(|f| f.0.as_str()).collect();
+        assert_eq!(names, ["r1/stage-1/output.zip", "r1/stage-1/logs.zip"]);
+        assert_eq!(files[0].1, b"PK-app");
+        assert!(crucible_crypto::read_password_zip(&z, "nope").is_err());
         assert_eq!(sealed_files(&d.path().join("results")).unwrap().len(), 3);
         // Without the key the numbers cannot be read.
         let no_key = ManifestInputs {
