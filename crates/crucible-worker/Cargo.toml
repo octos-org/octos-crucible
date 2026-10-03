@@ -1,0 +1,29 @@
+[package]
+name = "crucible-worker"
+description = "Cloudflare Worker backend of octos-crucible (workers-rs)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+# cdylib for the Worker (wasm32), rlib so the native tests can link the
+# platform-independent core.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+crucible-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+hmac = "0.12"
+base64 = "0.22"
+
+# The Workers runtime glue only exists on wasm32; everything else is plain
+# Rust that the native unit and flow tests exercise.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+worker = "0.8"
+getrandom = { version = "0.2", features = ["js"] }

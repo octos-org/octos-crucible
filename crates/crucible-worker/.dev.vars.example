@@ -1,0 +1,13 @@
+# Copy to .dev.vars for `npx wrangler dev` (never commit .dev.vars).
+# Dummy values: local development against a mock GitHub only.
+DEV_AUTH=1
+GITHUB_API_BASE=http://127.0.0.1:9911
+GITHUB_WEB_BASE=http://127.0.0.1:9911
+PAGES_ORIGIN=http://localhost:5173
+PAGES_URL=http://localhost:5173/
+ADMIN_GITHUB_IDS=1
+GITHUB_CLIENT_ID=dev-client
+GITHUB_CLIENT_SECRET=dev-secret
+GITHUB_TOKEN=dev-github-token
+SESSION_HMAC_KEY=dev-session-key-dev-session-key-0000
+CRUCIBLE_WORKER_TOKEN=dev-worker-token-dev-worker-token-0000
