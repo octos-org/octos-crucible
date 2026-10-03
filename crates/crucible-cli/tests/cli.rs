@@ -304,25 +304,18 @@ fn taskset_pack_inputs_and_plan() {
 fn cred_open_from_env_pipes_one_line() {
     let sk = PrivateKey::generate();
     let plain = br#"{"api_key":"sk-SECRET","endpoint":"https://api.z.ai/api/coding/paas/v4"}"#;
+    // Stored as a GitHub secret: base64 text (secrets must be UTF-8).
     let sealed = crucible(
-        &["seal", "--recipient", &sk.public().to_string()],
+        &["seal", "--recipient", &sk.public().to_string(), "--base64"],
         Some(plain),
     );
-    // Stored as a GitHub secret: base64 of the sealed bytes.
-    let b64 = {
-        const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut s = String::new();
-        for ch in sealed.stdout.chunks(3) {
-            let n = ch
-                .iter()
-                .enumerate()
-                .fold(0u32, |a, (i, b)| a | (*b as u32) << (16 - 8 * i));
-            for i in 0..=ch.len() {
-                s.push(T[(n >> (18 - 6 * i) & 63) as usize] as char);
-            }
-        }
-        s
-    };
+    assert!(sealed.status.success());
+    let b64 = String::from_utf8(sealed.stdout).unwrap();
+    assert!(
+        b64.trim()
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"+/=".contains(&b))
+    );
     let key = sk.to_secret_string();
     let out = crucible_env(
         &[

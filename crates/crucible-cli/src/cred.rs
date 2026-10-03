@@ -46,6 +46,26 @@ fn b64_val(c: u8) -> Option<u32> {
     } as u32)
 }
 
+/// Standard base64 with padding, one line.
+pub fn base64_encode(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut s = String::with_capacity(data.len().div_ceil(3) * 4);
+    for ch in data.chunks(3) {
+        let n = ch
+            .iter()
+            .enumerate()
+            .fold(0u32, |a, (i, b)| a | (*b as u32) << (16 - 8 * i));
+        for i in 0..4 {
+            if i <= ch.len() {
+                s.push(T[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                s.push('=');
+            }
+        }
+    }
+    s
+}
+
 /// Standard or URL-safe base64, whitespace and padding ignored.
 pub fn base64_decode(s: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(s.len() * 3 / 4);
@@ -132,6 +152,14 @@ mod tests {
         assert_eq!(base64_decode(b"aGVsbG8=").unwrap(), b"hello");
         assert_eq!(base64_decode(b"aGVs\nbG8").unwrap(), b"hello");
         assert!(base64_decode(b"a*b").is_none());
+        for n in 0..20 {
+            let data: Vec<u8> = (0..n).map(|i| (i * 37 + 200) as u8).collect();
+            assert_eq!(
+                base64_decode(base64_encode(&data).as_bytes()).unwrap(),
+                data
+            );
+        }
+        assert_eq!(base64_encode(b"hello"), "aGVsbG8=");
     }
 
     #[test]

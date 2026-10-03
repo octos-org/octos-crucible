@@ -61,6 +61,9 @@ enum Cmd {
         /// Output file, `-` for stdout.
         #[arg(long, default_value = "-")]
         out: String,
+        /// Write base64 text instead of binary (e.g. for a GitHub secret).
+        #[arg(long)]
+        base64: bool,
     },
     /// Decrypt a sealed file. The key is picked by the key id in the file.
     Open {
@@ -284,10 +287,15 @@ async fn run(cmd: Cmd) -> Result<()> {
             recipient,
             input,
             out,
+            base64,
         } => {
             let key: PublicKey = recipient.parse()?;
             let sealed = crucible_crypto::seal(&key, &read_input(&input)?)?;
-            write_output(&out, &sealed)
+            if base64 {
+                write_output(&out, (cred::base64_encode(&sealed) + "\n").as_bytes())
+            } else {
+                write_output(&out, &sealed)
+            }
         }
         Cmd::Open {
             identity,
