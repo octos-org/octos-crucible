@@ -1,0 +1,23 @@
+[package]
+name = "crucible-store"
+description = "Content-addressed blob store: put(bytes) -> sha256, get(sha256) -> bytes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+reqwest = { workspace = true, features = ["json"] }
+url.workspace = true
+sha2.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+wiremock.workspace = true
+serde_json.workspace = true
