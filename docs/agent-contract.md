@@ -105,3 +105,11 @@ exec timeout "$DEADLINE_S" python3 /opt/agent/agent.py --requirements /req --wor
 `agent.py` 读 `/req` 下的需求，在 `--workdir` 里写代码，调模型时使用 `OpenAI()`（不指定 base_url，让 SDK 从环境变量读取）。它不需要知道当前是第几阶段：第二阶段启动时，`/work` 里已经有第一阶段留下的代码，`/req` 换成了新的需求。
 
 把目录内容（`agent.json` 在 zip 根目录）打成 zip 上传即可。
+
+## Codex 示例
+
+`agents/codex/` 是内置的 OpenAI Codex CLI，与其他包格式相同：
+
+- `Dockerfile`：从源码编译 `openai/codex`（`upstream.json` 固定为 `rust-v0.93.0`，平台解析为 SHA 后经 `AGENT_REF` 传入），先打 `patches/zai-role-compat.patch`（z.ai 的 chat completions 不接受 `developer` 角色，改为 `system`）。不用官方二进制，是因为需要这个补丁；不升级版本，是因为之后的 Codex 去掉了 `wire_api = "chat"`，而计量代理只提供 `/chat/completions`。
+- `entry.sh`：每阶段把 `$HOME/.codex/config.toml` 写成指向 `OPENAI_BASE_URL` 的 chat wire 提供方（`env_key = "OPENAI_API_KEY"`，即 `dummy`），在 `DEADLINE_S` 前略早结束 `codex exec --skip-git-repo-check -s danger-full-access -C /work`。容器本身就是沙箱，所以关掉 Codex 自带的沙箱。
+- `prompt.txt`：读 `/req`，在 `/work` 里写；`/work` 里已有代码时就地扩展。`agent.json` 设 `streaming: true`，`app_start_cmd: ["node", "server.js"]`。

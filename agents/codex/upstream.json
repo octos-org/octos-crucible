@@ -1,0 +1,5 @@
+{
+  "repo": "https://github.com/openai/codex",
+  "ref": "refs/tags/rust-v0.93.0",
+  "build_arg": "AGENT_REF"
+}
