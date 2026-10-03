@@ -140,6 +140,12 @@ enum Cmd {
         pkg: PathBuf,
         #[arg(long, default_value = "crucible-agent:run")]
         tag: String,
+        /// KEY=VALUE build arg (repeatable).
+        #[arg(long = "build-arg")]
+        build_arg: Vec<String>,
+        /// Fail unless /agent-build.json in the image records this commit.
+        #[arg(long)]
+        expect_commit: Option<String>,
     },
     /// Run the agent stage by stage. Reads {"api_key","endpoint"} as one JSON line on stdin.
     Run(Box<run::RunArgs>),
@@ -384,8 +390,17 @@ async fn run(cmd: Cmd) -> Result<()> {
             println!("{}", serde_json::to_string(&facts)?);
             Ok(())
         }
-        Cmd::Build { pkg, tag } => {
-            let facts = build::build(&pkg, &tag)?;
+        Cmd::Build {
+            pkg,
+            tag,
+            build_arg,
+            expect_commit,
+        } => {
+            let opts = build::BuildOpts {
+                build_args: build_arg,
+                expect_commit,
+            };
+            let facts = build::build(&pkg, &tag, &opts)?;
             println!("{}", serde_json::to_string(&facts)?);
             Ok(())
         }
@@ -653,10 +668,12 @@ fn manifest(a: ManifestArgs) -> Result<()> {
         bail!("no replica left agent facts (agent.sealed)");
     }
     let text = |v: &serde_json::Value| v.as_str().map(|s| s.chars().take(100).collect::<String>());
+    // Builtin agents: the source commit the build was pinned to (checked
+    // against the image's /agent-build.json by `crucible build`).
     let commit = text(&facts["commit"]).or_else(|| {
         build
             .as_ref()
-            .and_then(|b| text(&b["agent_build"]["commit"]))
+            .and_then(|b| text(&b["expected_commit"]).or_else(|| text(&b["agent_build"]["commit"])))
     });
     let package = match (
         text(&facts["package_sha256"]),

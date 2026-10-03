@@ -50,6 +50,8 @@ my-agent/
 
 类型定义见 `crates/crucible-core/src/agent.rs`（`AgentSpec`）。
 
+内置 agent 若从另一个仓库构建，可在包里带 `upstream.json`（`{"repo", "ref", "build_arg"}`）：平台构建前用 `git ls-remote` 把 `ref` 解析为完整 commit，经 `--build-arg <build_arg>=<commit>` 构建，构建后核对镜像里 `/agent-build.json` 的 `commit` 与之相同（不同则失败），并把它记入评测清单。上传的 agent 忽略此文件。
+
 ## 运行环境
 
 每个阶段，平台在同一个容器配置下执行一次 `entrypoint`（每阶段一个新容器，同一个镜像）。

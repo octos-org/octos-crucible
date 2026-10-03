@@ -215,13 +215,28 @@ jobs:
 
       - name: Build agent image (no secret on this machine)
         timeout-minutes: 60
+        env:
+          AGENT_KIND: ${{ needs.setup.outputs.agent_kind }}
         run: |
           set -euo pipefail
           # Nothing from the package runs on the host: it is the build
           # context, RUN steps execute in BuildKit containers.
-          "$CRUCIBLE" build --pkg "$RUNNER_TEMP/agent-pkg" --tag crucible-agent:run 2> "$RUNNER_TEMP/build.log" > "$RUNNER_TEMP/build.json" \
+          opts=()
+          up="$RUNNER_TEMP/agent-pkg/upstream.json"
+          if [ "$AGENT_KIND" = builtin ] && [ -f "$up" ]; then
+            # A builtin agent built from another repo: resolve its branch to
+            # a full commit now and build exactly that (never a moving
+            # "main"); `crucible build` checks the image's
+            # /agent-build.json against it and build.json records it.
+            repo=$(jq -r .repo "$up"); ref=$(jq -r .ref "$up"); arg=$(jq -r .build_arg "$up")
+            commit=$(git ls-remote "$repo" "$ref" | head -n1 | cut -f1)
+            [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::cannot resolve $ref of $repo"; exit 1; }
+            echo "agent source: $repo $ref = $commit"
+            opts=(--build-arg "$arg=$commit" --expect-commit "$commit")
+          fi
+          "$CRUCIBLE" build --pkg "$RUNNER_TEMP/agent-pkg" --tag crucible-agent:run "${opts[@]}" 2> "$RUNNER_TEMP/build.log" > "$RUNNER_TEMP/build.json" \
             || { echo "::error::agent image build failed"; tail -c 3000 "$RUNNER_TEMP/build.log"; exit 1; }
-          jq -c '{size_bytes}' "$RUNNER_TEMP/build.json"
+          jq -c '{size_bytes, commit: .agent_build.commit}' "$RUNNER_TEMP/build.json"
 
       - name: Fetch stage inputs (never the tests)
         env:
