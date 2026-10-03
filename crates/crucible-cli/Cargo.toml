@@ -1,0 +1,30 @@
+[package]
+name = "crucible-cli"
+description = "The `crucible` command line tool"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "crucible"
+path = "src/main.rs"
+
+[dependencies]
+crucible-core.workspace = true
+crucible-metering.workspace = true
+crucible-meter.workspace = true
+crucible-egress.workspace = true
+crucible-crypto.workspace = true
+crucible-store.workspace = true
+crucible-report.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+serde_json.workspace = true
