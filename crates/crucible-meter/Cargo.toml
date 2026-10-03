@@ -1,0 +1,27 @@
+[package]
+name = "crucible-meter"
+description = "Metering proxy between an agent and the user's OpenAI-compatible endpoint"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+crucible-core.workspace = true
+crucible-metering.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+url.workspace = true
+tokio.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
+reqwest.workspace = true
+humantime.workspace = true
+clap.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
