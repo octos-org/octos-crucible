@@ -1,7 +1,8 @@
 name: worker
 
-# Build and test the Cloudflare Worker (crates/crucible-worker). Never
-# deploys and uses no secrets.
+# Build and test the Cloudflare Worker (crates/crucible-worker). On push to
+# main, the separate `deploy` job publishes it to Cloudflare; only that job
+# sees the Cloudflare token.
 
 on:
   pull_request:
@@ -83,3 +84,29 @@ jobs:
             sleep 2
           done
           node dev/e2e.mjs http://localhost:8787 http://127.0.0.1:9911 || { tail -50 wrangler.log; exit 1; }
+
+  deploy:
+    needs: worker
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    concurrency:
+      group: worker-deploy
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+      - name: install worker-build
+        run: cargo install worker-build --version 0.8.6 --locked
+      - name: deploy
+        working-directory: crates/crucible-worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          WRANGLER_SEND_METRICS: "false"
+        run: npx --yes wrangler@4 deploy
