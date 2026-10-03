@@ -12,6 +12,7 @@
 pub mod app;
 pub mod authz;
 pub mod config;
+pub mod dispatch;
 pub mod github;
 pub mod http;
 pub mod keys;

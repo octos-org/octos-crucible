@@ -1,19 +1,16 @@
 //! The GitHub calls the Worker makes: OAuth, release assets, workflow
 //! dispatch, run status, taskset listing. Nothing here logs a token.
 
-use crucible_core::TaskSet;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::Config;
 use crate::http::{ApiError, Backend, HttpRequest, HttpResponse, PutOptions};
-use crate::model::Status;
+use crate::model::{BUILDING, FAILED, QUEUED, SCORING, is_slug};
 use crate::util::{b64_decode_lenient, pct_encode, rfc3339};
 
 const API_VERSION: &str = "2022-11-28";
 const USER_AGENT: &str = concat!("crucible-worker/", env!("CARGO_PKG_VERSION"));
-/// Longest a taskset may run end to end: one GitHub-hosted job.
-pub const MAX_TASKSET_S: u64 = 6 * 3600;
 /// Keeps `/tasksets` within the Worker's per-request subrequest budget.
 const MAX_TASKSETS: usize = 20;
 
@@ -262,12 +259,9 @@ impl<'a, B: Backend> GitHub<'a, B> {
 
     // ---- Actions --------------------------------------------------------
 
-    pub async fn dispatch(&self, inputs: &Value) -> Result<(), ApiError> {
+    pub async fn dispatch(&self, workflow: &str, inputs: &Value) -> Result<(), ApiError> {
         let r = Self::with_json(
-            self.repo(
-                "POST",
-                &format!("actions/workflows/{}/dispatches", self.cfg.eval_workflow),
-            ),
+            self.repo("POST", &format!("actions/workflows/{workflow}/dispatches")),
             &serde_json::json!({"ref": self.cfg.eval_ref, "inputs": inputs}),
         );
         let resp = self.send("workflow dispatch", r).await?;
@@ -277,18 +271,18 @@ impl<'a, B: Backend> GitHub<'a, B> {
         }
     }
 
-    /// The run whose `run-name` contains `eval_id` (eval.yml sets
-    /// `run-name: eval ${{ inputs.eval_id }}`).
+    /// The run whose `run-name` contains `eval_id` (the workflow's
+    /// `run-name` must include `${{ inputs.eval_id }}`).
     pub async fn find_run(
         &self,
+        workflow: &str,
         eval_id: &str,
         created_s: u64,
     ) -> Result<Option<RunInfo>, ApiError> {
         // Day granularity, one day early to absorb clock and timezone skew.
         let since = &rfc3339(created_s.saturating_sub(86_400))[..10];
         let path = format!(
-            "actions/workflows/{}/runs?event=workflow_dispatch&per_page=100&created={}",
-            self.cfg.eval_workflow,
+            "actions/workflows/{workflow}/runs?event=workflow_dispatch&per_page=100&created={}",
             pct_encode(&format!(">={since}"))
         );
         let resp = self.send("list runs", self.repo("GET", &path)).await?;
@@ -317,7 +311,7 @@ impl<'a, B: Backend> GitHub<'a, B> {
             .ok_or_else(|| ApiError::upstream("GitHub get run: bad body"))
     }
 
-    /// Name of the first job still in progress, as a coarse phase.
+    /// Name of the first job still in progress.
     pub async fn current_job(&self, run_id: u64) -> Result<Option<String>, ApiError> {
         let resp = self
             .send(
@@ -391,19 +385,42 @@ impl<'a, B: Backend> GitHub<'a, B> {
     }
 }
 
+/// The parts of `taskset.json` the page needs. Parsed locally rather than
+/// through crucible-core's `TaskSet`, whose shape is still moving; unknown
+/// fields are ignored.
+#[derive(Deserialize)]
+struct TasksetFile {
+    name: String,
+    #[serde(default)]
+    version: Option<Value>,
+    stages: Vec<StageFile>,
+}
+
+#[derive(Deserialize)]
+struct StageFile {
+    id: String,
+    time_limit_s: u64,
+    #[serde(default)]
+    expected_total: Option<u32>,
+}
+
 /// A contents-API file object → taskset summary. The taskset's name must
 /// equal its directory. `version` is the file's own `version` field when
 /// present, else `git-<blob sha prefix>`.
 pub fn parse_taskset_file(dir: &str, file: &Value) -> Option<TasksetInfo> {
     let raw = b64_decode_lenient(file.get("content")?.as_str()?)?;
-    let value: Value = serde_json::from_slice(&raw).ok()?;
-    let ts: TaskSet = serde_json::from_value(value.clone()).ok()?;
-    ts.validate(MAX_TASKSET_S).ok()?;
-    if ts.name != dir {
+    let ts: TasksetFile = serde_json::from_slice(&raw).ok()?;
+    let stages_ok = !ts.stages.is_empty()
+        && ts.stages.len() <= 50
+        && ts
+            .stages
+            .iter()
+            .all(|s| is_slug(&s.id) && s.time_limit_s > 0);
+    if ts.name != dir || !is_slug(&ts.name) || !stages_ok {
         return None;
     }
-    let version = match value.get("version") {
-        Some(Value::String(s)) if !s.is_empty() && s.len() <= 64 => s.clone(),
+    let version = match ts.version {
+        Some(Value::String(s)) if !s.is_empty() && s.len() <= 64 => s,
         Some(Value::Number(n)) => n.to_string(),
         _ => format!(
             "git-{}",
@@ -420,9 +437,9 @@ pub fn parse_taskset_file(dir: &str, file: &Value) -> Option<TasksetInfo> {
         version,
         stages: ts
             .stages
-            .iter()
+            .into_iter()
             .map(|s| StageInfo {
-                name: s.id.clone(),
+                name: s.id,
                 time_limit_s: s.time_limit_s,
                 total: s.expected_total,
             })
@@ -439,20 +456,41 @@ pub fn upload_url(template: &str, name: &str) -> Option<String> {
     Some(format!("{base}?name={}", pct_encode(name)))
 }
 
-/// GitHub run state → eval status and phase. `has_manifest` is false here
-/// by construction (a manifest settles the status).
-pub fn map_run(run: &RunInfo) -> (Status, Option<String>) {
+/// What GitHub says about a run that has not delivered results.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunView {
+    /// A status estimated from the run and its current job.
+    Status(String),
+    /// Finished successfully, but results have not arrived (yet).
+    CompletedOk,
+}
+
+/// GitHub run state (+ the in-progress job's name) → eval status. Only a
+/// fallback: the workflow reports precise progress via
+/// `POST /internal/status/:id`. Job names: `generate*`/`run*` →
+/// `running:<first stage>`, `score*`/`publish*` → scoring, anything else
+/// (setup, build) → building.
+pub fn view_run(run: &RunInfo, job: Option<&str>, first_stage: Option<&str>) -> RunView {
     match run.status.as_str() {
         "completed" => match run.conclusion.as_deref() {
-            // Results are posted from inside the run; until they land the
-            // eval is still finishing.
-            Some("success") => (Status::Running, Some("publishing results".into())),
-            Some("cancelled") => (Status::Cancelled, Some("cancelled".into())),
-            Some(c) => (Status::Failed, Some(format!("run {c}"))),
-            None => (Status::Failed, Some("run failed".into())),
+            Some("success") => RunView::CompletedOk,
+            _ => RunView::Status(FAILED.into()),
         },
-        "in_progress" => (Status::Running, None),
-        _ => (Status::Queued, Some("waiting for a runner".into())),
+        "in_progress" => {
+            let job = job.unwrap_or_default().to_ascii_lowercase();
+            let s = if job.starts_with("score") || job.starts_with("publish") {
+                SCORING.to_owned()
+            } else if job.starts_with("generate") || job.starts_with("run") {
+                match first_stage {
+                    Some(stage) => format!("running:{stage}"),
+                    None => BUILDING.to_owned(),
+                }
+            } else {
+                BUILDING.to_owned()
+            };
+            RunView::Status(s)
+        }
+        _ => RunView::Status(QUEUED.into()),
     }
 }
 
@@ -484,20 +522,19 @@ mod tests {
             conclusion: conclusion.map(str::to_owned),
             display_title: String::new(),
         };
-        assert_eq!(map_run(&run("queued", None)).0, Status::Queued);
-        assert_eq!(map_run(&run("in_progress", None)).0, Status::Running);
+        let st = |s: &str| RunView::Status(s.into());
+        let busy = run("in_progress", None);
+        assert_eq!(view_run(&run("queued", None), None, None), st("queued"));
+        assert_eq!(view_run(&busy, Some("setup"), Some("stage-1")), st("building"));
         assert_eq!(
-            map_run(&run("completed", Some("success"))).0,
-            Status::Running
+            view_run(&busy, Some("generate r1"), Some("stage-1")),
+            st("running:stage-1")
         );
-        assert_eq!(
-            map_run(&run("completed", Some("failure"))).0,
-            Status::Failed
-        );
-        assert_eq!(
-            map_run(&run("completed", Some("cancelled"))).0,
-            Status::Cancelled
-        );
+        assert_eq!(view_run(&busy, Some("publish"), None), st("scoring"));
+        let done = |c: &str| view_run(&run("completed", Some(c)), None, None);
+        assert_eq!(done("success"), RunView::CompletedOk);
+        assert_eq!(done("failure"), st("failed"));
+        assert_eq!(done("cancelled"), st("failed"));
     }
 
     #[test]
@@ -525,8 +562,23 @@ mod tests {
             "git-0123456789ab"
         );
 
-        let too_long = json.replace("3600", "999999");
-        let file = serde_json::json!({"sha": "x", "content": b64_encode(too_long.as_bytes())});
+        let bad_stage = json.replace(r#""id":"stage-1""#, r#""id":"Stage 1""#);
+        let file = serde_json::json!({"sha": "x", "content": b64_encode(bad_stage.as_bytes())});
         assert!(parse_taskset_file("github-full", &file).is_none());
+    }
+
+    /// The step-2 format (inputs_blob/tests_blob, kebab-case output,
+    /// total_time_limit_s) parses too.
+    #[test]
+    fn taskset_step2_format() {
+        let json = r#"{"schema":1,"name":"arcbench-github","scorer":{"name":"playwright"},"aggregate":"sum",
+          "total_time_limit_s":15600,"stages":[
+          {"id":"stage-1","inputs_blob":{"sha256":"aa","key_id":"k"},"tests_blob":{"sha256":"bb","key_id":"k"},"output":"web-app","time_limit_s":4800,"expected_total":30},
+          {"id":"stage-2","inputs_blob":{"sha256":"aa","key_id":"k"},"tests_blob":{"sha256":"bb","key_id":"k"},"output":"web-app","time_limit_s":4800}]}"#;
+        let file = serde_json::json!({"sha": "fedcba9876543210", "content": b64_encode(json.as_bytes())});
+        let t = parse_taskset_file("arcbench-github", &file).unwrap();
+        assert_eq!(t.stages.len(), 2);
+        assert_eq!(t.stages[1].total, None);
+        assert_eq!(t.version, "git-fedcba987654");
     }
 }

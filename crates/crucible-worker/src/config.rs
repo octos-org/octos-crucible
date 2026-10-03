@@ -17,7 +17,10 @@ pub struct Config {
     /// Public base URL of this Worker, for `results_url`; the request
     /// origin when unset.
     pub worker_url: Option<String>,
+    /// Agent mode (full evaluation).
     pub eval_workflow: String,
+    /// App mode (score an uploaded artifact).
+    pub score_workflow: String,
     pub eval_ref: String,
     pub github_api: String,
     pub github_web: String,
@@ -103,8 +106,12 @@ impl Config {
                 && s.bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b"-_./".contains(&b))
         };
-        if !safe(&eval_workflow) || eval_workflow.contains('/') || !safe(&eval_ref) {
-            return Err("EVAL_WORKFLOW / EVAL_REF contain unexpected characters".into());
+        let score_workflow = opt("SCORE_WORKFLOW").unwrap_or_else(|| "score.yml".into());
+        let file_ok = |s: &str| safe(s) && !s.contains('/');
+        if !file_ok(&eval_workflow) || !file_ok(&score_workflow) || !safe(&eval_ref) {
+            return Err(
+                "EVAL_WORKFLOW / SCORE_WORKFLOW / EVAL_REF contain unexpected characters".into(),
+            );
         }
 
         let (github_api, github_web) = if dev_auth {
@@ -132,6 +139,7 @@ impl Config {
             admin_ids,
             worker_url,
             eval_workflow,
+            score_workflow,
             eval_ref,
             github_api: github_api.trim_end_matches('/').to_owned(),
             github_web: github_web.trim_end_matches('/').to_owned(),

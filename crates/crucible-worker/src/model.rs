@@ -9,11 +9,13 @@ use crate::keys::{SealError, check_sealed};
 use crate::shard::is_hash;
 use crate::util::b64_decode;
 
+/// Sealed bytes, as the page checks them before uploading.
 pub const MAX_UPLOAD: usize = 25 * 1024 * 1024;
 pub const MAX_EVAL_BODY: usize = 64 * 1024;
 pub const MAX_CRED: usize = 16 * 1024;
 pub const MAX_RESULTS_BODY: usize = 2 * 1024 * 1024;
-pub const MAX_REPLICAS: u32 = 5;
+/// Same limit as the page (the workflow allows more).
+pub const MAX_REPLICAS: u32 = 10;
 pub const CRED_TTL_S: u64 = 86_400;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,7 +23,7 @@ pub const CRED_TTL_S: u64 = 86_400;
 pub enum Mode {
     /// Upload an agent package; full evaluation with the user's model key.
     Agent,
-    /// Upload a finished artifact; score only.
+    /// Upload a finished artifact; score one stage only.
     App,
 }
 
@@ -41,19 +43,36 @@ impl Mode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Status {
-    Queued,
-    Running,
-    Succeeded,
-    Failed,
-    Cancelled,
+// ---- status ------------------------------------------------------------
+//
+// Fixed values shared with the page:
+// `queued | building | running:<stage> | scoring | done | failed`.
+
+pub const QUEUED: &str = "queued";
+pub const BUILDING: &str = "building";
+pub const SCORING: &str = "scoring";
+pub const DONE: &str = "done";
+pub const FAILED: &str = "failed";
+
+pub fn is_status(s: &str) -> bool {
+    match s.strip_prefix("running:") {
+        Some(stage) => is_slug(stage),
+        None => matches!(s, QUEUED | BUILDING | SCORING | DONE | FAILED),
+    }
 }
 
-impl Status {
-    pub fn is_terminal(self) -> bool {
-        matches!(self, Status::Succeeded | Status::Failed | Status::Cancelled)
+pub fn is_terminal(s: &str) -> bool {
+    matches!(s, DONE | FAILED)
+}
+
+/// Progress order; status never moves backwards.
+pub fn status_rank(s: &str) -> u8 {
+    match s {
+        QUEUED => 0,
+        BUILDING => 1,
+        SCORING => 3,
+        DONE | FAILED => 4,
+        _ => 2, // running:<stage>
     }
 }
 
@@ -97,11 +116,12 @@ pub struct ValidEval {
     pub eval_id: String,
     pub upload_hash: String,
     pub taskset: String,
+    /// agent: run the first N stages (None = all); app: 1-based stage number.
     pub stages: Option<u32>,
     pub model: Option<String>,
     pub replicas: u32,
     pub budget: Option<Budget>,
-    /// Sealed bytes (agent mode only).
+    /// Sealed bytes, stored as received (decoded from base64).
     pub cred: Option<Vec<u8>>,
     pub score_public: bool,
 }
@@ -121,7 +141,7 @@ pub fn is_uuid_v4(s: &str) -> bool {
     })
 }
 
-/// `[a-z0-9][a-z0-9-]{0,63}` — same rule as crucible-core's taskset names.
+/// `[a-z0-9][a-z0-9-]{0,63}` — crucible-core's rule for taskset/stage names.
 pub fn is_slug(s: &str) -> bool {
     let b = s.as_bytes();
     !b.is_empty()
@@ -131,20 +151,42 @@ pub fn is_slug(s: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
 }
 
-/// `[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}`: provider model names such as
-/// `gpt-5.1`, `glm-5.3`, `anthropic/claude-x`, `org/model:tag`.
+/// `[A-Za-z0-9][A-Za-z0-9._:/-]{0,79}`: what eval.yml's `crucible plan`
+/// accepts (`glm-5.3`, `anthropic/claude-x`, `org/model:tag`).
 pub fn is_model(s: &str) -> bool {
     let b = s.as_bytes();
     !b.is_empty()
-        && b.len() <= 128
+        && b.len() <= 80
         && b[0].is_ascii_alphanumeric()
         && b.iter()
-            .all(|c| c.is_ascii_alphanumeric() || b"._:/@+-".contains(c))
+            .all(|c| c.is_ascii_alphanumeric() || b"._:/-".contains(c))
 }
 
 /// GitHub login: `[A-Za-z0-9-]{1,39}`.
 pub fn is_login(s: &str) -> bool {
     !s.is_empty() && s.len() <= 39 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+const MODEL_RULE: &str = "model must match [A-Za-z0-9][A-Za-z0-9._:/-]{0,79}";
+
+fn decode_cred(cred: &str, current_key_id: &str) -> Result<Vec<u8>, ApiError> {
+    let bad = |m: &str| ApiError::bad_request(m.to_owned());
+    if cred.len() > MAX_CRED * 2 {
+        return Err(bad("cred_envelope is too large"));
+    }
+    let sealed = b64_decode(cred).ok_or_else(|| bad("cred_envelope must be standard base64"))?;
+    if sealed.len() > MAX_CRED {
+        return Err(bad("cred_envelope is too large"));
+    }
+    match check_sealed(&sealed, current_key_id) {
+        Ok(()) => Ok(sealed),
+        Err(SealError::WrongKey) => Err(ApiError::new(
+            400,
+            "wrong_key",
+            "cred_envelope is not sealed to the current public key (GET /pubkey)",
+        )),
+        Err(_) => Err(bad("cred_envelope is not a crucible envelope")),
+    }
 }
 
 impl EvalRequest {
@@ -178,13 +220,19 @@ impl EvalRequest {
         if self.stages == Some(0) {
             return bad("stages must be at least 1");
         }
+        if let Some(m) = &self.model
+            && !is_model(m)
+        {
+            return bad(MODEL_RULE);
+        }
+        let cred = match &self.cred_envelope {
+            Some(c) => Some(decode_cred(c, current_key_id)?),
+            None => None,
+        };
         match self.mode {
             Mode::Agent => {
-                let Some(model) = &self.model else {
+                if self.model.is_none() {
                     return bad("model is required in agent mode");
-                };
-                if !is_model(model) {
-                    return bad("model must match [A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}");
                 }
                 let replicas = self.replicas.unwrap_or(1);
                 if !(1..=MAX_REPLICAS).contains(&replicas) {
@@ -195,28 +243,8 @@ impl EvalRequest {
                 if let Some(b) = &self.budget {
                     check_budget(b)?;
                 }
-                let Some(cred) = &self.cred_envelope else {
+                if cred.is_none() {
                     return bad("cred_envelope is required in agent mode");
-                };
-                if cred.len() > MAX_CRED * 2 {
-                    return bad("cred_envelope is too large");
-                }
-                let Some(sealed) = b64_decode(cred) else {
-                    return bad("cred_envelope must be standard base64");
-                };
-                if sealed.len() > MAX_CRED {
-                    return bad("cred_envelope is too large");
-                }
-                match check_sealed(&sealed, current_key_id) {
-                    Ok(()) => {}
-                    Err(SealError::WrongKey) => {
-                        return Err(ApiError::new(
-                            400,
-                            "wrong_key",
-                            "cred_envelope is not sealed to the current public key (GET /pubkey)",
-                        ));
-                    }
-                    Err(_) => return bad("cred_envelope is not a crucible envelope"),
                 }
                 Ok(ValidEval {
                     mode: self.mode,
@@ -227,24 +255,19 @@ impl EvalRequest {
                     model: self.model,
                     replicas,
                     budget: self.budget.filter(|b| *b != Budget::default()),
-                    cred: Some(sealed),
+                    cred,
                     score_public: self.score_public,
                 })
             }
             Mode::App => {
-                if self.cred_envelope.is_some() {
-                    return bad("cred_envelope is not accepted in app mode");
+                if self.stages.is_none() {
+                    return bad("stages (1-based stage number) is required in app mode");
                 }
                 if self.budget.is_some() {
                     return bad("budget is not accepted in app mode");
                 }
                 if self.replicas.is_some_and(|r| r != 1) {
                     return bad("replicas must be 1 in app mode");
-                }
-                if let Some(m) = &self.model
-                    && !is_model(m)
-                {
-                    return bad("model must match [A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}");
                 }
                 Ok(ValidEval {
                     mode: self.mode,
@@ -255,7 +278,7 @@ impl EvalRequest {
                     model: self.model,
                     replicas: 1,
                     budget: None,
-                    cred: None,
+                    cred,
                     score_public: self.score_public,
                 })
             }
@@ -274,7 +297,8 @@ fn check_budget(b: &Budget) -> Result<(), ApiError> {
             "budget.max_tokens must be between 1 and 10000000000",
         ));
     }
-    if b.max_cost_usd
+    if b
+        .max_cost_usd
         .is_some_and(|v| !v.is_finite() || v <= 0.0 || v > 10_000.0)
     {
         return Err(ApiError::bad_request(
@@ -304,7 +328,11 @@ pub struct EvalRecord {
     pub mode: Mode,
     pub upload_hash: String,
     pub taskset: String,
+    /// agent: number of leading stages run; app: 1-based stage number.
     pub stages: u32,
+    /// Names of the stages this eval covers, in order.
+    #[serde(default)]
+    pub stage_names: Vec<String>,
     #[serde(default)]
     pub model: Option<String>,
     pub replicas: u32,
@@ -313,14 +341,15 @@ pub struct EvalRecord {
     pub score_public: bool,
     pub created_at: String,
     pub created_s: u64,
-    pub status: Status,
-    /// Coarse progress: the running job's name, or a short note.
-    #[serde(default)]
-    pub phase: Option<String>,
+    /// See [`is_status`].
+    pub status: String,
     #[serde(default)]
     pub run_id: Option<u64>,
     #[serde(default)]
     pub run_url: Option<String>,
+    /// When the run was first seen completed without results.
+    #[serde(default)]
+    pub run_completed_s: Option<u64>,
     #[serde(default)]
     pub manifest: Option<Value>,
     /// SHA-256 of the password-protected result zip.
@@ -338,90 +367,93 @@ pub struct EvalSummary {
     pub taskset: String,
     pub model: Option<String>,
     pub created_at: String,
-    pub status: Status,
+    pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_score: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_score: Option<u64>,
 }
 
 impl EvalRecord {
+    pub fn total_score(&self) -> Option<f64> {
+        let m = self.manifest.as_ref()?;
+        total_score(&serde_json::from_value::<Manifest>(m.clone()).ok()?)
+    }
+
     pub fn summary(&self) -> EvalSummary {
-        let (total_score, max_score) = self
-            .manifest
-            .as_ref()
-            .and_then(|m| serde_json::from_value::<Manifest>(m.clone()).ok())
-            .map(|m| score_of(&m))
-            .unwrap_or((None, None));
         EvalSummary {
             eval_id: self.eval_id.clone(),
             mode: self.mode,
             taskset: self.taskset.clone(),
             model: self.model.clone(),
             created_at: self.created_at.clone(),
-            status: self.status,
-            total_score,
-            max_score,
+            status: self.status.clone(),
+            total_score: self.total_score(),
         }
     }
 }
 
-/// `total_score` = mean over replicas of the summed `passed` of every
-/// scored stage; `max_score` = summed `total` of the first replica.
-pub fn score_of(m: &Manifest) -> (Option<f64>, Option<u64>) {
-    let per_replica: Vec<u64> = m
+/// 0–1: Σpassed / Σtotal over every scored stage of every replica, rounded
+/// to 4 decimals. `None` when nothing was scored.
+pub fn total_score(m: &Manifest) -> Option<f64> {
+    let (passed, total) = m
         .replicas
         .iter()
-        .filter(|r| r.stages.iter().any(|s| s.score.is_some()))
-        .map(|r| {
-            r.stages
-                .iter()
-                .filter_map(|s| s.score)
-                .map(|s| u64::from(s.passed))
-                .sum()
-        })
-        .collect();
-    if per_replica.is_empty() {
-        return (None, None);
+        .flat_map(|r| r.stages.iter())
+        .filter_map(|s| s.score)
+        .fold((0u64, 0u64), |(p, t), s| {
+            (p + u64::from(s.passed), t + u64::from(s.total))
+        });
+    if total == 0 {
+        return None;
     }
-    let mean = per_replica.iter().sum::<u64>() as f64 / per_replica.len() as f64;
-    let max = m.replicas.first().map(|r| {
-        r.stages
-            .iter()
-            .filter_map(|s| s.score)
-            .map(|s| u64::from(s.total))
-            .sum()
-    });
-    (Some((mean * 100.0).round() / 100.0), max)
+    Some((passed as f64 / total as f64 * 10_000.0).round() / 10_000.0)
 }
 
-/// Body of `POST /internal/results/:id`: a Manifest, plus the optional
-/// top-level `download` naming the password zip.
-pub fn parse_results(body: &[u8], eval_id: &str) -> Result<(Value, Option<String>), ApiError> {
+/// Body of `POST /internal/results/:id`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Results {
+    /// The manifest as posted (minus `download` and `status`).
+    pub manifest: Value,
+    pub download: Option<String>,
+    /// Default `done`; a partial manifest names the current status.
+    pub status: String,
+}
+
+/// A Manifest, plus optional top-level `download: {sha256}` (the password
+/// zip) and `status` (for partial results while the run continues).
+pub fn parse_results(body: &[u8], eval_id: &str) -> Result<Results, ApiError> {
     if body.len() > MAX_RESULTS_BODY {
         return Err(ApiError::too_large(MAX_RESULTS_BODY));
     }
-    let raw: Value = serde_json::from_slice(body)
+    let mut raw: Value = serde_json::from_slice(body)
         .map_err(|e| ApiError::bad_request(format!("results must be JSON: {e}")))?;
+    let obj = raw
+        .as_object_mut()
+        .ok_or_else(|| ApiError::bad_request("results must be a JSON object"))?;
+    let download = match obj.remove("download") {
+        None | Some(Value::Null) => None,
+        Some(d) => Some(
+            d.get("sha256")
+                .and_then(Value::as_str)
+                .filter(|h| is_hash(h))
+                .ok_or_else(|| ApiError::bad_request("download.sha256 must be a SHA-256 hex"))?
+                .to_owned(),
+        ),
+    };
+    let status = match obj.remove("status") {
+        None | Some(Value::Null) => DONE.to_owned(),
+        Some(Value::String(s)) if is_status(&s) && s != QUEUED => s,
+        Some(_) => return Err(ApiError::bad_request("status is not a valid eval status")),
+    };
     let manifest: Manifest = serde_json::from_value(raw.clone())
         .map_err(|e| ApiError::bad_request(format!("not a manifest: {e}")))?;
     if manifest.eval_id != eval_id {
-        return Err(ApiError::bad_request(
-            "manifest.eval_id does not match the URL",
-        ));
+        return Err(ApiError::bad_request("manifest.eval_id does not match the URL"));
     }
-    let download = match raw.get("download") {
-        None | Some(Value::Null) => None,
-        Some(d) => {
-            let h = d
-                .get("sha256")
-                .and_then(Value::as_str)
-                .filter(|h| is_hash(h))
-                .ok_or_else(|| ApiError::bad_request("download.sha256 must be a SHA-256 hex"))?;
-            Some(h.to_owned())
-        }
-    };
-    Ok((raw, download))
+    Ok(Results {
+        manifest: raw,
+        download,
+        status,
+    })
 }
 
 #[cfg(test)]
@@ -476,11 +508,24 @@ mod tests {
         assert!(!is_uuid_v4("3f2b8c1e-9a4d-4c7e-cb1a-2d3e4f5a6b7c")); // variant
         assert!(!is_uuid_v4("3f2b8c1e9a4d4c7e8b1a2d3e4f5a6b7c"));
         assert!(!is_uuid_v4("../../../../../../../../../../../../.."));
-        assert!(is_model("glm-5.3") && is_model("anthropic/claude-x:v1@2"));
+        assert!(is_model("glm-5.3") && is_model("anthropic/claude-x:v1"));
         assert!(!is_model("a b") && !is_model("-x") && !is_model("x;rm") && !is_model(""));
-        assert!(!is_model(&"m".repeat(129)));
+        assert!(!is_model(&"m".repeat(81)));
         assert!(is_login("octo-cat") && !is_login("a/b") && !is_login(&"a".repeat(40)));
         assert!(is_slug("github-full") && !is_slug("GitHub") && !is_slug("a_b"));
+    }
+
+    #[test]
+    fn statuses() {
+        for s in ["queued", "building", "running:stage-1", "scoring", "done", "failed"] {
+            assert!(is_status(s), "{s}");
+        }
+        for s in ["running", "running:", "running:Stage 1", "succeeded", "cancelled", ""] {
+            assert!(!is_status(s), "{s}");
+        }
+        assert!(is_terminal("done") && is_terminal("failed") && !is_terminal("scoring"));
+        assert!(status_rank("building") < status_rank("running:stage-2"));
+        assert!(status_rank("running:stage-2") < status_rank("scoring"));
     }
 
     #[test]
@@ -490,18 +535,14 @@ mod tests {
         assert_eq!(v.replicas, 3);
         assert_eq!(v.stages, Some(2));
         assert!(v.cred.unwrap().starts_with(b"{\"crucible_envelope\":1"));
-        // Defaults.
         let v = check(&with(
-            with(
-                with(agent_body(), "replicas", Value::Null),
-                "budget",
-                Value::Null,
-            ),
+            with(with(agent_body(), "replicas", Value::Null), "budget", Value::Null),
             "stages",
             Value::Null,
         ))
         .unwrap();
         assert_eq!((v.replicas, v.stages, v.budget), (1, None, None));
+        assert_eq!(check(&with(agent_body(), "replicas", 10.into())).unwrap().replicas, 10);
     }
 
     #[test]
@@ -518,25 +559,13 @@ mod tests {
             ("model", Value::Null, "bad_request"),
             ("model", "$(id)".into(), "bad_request"),
             ("replicas", 0.into(), "bad_request"),
-            ("replicas", 6.into(), "bad_request"),
-            (
-                "budget",
-                serde_json::json!({"max_cost_usd": -1}),
-                "bad_request",
-            ),
-            (
-                "budget",
-                serde_json::json!({"max_requests": 0}),
-                "bad_request",
-            ),
+            ("replicas", 11.into(), "bad_request"),
+            ("budget", serde_json::json!({"max_cost_usd": -1}), "bad_request"),
+            ("budget", serde_json::json!({"max_requests": 0}), "bad_request"),
             ("budget", serde_json::json!({"other": 1}), "bad_request"),
             ("cred_envelope", Value::Null, "bad_request"),
             ("cred_envelope", "!!!".into(), "bad_request"),
-            (
-                "cred_envelope",
-                b64_encode(b"plaintext key").into(),
-                "bad_request",
-            ),
+            ("cred_envelope", b64_encode(b"plaintext key").into(), "bad_request"),
             ("mode", "both".into(), "bad_request"),
             ("extra", 1.into(), "bad_request"),
         ];
@@ -546,12 +575,8 @@ mod tests {
         }
         let mut other = Envelope::new("0000000000000000").header_line();
         other.extend_from_slice(b"x");
-        let err = check(&with(
-            agent_body(),
-            "cred_envelope",
-            b64_encode(&other).into(),
-        ))
-        .unwrap_err();
+        let err = check(&with(agent_body(), "cred_envelope", b64_encode(&other).into()))
+            .unwrap_err();
         assert_eq!(err.code, "wrong_key");
         let big = b64_encode(&vec![b'x'; MAX_CRED + 1]);
         assert!(check(&with(agent_body(), "cred_envelope", big.into())).is_err());
@@ -561,44 +586,65 @@ mod tests {
     fn app_request() {
         let app = serde_json::json!({
             "mode": "app", "eval_id": EID, "upload_hash": "cd".repeat(32),
-            "taskset": "github-full", "score_public": true, "consent": true
+            "taskset": "github-full", "stages": 2, "score_public": true, "consent": true
         });
         let v = check(&app).unwrap();
-        assert_eq!((v.mode, v.replicas, v.cred), (Mode::App, 1, None));
-        assert!(check(&with(app.clone(), "cred_envelope", sealed_cred().into())).is_err());
+        assert_eq!((v.mode, v.replicas, v.stages, v.cred), (Mode::App, 1, Some(2), None));
+        // A sealed credential (download password) is optional in app mode.
+        assert!(check(&with(app.clone(), "cred_envelope", sealed_cred().into()))
+            .unwrap()
+            .cred
+            .is_some());
+        assert!(check(&with(app.clone(), "stages", Value::Null)).is_err());
         assert!(check(&with(app.clone(), "replicas", 2.into())).is_err());
         assert!(check(&with(app.clone(), "budget", serde_json::json!({}))).is_err());
         assert!(EvalRequest::parse(&vec![b' '; MAX_EVAL_BODY + 1]).is_err());
     }
 
-    #[test]
-    fn results_and_score() {
-        let m = serde_json::json!({
+    fn manifest() -> Value {
+        let usage = serde_json::json!({"requests":1,"prompt_tokens":1,"cached_tokens":0,"completion_tokens":1,"reasoning_tokens":0});
+        serde_json::json!({
             "schema": 1, "eval_id": EID, "created_at": "2026-10-03T00:00:00Z",
             "taskset": "github-full", "agent": {"name": "octos", "version": "1"},
             "model": "glm-5.3", "public": false,
             "replicas": [
               {"replica": 1, "stages": [
-                {"stage": "stage-1", "score": {"status": "failed", "passed": 27, "total": 30}, "usage": {"requests":1,"prompt_tokens":1,"cached_tokens":0,"completion_tokens":1,"reasoning_tokens":0}},
-                {"stage": "stage-2", "score": {"status": "failed", "passed": 20, "total": 29}, "usage": {"requests":1,"prompt_tokens":1,"cached_tokens":0,"completion_tokens":1,"reasoning_tokens":0}}
+                {"stage": "stage-1", "score": {"status": "failed", "passed": 27, "total": 30}, "usage": usage},
+                {"stage": "stage-2", "score": {"status": "failed", "passed": 20, "total": 29}, "usage": usage}
               ]},
               {"replica": 2, "stages": [
-                {"stage": "stage-1", "score": {"status": "passed", "passed": 30, "total": 30}, "usage": {"requests":1,"prompt_tokens":1,"cached_tokens":0,"completion_tokens":1,"reasoning_tokens":0}},
-                {"stage": "stage-2", "score": null, "usage": {"requests":0,"prompt_tokens":0,"cached_tokens":0,"completion_tokens":0,"reasoning_tokens":0}}
+                {"stage": "stage-1", "score": {"status": "passed", "passed": 30, "total": 30}, "usage": usage},
+                {"stage": "stage-2", "score": null, "usage": usage}
               ]}
-            ],
-            "download": {"sha256": "ef".repeat(32)}
-        });
+            ]
+        })
+    }
+
+    #[test]
+    fn results_and_score() {
+        let mut m = manifest();
+        m["download"] = serde_json::json!({"sha256": "ef".repeat(32)});
         let body = serde_json::to_vec(&m).unwrap();
-        let (raw, dl) = parse_results(&body, EID).unwrap();
-        assert_eq!(dl.as_deref(), Some("ef".repeat(32).as_str()));
-        let man: Manifest = serde_json::from_value(raw).unwrap();
-        assert_eq!(score_of(&man), (Some(38.5), Some(59)));
+        let r = parse_results(&body, EID).unwrap();
+        assert_eq!(r.download.as_deref(), Some("ef".repeat(32).as_str()));
+        assert_eq!(r.status, "done");
+        assert!(r.manifest.get("download").is_none());
+        let man: Manifest = serde_json::from_value(r.manifest).unwrap();
+        // (27 + 20 + 30) / (30 + 29 + 30) = 77 / 89
+        assert_eq!(total_score(&man), Some(0.8652));
 
         assert!(parse_results(&body, "3f2b8c1e-9a4d-4c7e-8b1a-000000000000").is_err());
         assert!(parse_results(b"{\"eval_id\":1}", EID).is_err());
+        assert!(parse_results(b"[]", EID).is_err());
         let mut bad_dl = m.clone();
         bad_dl["download"] = serde_json::json!({"sha256": "../x"});
         assert!(parse_results(&serde_json::to_vec(&bad_dl).unwrap(), EID).is_err());
+
+        let mut partial = manifest();
+        partial["status"] = "running:stage-2".into();
+        let r = parse_results(&serde_json::to_vec(&partial).unwrap(), EID).unwrap();
+        assert_eq!(r.status, "running:stage-2");
+        partial["status"] = "succeeded".into();
+        assert!(parse_results(&serde_json::to_vec(&partial).unwrap(), EID).is_err());
     }
 }

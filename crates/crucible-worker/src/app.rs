@@ -5,12 +5,14 @@ use serde_json::json;
 
 use crate::authz::{self, Principal};
 use crate::config::Config;
-use crate::github::{GitHub, TasksetInfo, UploadOutcome, map_run};
+use crate::dispatch;
+use crate::github::{GitHub, RunView, TasksetInfo, UploadOutcome, view_run};
 use crate::http::{ApiError, Backend, PutOptions, Req, Resp};
 use crate::keys;
 use crate::model::{
-    CRED_TTL_S, EvalRecord, EvalRequest, EvalSummary, MAX_UPLOAD, Mode, Status, UploadRecord,
-    ValidEval, is_login, is_uuid_v4, parse_results,
+    CRED_TTL_S, DONE, EvalRecord, EvalRequest, EvalSummary, FAILED, MAX_UPLOAD, Mode, QUEUED,
+    UploadRecord, ValidEval, is_login, is_status, is_terminal, is_uuid_v4, parse_results,
+    status_rank,
 };
 use crate::session;
 use crate::shard::{release_tag, sha256_hex};
@@ -20,6 +22,8 @@ const OAUTH_COOKIE: &str = "crucible_oauth";
 const TASKSETS_CACHE: &str = "cache/tasksets";
 const TASKSETS_TTL_S: u64 = 300;
 const LIST_LIMIT: usize = 1000;
+/// How long a run may be finished before missing results count as failure.
+const RESULTS_GRACE_S: u64 = 600;
 
 type Result<T> = std::result::Result<T, ApiError>;
 
@@ -115,6 +119,7 @@ impl<'a, B: Backend> App<'a, B> {
             ("GET", ["internal", "cred", id]) => self.internal_get_cred(req, id).await,
             ("DELETE", ["internal", "cred", id]) => self.internal_delete_cred(req, id).await,
             ("POST", ["internal", "results", id]) => self.internal_results(req, id).await,
+            ("POST", ["internal", "status", id]) => self.internal_status(req, id).await,
             ("POST", ["admin", "ban"]) => self.ban(req, true).await,
             ("POST", ["admin", "unban"]) => self.ban(req, false).await,
             (
@@ -442,16 +447,36 @@ impl<'a, B: Backend> App<'a, B> {
             .iter()
             .find(|t| t.name == v.taskset)
             .ok_or_else(|| ApiError::bad_request("unknown taskset"))?;
-        let n_stages = ts.stages.len() as u32;
-        let stages = v.stages.unwrap_or(n_stages);
-        if stages > n_stages {
-            return Err(ApiError::bad_request(format!(
-                "taskset {} has {n_stages} stages",
-                ts.name
-            )));
-        }
+        let names: Vec<String> = ts.stages.iter().map(|s| s.name.clone()).collect();
+        let n = names.len() as u32;
+        let (stages, stage_names) = match v.mode {
+            // First N stages.
+            Mode::Agent => {
+                let k = v.stages.unwrap_or(n);
+                if k > n {
+                    return Err(ApiError::bad_request(format!(
+                        "taskset {} has {n} stages",
+                        ts.name
+                    )));
+                }
+                (k, names[..k as usize].to_vec())
+            }
+            // One stage, 1-based.
+            Mode::App => {
+                let i = v.stages.unwrap_or(1);
+                if i > n {
+                    return Err(ApiError::bad_request(format!(
+                        "taskset {} has stages 1..={n}",
+                        ts.name
+                    )));
+                }
+                (i, vec![names[i as usize - 1].clone()])
+            }
+        };
 
         if let Some(cred) = &v.cred {
+            // Stored exactly as sealed by the page; returned unchanged by
+            // GET /internal/cred/:id.
             self.kv_put(
                 &format!("cred/{}", v.eval_id),
                 cred,
@@ -471,16 +496,17 @@ impl<'a, B: Backend> App<'a, B> {
             upload_hash: v.upload_hash.clone(),
             taskset: v.taskset.clone(),
             stages,
+            stage_names,
             model: v.model.clone(),
             replicas: v.replicas,
             budget: v.budget.clone(),
             score_public: v.score_public,
             created_at: rfc3339(now),
             created_s: now,
-            status: Status::Queued,
-            phase: None,
+            status: QUEUED.into(),
             run_id: None,
             run_url: None,
+            run_completed_s: None,
             manifest: None,
             download_sha256: None,
             updated_at: rfc3339(now),
@@ -492,26 +518,10 @@ impl<'a, B: Backend> App<'a, B> {
             .worker_url
             .clone()
             .unwrap_or_else(|| req.origin.clone());
-        // Non-secret inputs only; the workflow validates each again.
-        let inputs = json!({
-            "eval_id": rec.eval_id,
-            "mode": rec.mode.as_str(),
-            "agent_source": format!("blob:{}", rec.upload_hash),
-            "taskset": rec.taskset,
-            "stages": rec.stages.to_string(),
-            "model": rec.model.clone().unwrap_or_default(),
-            "replicas": rec.replicas.to_string(),
-            "budget": rec.budget.as_ref().map(|b| serde_json::to_string(b).expect("json")).unwrap_or_default(),
-            "cred_source": if v.cred.is_some() { "kv" } else { "none" },
-            "owner_id": rec.owner_id.to_string(),
-            "owner_login": rec.owner_login,
-            "score_public": rec.score_public.to_string(),
-            "results_url": format!("{worker_url}/internal/results/{}", rec.eval_id),
-        });
-        if let Err(e) = self.gh().dispatch(&inputs).await {
+        let (workflow, inputs) = dispatch::inputs(self.cfg, &rec, v.cred.is_some(), &worker_url);
+        if let Err(e) = self.gh().dispatch(&workflow, &inputs).await {
             let _ = self.b.kv_delete(&format!("cred/{}", rec.eval_id)).await;
-            rec.status = Status::Failed;
-            rec.phase = Some("dispatch failed".into());
+            rec.status = FAILED.into();
             rec.updated_at = rfc3339(self.b.now_s());
             let _ = self.save_record(&rec).await;
             return Err(e);
@@ -553,13 +563,13 @@ impl<'a, B: Backend> App<'a, B> {
                 self.b.log(&format!("refresh save failed: {}", e.message));
             }
         }
-        let summary = rec.summary();
         let mut out = json!({
             "eval_id": rec.eval_id,
             "status": rec.status,
             "mode": rec.mode,
             "taskset": rec.taskset,
             "stages": rec.stages,
+            "stage_names": rec.stage_names,
             "model": rec.model,
             "replicas": rec.replicas,
             "score_public": rec.score_public,
@@ -569,71 +579,77 @@ impl<'a, B: Backend> App<'a, B> {
             "download_available": rec.download_sha256.is_some(),
         });
         let o = out.as_object_mut().expect("object");
-        if let Some(ph) = &rec.phase {
-            o.insert("phase".into(), json!(ph));
-        }
         if let Some(u) = &rec.run_url {
             o.insert("run_url".into(), json!(u));
         }
         if let Some(m) = &rec.manifest {
-            let mut m = m.clone();
-            if let Some(mo) = m.as_object_mut() {
-                mo.remove("download");
-            }
-            o.insert("manifest".into(), m);
+            o.insert("manifest".into(), m.clone());
         }
-        if let Some(s) = summary.total_score {
+        if let Some(s) = rec.total_score() {
             o.insert("total_score".into(), json!(s));
-        }
-        if let Some(s) = summary.max_score {
-            o.insert("max_score".into(), json!(s));
         }
         Ok(Resp::json(200, &out))
     }
 
-    /// Poll GitHub for an eval that has not reported results yet. Returns
-    /// whether the record changed. GitHub errors leave it as it was.
+    /// Poll GitHub for an eval that has not finished. Returns whether the
+    /// record changed. GitHub errors leave it as it was. Status only moves
+    /// forward, so a precise status reported by the workflow is never
+    /// replaced by the coarser estimate.
     async fn refresh(&self, rec: &mut EvalRecord) -> bool {
-        if rec.status.is_terminal() || rec.manifest.is_some() {
+        if is_terminal(&rec.status) {
             return false;
         }
         let gh = self.gh();
+        let workflow = match rec.mode {
+            Mode::Agent => &self.cfg.eval_workflow,
+            Mode::App => &self.cfg.score_workflow,
+        };
         let run = match rec.run_id {
-            None => match gh.find_run(&rec.eval_id, rec.created_s).await {
+            None => match gh.find_run(workflow, &rec.eval_id, rec.created_s).await {
                 Ok(Some(run)) => run,
                 Ok(None) => return false,
                 Err(e) => {
-                    self.b
-                        .log(&format!("refresh {}: {}", rec.eval_id, e.message));
+                    self.b.log(&format!("refresh {}: {}", rec.eval_id, e.message));
                     return false;
                 }
             },
             Some(id) => match gh.run(id).await {
                 Ok(run) => run,
                 Err(e) => {
-                    self.b
-                        .log(&format!("refresh {}: {}", rec.eval_id, e.message));
+                    self.b.log(&format!("refresh {}: {}", rec.eval_id, e.message));
                     return false;
                 }
             },
         };
-        let (status, mut phase) = map_run(&run);
-        if status == Status::Running && phase.is_none() {
-            phase = gh.current_job(run.id).await.ok().flatten();
+        let before = (rec.status.clone(), rec.run_id, rec.run_completed_s);
+        let job = if run.status == "in_progress" {
+            gh.current_job(run.id).await.ok().flatten()
+        } else {
+            None
+        };
+        let estimate = match view_run(&run, job.as_deref(), rec.stage_names.first().map(String::as_str)) {
+            RunView::Status(s) => Some(s),
+            RunView::CompletedOk => {
+                // Results are posted from inside the run; allow for KV
+                // propagation before calling it failed.
+                let now = self.b.now_s();
+                let since = *rec.run_completed_s.get_or_insert(now);
+                (now.saturating_sub(since) >= RESULTS_GRACE_S).then(|| FAILED.to_owned())
+            }
+        };
+        if let Some(s) = estimate
+            && status_rank(&s) > status_rank(&rec.status)
+        {
+            rec.status = s;
         }
-        let changed = rec.run_id != Some(run.id)
-            || rec.status != status
-            || rec.phase != phase
-            || rec.run_url.as_deref() != Some(run.html_url.as_str());
+        let url_changed = rec.run_url.as_deref() != Some(run.html_url.as_str());
         rec.run_id = Some(run.id);
         rec.run_url = Some(run.html_url);
-        rec.status = status;
-        rec.phase = phase;
-        if status.is_terminal() {
-            // The run is over without results; the key has no further use.
+        if is_terminal(&rec.status) {
+            // The run is over; the key has no further use.
             let _ = self.b.kv_delete(&format!("cred/{}", rec.eval_id)).await;
         }
-        changed
+        url_changed || before != (rec.status.clone(), rec.run_id, rec.run_completed_s)
     }
 
     async fn download(&self, req: &Req, id: &str) -> Result<Resp> {
@@ -692,16 +708,49 @@ impl<'a, B: Backend> App<'a, B> {
     async fn internal_results(&self, req: &Req, id: &str) -> Result<Resp> {
         let id = self.internal_id(req, id)?;
         let mut rec = self.load_record(id).await?;
-        let (manifest, download) = parse_results(&req.body, id)?;
-        rec.manifest = Some(manifest);
-        if download.is_some() {
-            rec.download_sha256 = download;
+        let results = parse_results(&req.body, id)?;
+        rec.manifest = Some(results.manifest);
+        if results.download.is_some() {
+            rec.download_sha256 = results.download;
         }
-        rec.status = Status::Succeeded;
-        rec.phase = None;
+        rec.status = results.status;
         rec.updated_at = rfc3339(self.b.now_s());
         self.save_record(&rec).await?;
-        let _ = self.b.kv_delete(&format!("cred/{id}")).await;
+        if is_terminal(&rec.status) {
+            let _ = self.b.kv_delete(&format!("cred/{id}")).await;
+        }
+        Ok(Resp::json(200, &json!({"ok": true, "status": rec.status})))
+    }
+
+    /// Progress from the workflow: `{"status": "building" | "running:<stage>"
+    /// | "scoring" | "failed"}`. `done` comes with the results.
+    async fn internal_status(&self, req: &Req, id: &str) -> Result<Resp> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Body {
+            status: String,
+        }
+        let id = self.internal_id(req, id)?;
+        let mut rec = self.load_record(id).await?;
+        if req.body.len() > 4096 {
+            return Err(ApiError::too_large(4096));
+        }
+        let body: Body = serde_json::from_slice(&req.body)
+            .map_err(|e| ApiError::bad_request(format!("invalid request body: {e}")))?;
+        if !is_status(&body.status) || body.status == QUEUED || body.status == DONE {
+            return Err(ApiError::bad_request(
+                "status must be building, running:<stage>, scoring or failed",
+            ));
+        }
+        if is_terminal(&rec.status) {
+            return Err(ApiError::conflict(format!("eval is already {}", rec.status)));
+        }
+        rec.status = body.status;
+        rec.updated_at = rfc3339(self.b.now_s());
+        self.save_record(&rec).await?;
+        if is_terminal(&rec.status) {
+            let _ = self.b.kv_delete(&format!("cred/{id}")).await;
+        }
         Ok(Resp::json(200, &json!({"ok": true, "status": rec.status})))
     }
 
