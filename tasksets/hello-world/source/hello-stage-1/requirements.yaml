@@ -1,0 +1,20 @@
+id: ROOT
+name: Hello World - Stage 1
+type: FOLDER
+dependencies: []
+description: This product is a minimal web page served at the application home page
+  `/`. Later stages extend the same application.
+children:
+- id: REQ-1
+  name: Hello World Page
+  type: ATOMIC
+  dependencies: []
+  description: |-
+    Opening the application home page `/` shows a page whose visible text includes exactly the line “Hello, world” (for example as a level-1 heading). No sign-in, data, or other pages are needed.
+  scenarios:
+  - name: 'REQ-1: Hello World Page - Scenario 1'
+    steps:
+    - keyword: GIVEN
+      content: 'A visitor opens the application home page in a fresh browser session.'
+    - keyword: THEN
+      content: 'The page visibly shows the text “Hello, world”.'
