@@ -11,3 +11,6 @@ GITHUB_CLIENT_SECRET=dev-secret
 GITHUB_TOKEN=dev-github-token
 SESSION_HMAC_KEY=dev-session-key-dev-session-key-0000
 CRUCIBLE_WORKER_TOKEN=dev-worker-token-dev-worker-token-0000
+
+# wrangler.toml sets the production WORKER_URL; local runs must point at themselves.
+WORKER_URL=http://localhost:8787
