@@ -1,0 +1,224 @@
+# TEMPORARY - delete before merging the scorer-playwright PR.
+# Parity check: the prototype grader (BH3GEI/arcbench-grader scripts/grade.sh)
+# and the new scorers/playwright/score.sh score the same Octos artifact on the
+# same machine, per stage, twice. Only test titles and pass/fail reach the
+# step summary and the uploaded artifacts; no test source, no error text.
+name: temp-scorer-parity
+
+on:
+  push:
+    branches: [scorer-playwright]
+    paths:
+      - "scorers/**"
+      - ".github/workflows/temp-scorer-parity.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: temp-scorer-parity-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  OLD_GRADER_REPO: BH3GEI/arcbench-grader
+  OLD_GRADER_REF: 551d4bf8830ff42d9ea99975d731e62b6d0c9a86 # main
+  TASKSET_REF: step2-generate
+  # Public artifact `selftest-app-r1` of BH3GEI/arcbench-grader run 37135037401,
+  # re-hosted as a temporary pre-release asset (cross-repo artifact download
+  # needs more than GITHUB_TOKEN).
+  APP_URL: https://github.com/octos-org/octos-crucible/releases/download/temp-scorer-verify/selftest-app-r1.zip
+  APP_SHA256: dbf23d6a5c3be8ff4a6c224d12daeae1da46a2cfe15476859466dc2f54d84997
+
+jobs:
+  # `crucible open --identity-env` exists on step2-generate (not yet on main).
+  build-crucible:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.TASKSET_REF }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
+      - name: build crucible
+        run: cargo build --release --locked -p crucible-cli
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: crucible-bin
+          path: target/release/crucible
+          retention-days: 1
+
+  parity:
+    needs: build-crucible
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        stage: [1, 2, 3]
+        round: [1, 2]
+    env:
+      STAGE: ${{ matrix.stage }}
+      ROUND: ${{ matrix.round }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.OLD_GRADER_REPO }}
+          ref: ${{ env.OLD_GRADER_REF }}
+          path: old-grader
+          persist-credentials: false
+
+      - name: allow unprivileged user namespaces (Chromium sandbox)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
+      - name: fetch app zip
+        run: |
+          set -euo pipefail
+          curl -fsSL --proto =https "$APP_URL" -o "$RUNNER_TEMP/app.zip"
+          echo "$APP_SHA256  $RUNNER_TEMP/app.zip" | sha256sum -c -
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: crucible-bin
+          path: ${{ runner.temp }}/bin
+
+      - name: fetch sealed tests blob
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          chmod +x "$RUNNER_TEMP/bin/crucible"
+          gh api "repos/$GITHUB_REPOSITORY/contents/tasksets/arcbench-github/taskset.json?ref=$TASKSET_REF" \
+            --jq .content | base64 -d > "$RUNNER_TEMP/taskset.json"
+          hash="$(jq -r --arg id "stage-$STAGE" '.stages[] | select(.id == $id) | .tests_blob.sha256' "$RUNNER_TEMP/taskset.json")"
+          [[ "$hash" =~ ^[0-9a-f]{64}$ ]]
+          mkdir -p "$RUNNER_TEMP/blob"
+          # `crucible get` verifies the SHA-256.
+          "$RUNNER_TEMP/bin/crucible" get --store "github:$GITHUB_REPOSITORY" "$hash" --out "$RUNNER_TEMP/blob/tests.sealed"
+
+      - name: decrypt tests
+        env:
+          CRUCIBLE_AGE_KEY: ${{ secrets.CRUCIBLE_AGE_KEY }}
+        run: |
+          set -euo pipefail
+          # The key stays in the environment of this one step; never on disk.
+          "$RUNNER_TEMP/bin/crucible" open --identity-env CRUCIBLE_AGE_KEY \
+            --in "$RUNNER_TEMP/blob/tests.sealed" --out "$RUNNER_TEMP/tests.zip"
+          T="$RUNNER_TEMP/tasks/github-stage-$STAGE-req-test"
+          mkdir -p "$T/requirements"
+          printf 'visibility: public\napp_port: 3000\n' > "$T/requirements/requirements.yaml"
+          unzip -q "$RUNNER_TEMP/tests.zip" -d "$T"
+          rm -f "$RUNNER_TEMP/tests.zip"
+          test -d "$T/tests"
+          chmod -R a+rX "$RUNNER_TEMP/tasks"
+          echo "TESTS_DIR_NEW=$T/tests" >> "$GITHUB_ENV"
+          echo "spec files: $(find "$T/tests" -name '*.spec.ts' | wc -l)"
+
+      - name: build both runner images (outside the timed runs)
+        run: |
+          docker build -q -t crucible-scorer-playwright:ci scorers/playwright/image
+          docker build -q -t grader-runner:ci old-grader/runner
+
+      - name: score (new and old, order alternates by round)
+        run: |
+          set -uo pipefail
+          run_new() {
+            local t0; t0=$(date +%s)
+            CRUCIBLE_SCORER_IMAGE=crucible-scorer-playwright:ci scorers/playwright/score.sh \
+              --artifact "$RUNNER_TEMP/app.zip" --tests "$TESTS_DIR_NEW" \
+              --out "$RUNNER_TEMP/new.json" --task-id "github-stage-$STAGE-req-test"
+            echo "NEW_SECONDS=$(( $(date +%s) - t0 ))" >> "$GITHUB_ENV"
+          }
+          run_old() {
+            local t0; t0=$(date +%s)
+            ( cd old-grader && env SUBMISSION_ID="parity-$STAGE-$ROUND" TASK_ID="github-stage-$STAGE-req-test" \
+                DOWNLOAD_URL="$APP_URL" TASKS_DIR="$RUNNER_TEMP/tasks" GRADER_RUNNER_IMAGE=grader-runner:ci \
+                ./scripts/grade.sh ) || true
+            cp old-grader/.gradework/results/result.json "$RUNNER_TEMP/old.json"
+            echo "OLD_SECONDS=$(( $(date +%s) - t0 ))" >> "$GITHUB_ENV"
+          }
+          if [ "$ROUND" = "1" ]; then run_new; run_old; else run_old; run_new; fi
+
+      - name: reduce to titles + pass/fail
+        run: |
+          set -euo pipefail
+          mkdir -p parity
+          python3 - "$RUNNER_TEMP/old.json" "$RUNNER_TEMP/new.json" "parity/stage-$STAGE-round-$ROUND.json" <<'EOF'
+          import json, os, sys
+          def red(p):
+              r = json.load(open(p))
+              return {"status": r["status"], "passed": r["passed"], "total": r["total"],
+                      "tests": {t["title"]: t["ok"] for t in r.get("tests", [])}}
+          out = {"stage": int(os.environ["STAGE"]), "round": int(os.environ["ROUND"]),
+                 "old": red(sys.argv[1]), "new": red(sys.argv[2]),
+                 "old_seconds": int(os.environ["OLD_SECONDS"]), "new_seconds": int(os.environ["NEW_SECONDS"])}
+          json.dump(out, open(sys.argv[3], "w"), indent=1)
+          print(out["stage"], out["round"], out["old"]["passed"], out["old"]["total"], out["new"]["passed"], out["new"]["total"])
+          EOF
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: parity-stage-${{ matrix.stage }}-round-${{ matrix.round }}
+          path: parity/
+          retention-days: 7
+
+      - name: remove decrypted tests
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/tasks" "$RUNNER_TEMP/blob" "$RUNNER_TEMP/tests.zip" old-grader/.gradework
+
+  summary:
+    needs: parity
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: parity-*
+          path: parity
+          merge-multiple: true
+      - name: compare
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          import glob, json, os, sys
+          rows = sorted((json.load(open(p)) for p in glob.glob("parity/*.json")), key=lambda r: (r["stage"], r["round"]))
+          bad = False
+          print("## Playwright scorer parity: old grade.sh vs new score.sh\n")
+          print("| stage | round | old | new | per-test diffs | old s | new s |")
+          print("|---|---|---|---|---|---|---|")
+          details = []
+          for r in rows:
+              o, n = r["old"], r["new"]
+              diffs = sorted(k for k in set(o["tests"]) | set(n["tests"]) if o["tests"].get(k) != n["tests"].get(k))
+              same = (o["status"], o["passed"], o["total"]) == (n["status"], n["passed"], n["total"]) and not diffs
+              bad |= not same
+              print(f"| {r['stage']} | {r['round']} | {o['status']} {o['passed']}/{o['total']} | {n['status']} {n['passed']}/{n['total']} | {len(diffs)} | {r['old_seconds']} | {r['new_seconds']} |")
+              for k in diffs:
+                  details.append(f"- stage {r['stage']} round {r['round']}: `{k}` old={o['tests'].get(k)} new={n['tests'].get(k)}")
+          if details:
+              print("\n### Differences\n")
+              print("\n".join(details))
+          print("\n### Per-test results (round 1)\n")
+          for r in rows:
+              if r["round"] != 1:
+                  continue
+              print(f"<details><summary>stage {r['stage']}</summary>\n")
+              print("| test | old | new |\n|---|---|---|")
+              for k in sorted(r["old"]["tests"]):
+                  print(f"| {k} | {'pass' if r['old']['tests'][k] else 'fail'} | {'pass' if r['new']['tests'].get(k) else 'fail'} |")
+              print("\n</details>\n")
+          print(f"\n**{'MISMATCH' if bad else 'all rows identical'}** ({len(rows)} rows, expected 6)")
+          if bad or len(rows) != 6:
+              open(os.environ["GITHUB_ENV"], "a").write("PARITY_FAILED=1\n")
+          EOF
+          cat "$GITHUB_STEP_SUMMARY"
+      - name: fail on mismatch
+        run: |
+          [ "${PARITY_FAILED:-0}" != "1" ] || { echo "old and new results differ (see summary)"; exit 1; }

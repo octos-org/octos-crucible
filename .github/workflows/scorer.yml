@@ -1,0 +1,62 @@
+name: scorer
+
+on:
+  pull_request:
+    paths:
+      - "scorers/**"
+      - ".github/workflows/scorer.yml"
+  push:
+    branches: [main]
+    paths:
+      - "scorers/**"
+      - ".github/workflows/scorer.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scorer-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  playwright-unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: scorers/playwright
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+      - name: install dev deps
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: typecheck
+        run: npm run typecheck
+      - name: unit tests
+        run: npm test
+      - name: shellcheck
+        run: shellcheck score.sh image/run.sh test/e2e.sh
+
+  playwright-e2e:
+    needs: playwright-unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Chromium's own sandbox needs unprivileged user namespaces, which
+      # ubuntu-24.04 restricts via AppArmor. Throwaway VM, this job only.
+      - name: allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      - name: build scorer image
+        run: docker build -t crucible-scorer-playwright:ci scorers/playwright/image
+      - name: score fixture app
+        env:
+          CRUCIBLE_SCORER_IMAGE: crucible-scorer-playwright:ci
+          CRUCIBLE_PRUNE_BUILD_CACHE: "1"
+        run: scorers/playwright/test/e2e.sh

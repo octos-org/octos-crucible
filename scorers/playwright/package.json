@@ -1,0 +1,17 @@
+{
+  "name": "@octos-crucible/scorer-playwright",
+  "private": true,
+  "description": "Dev tooling only (typecheck + unit tests). The scorer itself runs the .ts sources directly with Node 24 inside image/.",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/*.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.1",
+    "typescript": "5.9.3"
+  }
+}
