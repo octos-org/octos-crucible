@@ -1,0 +1,36 @@
+# Cloudflare Worker: octos-crucible backend. Deployment steps: docs/api.md.
+name = "crucible-worker"
+main = "build/index.js"
+compatibility_date = "2026-09-01"
+
+[build]
+# Needs `cargo install worker-build --version 0.8.6 --locked` and the
+# wasm32-unknown-unknown target.
+command = "worker-build --release"
+
+[[kv_namespaces]]
+binding = "CRUCIBLE_KV"
+# `wrangler kv namespace create CRUCIBLE_KV` prints the id to put here.
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
+
+[vars]
+PAGES_ORIGIN = "https://octos-org.github.io"
+PAGES_URL = "https://octos-org.github.io/octos-crucible/"
+GITHUB_REPO = "octos-org/octos-crucible"
+# Comma-separated GitHub numeric user ids.
+ADMIN_GITHUB_IDS = ""
+# Optional:
+# WORKER_URL = "https://crucible.<account>.workers.dev"   # base of results_url
+# EVAL_WORKFLOW = "eval.yml"
+# SCORE_WORKFLOW = "score.yml"
+# EVAL_REF = "main"
+
+# Secrets — set with `wrangler secret put <NAME>`, never in this file:
+#   GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET   (GitHub OAuth App)
+#   GITHUB_TOKEN                             (fine-grained: contents:write, actions:write, this repo only)
+#   SESSION_HMAC_KEY                         (>= 32 random bytes)
+#   CRUCIBLE_WORKER_TOKEN                    (>= 32 chars; same value as the Actions secret)
+#
+# Local only (`.dev.vars`, see .dev.vars.example): DEV_AUTH=1 enables
+# /auth/dev-login and GITHUB_API_BASE / GITHUB_WEB_BASE overrides, honoured
+# for requests to localhost only.
