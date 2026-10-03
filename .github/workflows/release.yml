@@ -1,0 +1,130 @@
+# 预编译发布：push 标签 vX.Y.Z 时编译 crucible（x86_64-unknown-linux-gnu），
+# 打包并连同 SHA256SUMS 发布到 GitHub Release。
+# workflow_dispatch 为演练模式：只构建、打包、上传 workflow artifact，不发布。
+# 说明见 docs/releasing.md。
+name: release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TARGET: x86_64-unknown-linux-gnu
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      publish: ${{ steps.version.outputs.publish }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: resolve version
+        id: version
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # 工作区版本号（Cargo.toml 的 [workspace.package] version）
+          cargo_version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"$/\1/p' Cargo.toml)
+          if [ -z "$cargo_version" ]; then
+            echo "::error::无法从 Cargo.toml 读取 workspace.package.version"
+            exit 1
+          fi
+          if [ "$EVENT" = "push" ] && [ "$REF_TYPE" = "tag" ]; then
+            if ! printf '%s' "$REF_NAME" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "::error::标签必须是 vX.Y.Z（不支持预发布后缀），实际：$REF_NAME"
+              exit 1
+            fi
+            version="${REF_NAME#v}"
+            if [ "$version" != "$cargo_version" ]; then
+              echo "::error::标签 $REF_NAME 与 Cargo.toml 版本 $cargo_version 不一致"
+              exit 1
+            fi
+            publish=true
+          else
+            version="${cargo_version}-dryrun.${SHA:0:7}"
+            publish=false
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "version=$version publish=$publish"
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
+          targets: ${{ env.TARGET }}
+      # 发布构建不使用缓存，避免缓存投毒。
+      - name: build
+        run: cargo build --release --locked -p crucible-cli --target "$TARGET"
+      - name: smoke test
+        run: target/"$TARGET"/release/crucible --version
+      - name: package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/$TARGET/release/crucible" dist/crucible
+          chmod 0755 dist/crucible
+          tar -C dist --owner=0 --group=0 --numeric-owner -czf "dist/crucible-${VERSION}-${TARGET}.tar.gz" crucible
+          rm dist/crucible
+          (cd dist && sha256sum -- *.tar.gz > SHA256SUMS && cat SHA256SUMS)
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: crucible-dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    if: needs.build.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: crucible-dist
+          path: dist
+      - name: verify checksums
+        working-directory: dist
+        run: sha256sum -c SHA256SUMS
+      # 版本 Release：非 prerelease，并显式设为 latest（仓库里还有 blobs-* 存储用预发布）。
+      - name: create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          notes="crucible ${VERSION} 预编译二进制（${TARGET}）。
+
+          安装（会校验 SHA-256）：
+          \`\`\`
+          curl -fsSL https://raw.githubusercontent.com/${REPO}/${TAG}/tools/install-crucible.sh | bash -s -- ${VERSION} \"\$HOME/.local/bin\"
+          \`\`\`"
+          gh release create "$TAG" dist/*.tar.gz dist/SHA256SUMS \
+            --repo "$REPO" \
+            --verify-tag \
+            --title "crucible ${VERSION}" \
+            --notes "$notes" \
+            --latest
