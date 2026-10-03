@@ -7,7 +7,8 @@ export const MAX_UPLOAD = 25 * 1024 * 1024;
 /** age adds ~16 bytes per 64 KiB chunk plus a header; keep a margin for it. */
 export const MAX_PLAIN = MAX_UPLOAD - 64 * 1024;
 export const MAX_REPLICAS = 10;
-export const MIN_PASSWORD = 8;
+/** The output zip sits at a public URL; this password is its only protection. */
+export const MIN_PASSWORD = 12;
 
 export interface FormInput {
   mode: Mode;
@@ -110,7 +111,7 @@ export function validate(f: FormInput): Errors {
     if (f.maxRequests.trim() && !positiveInt(f.maxRequests)) e.maxRequests = "请填正整数，或留空";
     if (f.maxTokens.trim() && !positiveInt(f.maxTokens)) e.maxTokens = "请填正整数，或留空";
     if (f.maxCostUsd.trim() && !positiveNumber(f.maxCostUsd)) e.maxCostUsd = "请填正数，或留空";
-    if (f.password.length < MIN_PASSWORD) e.password = `下载密码至少 ${MIN_PASSWORD} 位`;
+    if ([...f.password].length < MIN_PASSWORD) e.password = `下载密码至少 ${MIN_PASSWORD} 个字符`;
     else if (f.password !== f.password2) e.password2 = "两次输入的密码不一致";
   }
   if (!f.consent) e.consent = "提交前需要同意声明";

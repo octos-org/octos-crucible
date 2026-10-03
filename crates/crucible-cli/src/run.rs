@@ -432,13 +432,9 @@ async fn run_stage(env: &Env<'_>, stage: &Stage, limits: Limits) -> Result<(Timi
     let ended_at = now_rfc3339();
 
     // Container output goes to agent.log only.
-    let log = std::fs::File::create(sdir.join("agent.log"))?;
-    let _ = tokio::process::Command::from(docker())
-        .args(["logs", "--tail", "200000", &cid])
-        .stdout(log.try_clone()?)
-        .stderr(log)
-        .status()
-        .await;
+    let mut logs = docker();
+    logs.args(["logs", "--tail", LOG_TAIL_LINES, &cid]);
+    let _ = write_log(logs, &sdir.join("agent.log")).await;
     let _ = docker_out(&["rm", "-f", &cid]).await;
     meter.abort();
     egress.abort();
@@ -506,6 +502,21 @@ async fn run_stage(env: &Env<'_>, stage: &Stage, limits: Limits) -> Result<(Timi
         u.requests,
     );
     Ok((timing, interrupted))
+}
+
+/// agent.log keeps at most this many of the container's last output lines.
+const LOG_TAIL_LINES: &str = "200000";
+
+/// Run `cmd` (`docker logs`) with its stdout and stderr both going to `path`.
+async fn write_log(cmd: std::process::Command, path: &Path) -> Result<()> {
+    let log = std::fs::File::create(path)?;
+    tokio::process::Command::from(cmd)
+        .stdin(Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log)
+        .status()
+        .await?;
+    Ok(())
 }
 
 async fn docker_out_owned(args: Vec<String>) -> Result<String> {
@@ -681,6 +692,21 @@ mod tests {
         assert_eq!(l.max_tokens, None);
         assert_eq!(l.max_cost_usd, Some(0.0));
         assert!(remaining(&Budget::default(), u).is_unlimited());
+    }
+
+    #[tokio::test]
+    async fn agent_log_has_stdout_and_stderr() {
+        let dir = std::env::temp_dir().join(format!("crucible-agentlog-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.log");
+        // Stands in for `docker logs`, which replays both streams.
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "echo to-stdout; echo to-stderr >&2"]);
+        write_log(cmd, &path).await.unwrap();
+        let log = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(log.contains("to-stdout"), "{log}");
+        assert!(log.contains("to-stderr"), "{log}");
     }
 
     #[test]

@@ -13,8 +13,8 @@ function agentForm(over: Partial<FormInput> = {}): FormInput {
     endpoint: "https://api.example.com/v1",
     apiKey: "sk-x",
     replicas: "3",
-    password: "12345678",
-    password2: "12345678",
+    password: "123456789012",
+    password2: "123456789012",
     consent: true,
     ...over,
   };
@@ -48,6 +48,10 @@ describe("validate", () => {
 
   it("checks the download password", () => {
     expect(validate(agentForm({ password: "short", password2: "short" })).password).toBeTruthy();
+    // At least 12 characters.
+    expect(validate(agentForm({ password: "12345678901", password2: "12345678901" })).password).toBeTruthy();
+    expect(validate(agentForm({ password: "123456789012", password2: "123456789012" }))).toEqual({});
+    expect(validate(agentForm({ password: "电池电池电池电池电池电池", password2: "电池电池电池电池电池电池" }))).toEqual({});
     expect(validate(agentForm({ password2: "different" })).password2).toBeTruthy();
   });
 
