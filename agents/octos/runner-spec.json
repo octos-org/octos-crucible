@@ -1,0 +1,15 @@
+{
+  "agent_source": "uploaded_agent",
+  "runtime": "python",
+  "submission_dir": "/workspace/submission",
+  "template_dir": "/workspace/template",
+  "project_dir": "/workspace/template",
+  "tests_dir": "/workspace/tests",
+  "arc_dir": ".arc",
+  "requirement_dir": "requirements",
+  "output_dir": "/workspace/template",
+  "runner_events_path": ".arc/runner-events.jsonl",
+  "traceability_dir": ".arc/traceability",
+  "evaluation_enabled": false,
+  "task": {"category": "web", "requirement_id": "hackathon--github-stage1", "test_runner": "playwright"}
+}

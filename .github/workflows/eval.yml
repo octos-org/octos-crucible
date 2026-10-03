@@ -1,0 +1,412 @@
+name: eval
+
+# One evaluation: an agent package x a model x a taskset, N replicas, the
+# stages of the taskset run back to back on one machine per replica.
+#
+#   setup     validate inputs (crucible plan), build crucible once
+#   generate  per replica: fetch + docker build the agent (no secret on the
+#             machine yet) -> fetch the stage inputs (never the tests) ->
+#             sandbox network -> crucible run (credential on stdin; meter +
+#             egress per stage; container 2g/1cpu/non-root/cap-drop ALL) ->
+#             seal checkpoints and logs to the platform key -> artifact
+#   publish   the only job with contents: write; runs no agent code:
+#             stores the sealed files as blobs, builds the manifest (times
+#             from GitHub's job/step timestamps), archives it sealed, and
+#             commits it in clear to the data branch only if score_public.
+#
+# Rules: top-level permissions are empty; inputs are validated by
+# `crucible plan` and reach shells only through env; actions are pinned by
+# SHA; public logs carry progress and numbers only (agent output goes to the
+# sealed agent.log).
+#
+# workflow_dispatch only works once this file is on the default branch.
+
+on:
+  workflow_dispatch:
+    inputs:
+      agent_source:
+        description: "builtin:<name> | url:<https zip> | git:<https url>@<ref> | blob:<sha256>"
+        type: string
+        required: true
+        default: builtin:octos
+      taskset:
+        description: "tasksets/<name>"
+        type: string
+        required: true
+        default: arcbench-github
+      model:
+        type: string
+        required: true
+        default: glm-5.3-flash
+      endpoint:
+        description: "OpenAI-compatible base URL (https); empty = the one stored with the credential"
+        type: string
+        default: ""
+      replicas:
+        type: string
+        default: "1"
+      cred_source:
+        description: "github-secret (development) | workers-kv (step 4)"
+        type: string
+        default: github-secret
+      eval_id:
+        description: "[a-z0-9][a-z0-9-]{7,63}; empty = dev-<run id>-<attempt>"
+        type: string
+        default: ""
+      score_public:
+        description: "publish the manifest in clear on the data branch"
+        type: boolean
+        default: false
+      owner:
+        description: "<github_id>:<login> of the submitter (optional)"
+        type: string
+        default: ""
+      options:
+        description: 'JSON, all optional: {"stages": N (first N stages only), "budget": {"max_requests","max_tokens","max_cost_usd","price"}, "results_url": "https://..."}'
+        type: string
+        default: ""
+
+run-name: eval ${{ inputs.taskset }} ${{ inputs.model }} ${{ inputs.eval_id }}
+
+permissions: {}
+
+jobs:
+  setup:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      agent_source: ${{ steps.plan.outputs.agent_source }}
+      agent_kind: ${{ steps.plan.outputs.agent_kind }}
+      model: ${{ steps.plan.outputs.model }}
+      endpoint: ${{ steps.plan.outputs.endpoint }}
+      cred_source: ${{ steps.plan.outputs.cred_source }}
+      budget: ${{ steps.plan.outputs.budget }}
+      taskset: ${{ steps.plan.outputs.taskset }}
+      taskset_path: ${{ steps.plan.outputs.taskset_path }}
+      stages: ${{ steps.plan.outputs.stages }}
+      run_timeout_min: ${{ steps.plan.outputs.run_timeout_min }}
+      eval_id: ${{ steps.plan.outputs.eval_id }}
+      score_public: ${{ steps.plan.outputs.score_public }}
+      owner: ${{ steps.plan.outputs.owner }}
+      results_url: ${{ steps.plan.outputs.results_url }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: crucible-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'crates/**/*.rs') }}
+          restore-keys: |
+            crucible-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-
+            crucible-${{ runner.os }}-
+
+      - name: Build crucible
+        run: |
+          set -euo pipefail
+          rustup update stable --no-self-update >/dev/null
+          rustup default stable >/dev/null
+          cargo build --release --locked -p crucible-cli
+          mkdir -p "$RUNNER_TEMP/bin"
+          cp target/release/crucible "$RUNNER_TEMP/bin/crucible"
+
+      - name: Validate inputs and plan
+        id: plan
+        env:
+          IN_AGENT_SOURCE: ${{ inputs.agent_source }}
+          IN_TASKSET: ${{ inputs.taskset }}
+          IN_MODEL: ${{ inputs.model }}
+          IN_ENDPOINT: ${{ inputs.endpoint }}
+          IN_REPLICAS: ${{ inputs.replicas }}
+          IN_CRED_SOURCE: ${{ inputs.cred_source }}
+          IN_EVAL_ID: ${{ inputs.eval_id }}
+          IN_SCORE_PUBLIC: ${{ inputs.score_public }}
+          IN_OWNER: ${{ inputs.owner }}
+          IN_OPTIONS: ${{ inputs.options }}
+        run: |
+          set -euo pipefail
+          # The agent source may be a signed URL: keep it out of the log.
+          "$RUNNER_TEMP/bin/crucible" plan --root . 2>&1 | grep -v '^agent_source=' || exit 1
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: crucible-bin
+          path: ${{ runner.temp }}/bin/crucible
+          retention-days: 1
+          if-no-files-found: error
+
+  generate:
+    needs: setup
+    name: generate r${{ matrix.replica }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    env:
+      REPLICA: ${{ matrix.replica }}
+      AGENT_SOURCE: ${{ needs.setup.outputs.agent_source }}
+      MODEL: ${{ needs.setup.outputs.model }}
+      ENDPOINT: ${{ needs.setup.outputs.endpoint }}
+      CRED_SOURCE: ${{ needs.setup.outputs.cred_source }}
+      BUDGET: ${{ needs.setup.outputs.budget }}
+      TASKSET_PATH: ${{ needs.setup.outputs.taskset_path }}
+      STAGES: ${{ needs.setup.outputs.stages }}
+      STORE: github:${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /agents/
+            /config/
+            /tasksets/
+            /tools/
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: crucible-bin
+          path: ${{ runner.temp }}/bin
+
+      - name: Prepare
+        run: |
+          set -euo pipefail
+          chmod 0755 "$RUNNER_TEMP/bin/crucible"
+          echo "CRUCIBLE=$RUNNER_TEMP/bin/crucible" >> "$GITHUB_ENV"
+          # Test material only ever exists inside sealed tests blobs, which
+          # this job never downloads.
+          if find . -name '*.spec.ts' -o -name 'e2e.ts' | grep -q .; then
+            echo "::error::test material present in the generation job"
+            exit 1
+          fi
+
+      - name: Fetch agent package
+        if: needs.setup.outputs.agent_kind != 'blob'
+        run: |
+          set -euo pipefail
+          "$CRUCIBLE" fetch --source "$AGENT_SOURCE" --out "$RUNNER_TEMP/agent-pkg" --builtin-dir agents > "$RUNNER_TEMP/facts.json"
+          jq -c '{source_kind, name: .agent.name, version: .agent.version, commit}' "$RUNNER_TEMP/facts.json"
+
+      - name: Fetch agent package (sealed blob)
+        if: needs.setup.outputs.agent_kind == 'blob'
+        env:
+          CRUCIBLE_AGE_KEY: ${{ secrets.CRUCIBLE_AGE_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          "$CRUCIBLE" fetch --source "$AGENT_SOURCE" --out "$RUNNER_TEMP/agent-pkg" \
+            --store "$STORE" --identity-env CRUCIBLE_AGE_KEY > "$RUNNER_TEMP/facts.json"
+          echo "agent package fetched"
+
+      - name: Build agent image (no secret on this machine)
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          # Nothing from the package runs on the host: it is the build
+          # context, RUN steps execute in BuildKit containers.
+          "$CRUCIBLE" build --pkg "$RUNNER_TEMP/agent-pkg" --tag crucible-agent:run 2> "$RUNNER_TEMP/build.log" > "$RUNNER_TEMP/build.json" \
+            || { echo "::error::agent image build failed"; tail -c 3000 "$RUNNER_TEMP/build.log"; exit 1; }
+          jq -c '{size_bytes}' "$RUNNER_TEMP/build.json"
+
+      - name: Fetch stage inputs (never the tests)
+        env:
+          CRUCIBLE_AGE_KEY: ${{ secrets.CRUCIBLE_AGE_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          "$CRUCIBLE" taskset inputs --taskset "$TASKSET_PATH" --store "$STORE" \
+            --identity-env CRUCIBLE_AGE_KEY --stages "$STAGES" --out "$RUNNER_TEMP/inputs"
+          if find "$RUNNER_TEMP/inputs" -name '*.spec.ts' -o -name 'e2e.ts' | grep -q .; then
+            echo "::error::test material in the stage inputs"
+            exit 1
+          fi
+
+      - name: Sandbox network up and check
+        run: |
+          set -euo pipefail
+          tools/sandbox-net.sh up
+          tools/sandbox-net.sh check
+
+      - name: Run agent stages
+        timeout-minutes: ${{ fromJSON(needs.setup.outputs.run_timeout_min) }}
+        env:
+          DEV_MODEL_CRED: ${{ secrets.DEV_MODEL_CRED }}
+          CRUCIBLE_AGE_KEY: ${{ secrets.CRUCIBLE_AGE_KEY }}
+        run: |
+          set -euo pipefail
+          ep=()
+          if [ -n "$ENDPOINT" ]; then ep=(--endpoint "$ENDPOINT"); fi
+          # The opened credential goes through this pipe only: never a file,
+          # never an env var. `crucible run` itself gets neither secret.
+          "$CRUCIBLE" cred open --source "$CRED_SOURCE" --sealed-env DEV_MODEL_CRED \
+              --identity-env CRUCIBLE_AGE_KEY "${ep[@]}" \
+            | env -u DEV_MODEL_CRED -u CRUCIBLE_AGE_KEY "$CRUCIBLE" run \
+              --image crucible-agent:run \
+              --agent-json "$RUNNER_TEMP/agent-pkg/agent.json" \
+              --taskset "$TASKSET_PATH" --stages "$STAGES" \
+              --inputs-dir "$RUNNER_TEMP/inputs" \
+              --model "$MODEL" --budget "$BUDGET" \
+              --out-dir "$RUNNER_TEMP/run/$REPLICA" --scratch-dir "$RUNNER_TEMP/scratch" \
+              --pricing config/pricing.json --egress-allow config/egress.json
+
+      - name: Stop containers and sandbox network
+        if: always()
+        run: |
+          docker ps -aq --filter name=crucible- | xargs -r docker rm -f >/dev/null 2>&1 || true
+          tools/sandbox-net.sh down || true
+
+      - name: Seal checkpoints and logs
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/run/$REPLICA" "$RUNNER_TEMP/results/$REPLICA"
+          extra=()
+          for f in facts.json build.json; do
+            if [ -f "$RUNNER_TEMP/$f" ]; then extra+=(--extra "$RUNNER_TEMP/$f"); fi
+          done
+          "$CRUCIBLE" seal-outputs --replica-dir "$RUNNER_TEMP/run/$REPLICA" --keys config/keys.json \
+            --out "$RUNNER_TEMP/results/$REPLICA" "${extra[@]}"
+          # Only sealed files leave this machine.
+          find "$RUNNER_TEMP/results" -type f ! -name '*.sealed' -delete
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: gen-r${{ matrix.replica }}
+          path: ${{ runner.temp }}/results
+          retention-days: 3
+          if-no-files-found: warn
+
+  publish:
+    needs: [setup, generate]
+    if: always() && needs.setup.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      actions: read
+    env:
+      EVAL_ID: ${{ needs.setup.outputs.eval_id }}
+      MODEL: ${{ needs.setup.outputs.model }}
+      TASKSET_PATH: ${{ needs.setup.outputs.taskset_path }}
+      STAGES: ${{ needs.setup.outputs.stages }}
+      MATRIX: ${{ needs.setup.outputs.matrix }}
+      OWNER: ${{ needs.setup.outputs.owner }}
+      SCORE_PUBLIC: ${{ needs.setup.outputs.score_public }}
+      RESULTS_URL: ${{ needs.setup.outputs.results_url }}
+      BUDGET: ${{ needs.setup.outputs.budget }}
+      STORE: github:${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /config/
+            /tasksets/
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: crucible-bin
+          path: ${{ runner.temp }}/bin
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: gen-r*
+          merge-multiple: true
+          path: ${{ runner.temp }}/results
+
+      - name: Store sealed outputs as blobs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          chmod 0755 "$RUNNER_TEMP/bin/crucible"
+          echo "CRUCIBLE=$RUNNER_TEMP/bin/crucible" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/results"
+          "$RUNNER_TEMP/bin/crucible" put-sealed --store "$STORE" "$RUNNER_TEMP/results"
+
+      - name: Build the manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CRUCIBLE_AGE_KEY: ${{ secrets.CRUCIBLE_AGE_KEY }}
+        run: |
+          set -euo pipefail
+          # Wall times come from GitHub's own job and step timestamps.
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" \
+            > "$RUNNER_TEMP/jobs.json"
+          replicas=$(jq '.replica | length' <<< "$MATRIX")
+          price=()
+          if [ -n "$BUDGET" ] && jq -e '.price' <<< "$BUDGET" >/dev/null; then
+            price=(--price-json "$(jq -c '.price' <<< "$BUDGET")")
+          fi
+          "$CRUCIBLE" manifest --eval-id "$EVAL_ID" --taskset "$TASKSET_PATH" --stages "$STAGES" \
+            --model "$MODEL" --results "$RUNNER_TEMP/results" --replicas "$replicas" \
+            --jobs "$RUNNER_TEMP/jobs.json" --identity-env CRUCIBLE_AGE_KEY \
+            --owner "$OWNER" --score-public "$SCORE_PUBLIC" \
+            --pricing config/pricing.json "${price[@]}" --out "$RUNNER_TEMP/manifest.json"
+          jq -c '{eval_id, stages_run, replicas: [.replicas[] | {replica, failure, stages: [.stages[] | {stage, wall_s, ended, checkpoint_source}]}]}' "$RUNNER_TEMP/manifest.json"
+
+      # Results sink (a): always archive the manifest, sealed, as a blob.
+      - name: Archive the manifest (sealed)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          pub=$(jq -r '.current as $c | .keys[] | select(.key_id == $c) | .public_key' config/keys.json)
+          "$CRUCIBLE" seal --recipient "$pub" --in "$RUNNER_TEMP/manifest.json" --out "$RUNNER_TEMP/manifest.sealed"
+          sha=$("$CRUCIBLE" put --store "$STORE" "$RUNNER_TEMP/manifest.sealed")
+          echo "manifest archived as blob $sha"
+          { echo "## eval $EVAL_ID"; echo; echo "manifest blob: \`$sha\`"; } >> "$GITHUB_STEP_SUMMARY"
+
+      # Results sink (b): the manifest in clear, only if the submitter opted in.
+      - name: Publish the manifest on the data branch
+        if: needs.setup.outputs.score_public == 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          d="$RUNNER_TEMP/data"
+          git init -q "$d"
+          cd "$d"
+          git remote add origin "https://github.com/$GITHUB_REPOSITORY.git"
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)"
+          g() { git -c "http.https://github.com/.extraheader=$auth" "$@"; }
+          for attempt in 1 2 3 4 5; do
+            if g ls-remote --exit-code origin refs/heads/data >/dev/null; then
+              g fetch -q --depth 1 origin data
+              git checkout -q -B data FETCH_HEAD
+            else
+              git checkout -q --orphan data
+            fi
+            mkdir -p evals
+            cp "$RUNNER_TEMP/manifest.json" "evals/$EVAL_ID.json"
+            git add "evals/$EVAL_ID.json"
+            git -c user.name="crucible-bot" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -q -m "eval $EVAL_ID" || { echo "manifest unchanged"; break; }
+            if g push -q origin HEAD:refs/heads/data; then
+              echo "published evals/$EVAL_ID.json on data"
+              break
+            fi
+            echo "push raced, retrying ($attempt)"
+            sleep $((attempt * 3))
+          done
+
+      # Results sink (c), step 4: POST the manifest to the Worker, which
+      # keeps it in KV for the submitter (Authorization: secret
+      # CRUCIBLE_WORKER_TOKEN).
+      - name: Deliver the manifest to the Worker (step 4)
+        if: needs.setup.outputs.results_url != ''
+        run: echo "::notice::results_url is set; delivery to the Worker is not implemented yet (step 4)"

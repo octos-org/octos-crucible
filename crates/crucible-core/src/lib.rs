@@ -5,6 +5,7 @@
 //! native tools and the Cloudflare Worker (wasm32).
 
 pub mod agent;
+pub mod blob;
 pub mod envelope;
 pub mod manifest;
 pub mod netpolicy;
@@ -13,6 +14,7 @@ pub mod taskset;
 pub mod usage;
 
 pub use agent::AgentSpec;
+pub use blob::BlobRef;
 pub use envelope::Envelope;
 pub use manifest::Manifest;
 pub use score::{ScoreResult, ScoreStatus};
@@ -21,7 +23,7 @@ pub use usage::UsageRecord;
 
 /// Names used for agents, tasksets and stages: safe as path components,
 /// release asset names and shell words.
-pub(crate) fn is_slug(s: &str, max_len: usize) -> bool {
+pub fn is_slug(s: &str, max_len: usize) -> bool {
     let b = s.as_bytes();
     !b.is_empty()
         && b.len() <= max_len

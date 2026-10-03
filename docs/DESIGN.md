@@ -23,7 +23,7 @@ octos-crucible 是评测 coding agent 的基础设施：运行 agent、计量、
 | 计量代理 meter | agent 调模型都经过它。记录每次调用的 token（含缓存命中）和耗时；只转发到用户填的接口（必须 https，不能指向内网）。默认无预算上限，用户可自设。 |
 | 价格配置 pricing | 公开价格表，折算等价花销。表里没有的模型只报 token，用户可自填单价。 |
 | 存储 store | 只有 `put(bytes) -> hash` 和 `get(hash) -> bytes`。当前实现为 GitHub Release，可替换。 |
-| 结果 results | 每次评测一份清单（manifest），汇总表和网页都由清单生成。 |
+| 结果 results | 每次评测一份清单（manifest），汇总表和网页都由清单生成。清单的去处（results sink）可组合：总是加密存为块（存档）；提交者选择公开分数时，明文提交到数据分支；第 4 步起回传给 Worker 存入 KV。 |
 
 ## 4. 一次完整评测
 
@@ -36,7 +36,7 @@ octos-crucible 是评测 coding agent 的基础设施：运行 agent、计量、
    - 阶段内每 15 分钟自动快照；被强制结束时，用最后一份快照打分。
    - 容器限制：2G 内存、1 核、非 root、cap-drop ALL、no-new-privileges；只能访问计量代理和白名单软件源（npm、PyPI）；看不到测试。
 4. **打分**：在另一台机器上解密题目包，用指定打分器给每个阶段的 checkpoint 打分。
-5. **汇总**：用时取 GitHub job 时间戳（不采信 agent 自报），token 和花销取计量代理日志；写入清单并提交到数据分支；产出和日志加密存为块；为提交者生成用下载密码加密的 zip。
+5. **汇总**：用时取平台进程在运行步骤内的计时，并用 GitHub job/step 时间戳核对（不采信 agent 自报），token 和花销取计量代理日志；产出和日志加密存为块；清单加密存档，提交者选择公开时才明文提交到数据分支；为提交者生成用下载密码加密的 zip。
 6. **清理**：删除模型 key 和下载密码；KV 另设 24 小时过期兜底。
 
 ## 5. 存储与数据
@@ -44,7 +44,8 @@ octos-crucible 是评测 coding agent 的基础设施：运行 agent、计量、
 | 东西 | 位置 | 保留 |
 |---|---|---|
 | 所有文件（上传的包、产出、日志、题目包） | 加密后按 SHA-256 命名，存于 32 个预发布 Release `blobs-00`…`blobs-31`，分片 = 哈希前 5 位 | 永久 |
-| 元数据（评测清单、题目登记表） | 仓库 `data` 分支 | 永久 |
+| 题目登记表 | 仓库 `tasksets/<name>/taskset.json` | 永久 |
+| 评测清单 | 加密块（总是）；公开分数的评测另在仓库 `data` 分支 `evals/<eval_id>.json` | 永久 |
 | 平台程序 | 正式 Release `vX.Y.Z` | 永久 |
 | 用户模型 key、下载密码 | Workers KV | 评测结束即删 |
 
@@ -83,7 +84,7 @@ octos-crucible 是评测 coding agent 的基础设施：运行 agent、计量、
 | `crucible-crypto` | 信封加密（公钥加密、私钥解密）、密码 zip |
 | `crucible-store` | `put`/`get`，GitHub Release 实现（32 分片） |
 | `crucible-report` | 多遍、多阶段汇总 |
-| `crucible-cli` | 二进制 `crucible`：plan / fetch / build / run / package / score / report / put / get |
+| `crucible-cli` | 二进制 `crucible`：taskset / plan / fetch / build / run / package / cred / seal-outputs / manifest / score / report / put / get |
 | `crucible-worker` | Cloudflare Worker 后端 |
 
 ## 8. 安全边界
@@ -92,6 +93,7 @@ octos-crucible 是评测 coding agent 的基础设施：运行 agent、计量、
 - 每个 job 只拿它需要的东西：生成 job 拿不到题目；打分 job 不运行 agent；只有发布 job 有写仓库权限。workflow 顶层 `permissions: {}`。
 - 所有输入经正则校验后通过 env 传入 shell，不做表达式拼接。
 - 已知残余风险：容器逃逸可拿到该机器上的模型 key 和私钥。缓解：机器一次性使用、key 用完即删、钥匙可更换。
+- 已知残余风险：只有一对钥匙，题目包的 inputs 块和 tests 块用同一把公钥加密，生成 job 为了解开 inputs 块持有私钥，因此技术上也能解开 tests 块。"生成 job 拿不到题目"靠的是生成 job 只下载 inputs 块（`crucible taskset inputs` 只读 `inputs_blob`），不是密码学隔离。要做到密码学隔离需为 tests 块单设一把只在打分 job 使用的钥匙。
 
 ## 9. 维护
 

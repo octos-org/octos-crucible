@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "name": "octos",
+  "version": "1",
+  "streaming": false,
+  "app_start_cmd": ["npm", "start"]
+}

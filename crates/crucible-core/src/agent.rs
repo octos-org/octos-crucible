@@ -18,6 +18,11 @@ pub struct AgentSpec {
     /// can still be counted.
     #[serde(default)]
     pub streaming: bool,
+    /// For `web-app` stages whose work dir has no root Dockerfile: the CMD
+    /// of the generated Dockerfile, run from `backend/`. Default
+    /// `["npm", "start"]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_start_cmd: Option<Vec<String>>,
 }
 
 fn default_version() -> String {
@@ -32,6 +37,8 @@ pub enum AgentSpecError {
     Name,
     #[error("agent.json: entrypoint must be a non-empty list of non-empty strings")]
     Entrypoint,
+    #[error("agent.json: app_start_cmd must be a non-empty list of non-empty strings")]
+    AppStartCmd,
 }
 
 impl AgentSpec {
@@ -47,7 +54,18 @@ impl AgentSpec {
         {
             return Err(AgentSpecError::Entrypoint);
         }
+        if let Some(c) = &self.app_start_cmd
+            && (c.is_empty() || c.iter().any(String::is_empty))
+        {
+            return Err(AgentSpecError::AppStartCmd);
+        }
         Ok(())
+    }
+
+    pub fn app_start_cmd(&self) -> Vec<String> {
+        self.app_start_cmd
+            .clone()
+            .unwrap_or_else(|| vec!["npm".into(), "start".into()])
     }
 }
 
@@ -71,6 +89,7 @@ mod tests {
             r#"{"schema":1,"name":"../x"}"#,
             r#"{"schema":1,"name":"x","entrypoint":[]}"#,
             r#"{"schema":1,"name":"x","entrypoint":[""]}"#,
+            r#"{"schema":1,"name":"x","app_start_cmd":[]}"#,
         ] {
             let a: AgentSpec = serde_json::from_str(raw).unwrap();
             assert!(a.validate().is_err(), "{raw}");

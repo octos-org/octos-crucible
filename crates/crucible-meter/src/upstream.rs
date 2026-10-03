@@ -23,7 +23,7 @@ const UPSTREAM_READ_TIMEOUT: Duration = Duration::from_secs(1800);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `{"api_key", "endpoint"}` as handed over on stdin.
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Credential {
     pub api_key: String,
     pub endpoint: String,
