@@ -27,3 +27,7 @@ Config: `config/pricing.json` (public prices, USD per 1M tokens), `config/egress
 cargo build --release
 cargo test --workspace
 ```
+
+## 使用指南
+
+给平台使用者的中文文档：[docs/guide/README.md](docs/guide/README.md)

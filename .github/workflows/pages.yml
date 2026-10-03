@@ -1,0 +1,74 @@
+name: pages
+
+# Builds the web frontend (web/) for GitHub Pages.
+# Pull requests only build and test. Deployment runs on main only when the
+# repository variable PAGES_ENABLED is "true" (set it after Pages is enabled
+# with source "GitHub Actions"). VITE_API_BASE comes from the repository
+# variable CRUCIBLE_API_BASE (the Worker URL).
+
+on:
+  pull_request:
+    paths:
+      - "web/**"
+      - "config/keys.json"
+      - ".github/workflows/pages.yml"
+  push:
+    branches: [main]
+    paths:
+      - "web/**"
+      - "config/keys.json"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: install age (interop test)
+        run: sudo apt-get install -y --no-install-recommends age
+      - run: npm ci
+      - name: test
+        run: npm test
+      - name: build
+        env:
+          VITE_API_BASE: ${{ vars.CRUCIBLE_API_BASE }}
+        run: npm run build
+      - if: github.event_name != 'pull_request' && vars.PAGES_ENABLED == 'true'
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: web/dist
+
+  deploy:
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.PAGES_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

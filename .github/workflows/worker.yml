@@ -1,0 +1,85 @@
+name: worker
+
+# Build and test the Cloudflare Worker (crates/crucible-worker). Never
+# deploys and uses no secrets.
+
+on:
+  pull_request:
+    paths:
+      - "crates/crucible-worker/**"
+      - "crates/crucible-core/**"
+      - "config/keys.json"
+      - "Cargo.lock"
+      - ".github/workflows/worker.yml"
+  push:
+    branches: [main]
+    paths:
+      - "crates/crucible-worker/**"
+      - "crates/crucible-core/**"
+      - "config/keys.json"
+      - "Cargo.lock"
+      - ".github/workflows/worker.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: worker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  worker:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: worker
+
+      - name: fmt
+        run: cargo fmt -p crucible-worker --check
+      - name: native tests
+        run: cargo test -p crucible-worker --locked
+      - name: clippy (native)
+        run: cargo clippy -p crucible-worker --all-targets --locked -- -D warnings
+      - name: clippy (wasm32)
+        run: cargo clippy -p crucible-worker --target wasm32-unknown-unknown --locked -- -D warnings
+
+      - name: install worker-build
+        run: cargo install worker-build --version 0.8.6 --locked
+      - name: worker-build
+        working-directory: crates/crucible-worker
+        run: |
+          set -euo pipefail
+          worker-build --release
+          ls -l build
+          size=$(stat -c %s build/index_bg.wasm)
+          echo "wasm size: $size bytes"
+          # Workers free plan: 3 MiB compressed; keep a wide margin.
+          test "$size" -lt 3000000
+
+      # Local runtime (workerd via wrangler dev) against a mock GitHub:
+      # login -> upload -> submit -> credential hand-off -> results ->
+      # query -> download. Dummy values only; nothing leaves the runner.
+      - name: end-to-end (wrangler dev + mock GitHub)
+        working-directory: crates/crucible-worker
+        env:
+          WRANGLER_SEND_METRICS: "false"
+        run: |
+          set -euo pipefail
+          cp .dev.vars.example .dev.vars
+          node dev/mock-github.mjs 9911 > mock.log 2>&1 &
+          npx --yes wrangler@4 dev --port 8787 --ip 127.0.0.1 > wrangler.log 2>&1 &
+          for _ in $(seq 1 90); do
+            curl -s -o /dev/null http://localhost:8787/ && break
+            sleep 2
+          done
+          node dev/e2e.mjs http://localhost:8787 http://127.0.0.1:9911 || { tail -50 wrangler.log; exit 1; }
