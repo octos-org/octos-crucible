@@ -24,10 +24,9 @@ env:
   OLD_GRADER_REPO: BH3GEI/arcbench-grader
   OLD_GRADER_REF: 551d4bf8830ff42d9ea99975d731e62b6d0c9a86 # main
   TASKSET_REF: step2-generate
-  # Public artifact `selftest-app-r1` of BH3GEI/arcbench-grader run 37135037401,
-  # re-hosted as a temporary pre-release asset (cross-repo artifact download
-  # needs more than GITHUB_TOKEN).
-  APP_URL: https://github.com/octos-org/octos-crucible/releases/download/temp-scorer-verify/selftest-app-r1.zip
+  # Public artifact `selftest-app-r1` (Octos, all three stages).
+  APP_REPO: BH3GEI/arcbench-grader
+  APP_RUN_ID: "37135037401"
   APP_SHA256: dbf23d6a5c3be8ff4a6c224d12daeae1da46a2cfe15476859466dc2f54d84997
 
 jobs:
@@ -77,11 +76,29 @@ jobs:
       - name: allow unprivileged user namespaces (Chromium sandbox)
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
 
-      - name: fetch app zip
+      - name: fetch app zip (public artifact of the source run)
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: selftest-app-r1
+          repository: ${{ env.APP_REPO }}
+          run-id: ${{ env.APP_RUN_ID }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/app
+      - name: check app zip
         run: |
           set -euo pipefail
-          curl -fsSL --proto =https "$APP_URL" -o "$RUNNER_TEMP/app.zip"
+          ls -la "$RUNNER_TEMP/app"
+          mv "$RUNNER_TEMP/app/selftest-app-r1.zip" "$RUNNER_TEMP/app.zip"
           echo "$APP_SHA256  $RUNNER_TEMP/app.zip" | sha256sum -c -
+      - name: let the old grader read a local zip
+        # grade.sh only downloads over https; the one change is to copy the
+        # local zip instead. Everything after the download is untouched.
+        run: |
+          set -euo pipefail
+          f=old-grader/scripts/grade.sh
+          grep -q '  if \[ -n "${APP_DOWNLOAD_TOKEN:-}" \]; then' "$f"
+          sed -i 's|  if \[ -n "${APP_DOWNLOAD_TOKEN:-}" \]; then|  if [ -n "${LOCAL_ZIP:-}" ]; then\n    cp "$LOCAL_ZIP" "$WORK/app.zip" \|\| DL_OK=1\n  elif [ -n "${APP_DOWNLOAD_TOKEN:-}" ]; then|' "$f"
+          (cd old-grader && git diff --stat && git diff)
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -139,7 +156,7 @@ jobs:
           run_old() {
             local t0; t0=$(date +%s)
             ( cd old-grader && env SUBMISSION_ID="parity-$STAGE-$ROUND" TASK_ID="github-stage-$STAGE-req-test" \
-                DOWNLOAD_URL="$APP_URL" TASKS_DIR="$RUNNER_TEMP/tasks" GRADER_RUNNER_IMAGE=grader-runner:ci \
+                DOWNLOAD_URL=https://unused.invalid LOCAL_ZIP="$RUNNER_TEMP/app.zip" TASKS_DIR="$RUNNER_TEMP/tasks" GRADER_RUNNER_IMAGE=grader-runner:ci \
                 ./scripts/grade.sh ) || true
             cp old-grader/.gradework/results/result.json "$RUNNER_TEMP/old.json"
             echo "OLD_SECONDS=$(( $(date +%s) - t0 ))" >> "$GITHUB_ENV"
