@@ -1,0 +1,14 @@
+diff --git a/codex-rs/codex-api/src/requests/chat.rs b/codex-rs/codex-api/src/requests/chat.rs
+index 5c16a5f..4668ec8 100644
+--- a/codex-rs/codex-api/src/requests/chat.rs
++++ b/codex-rs/codex-api/src/requests/chat.rs
+@@ -152,6 +152,9 @@ impl<'a> ChatRequestBuilder<'a> {
+         for (idx, item) in input.iter().enumerate() {
+             match item {
+                 ResponseItem::Message { role, content, .. } => {
++                    // z.ai GLM chat completions rejects the OpenAI "developer" role
++                    // (error 1214). Map it to "system" for chat-completions providers.
++                    let role = &if role == "developer" { "system".to_string() } else { role.clone() };
+                     let mut text = String::new();
+                     let mut items: Vec<Value> = Vec::new();
+                     let mut saw_image = false;

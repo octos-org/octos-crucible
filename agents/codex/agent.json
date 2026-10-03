@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "name": "codex",
+  "version": "1",
+  "streaming": true,
+  "app_start_cmd": ["node", "server.js"]
+}
