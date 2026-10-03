@@ -1,0 +1,914 @@
+//! End-to-end flow through the real router with an in-memory KV and a fake
+//! GitHub: login → upload → submit → Actions fetches and deletes the
+//! credential → results → query → download, plus the refusal paths.
+
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::pin;
+use std::task::{Context, Poll, Waker};
+
+use crucible_core::Envelope;
+use crucible_worker::app::handle;
+use crucible_worker::config::Config;
+use crucible_worker::http::{Backend, HttpRequest, HttpResponse, KvKey, PutOptions, Req, Resp};
+use crucible_worker::session::issue_session;
+use crucible_worker::shard::{release_tag, sha256_hex};
+use crucible_worker::util::b64_encode;
+use crucible_worker::{keys, util};
+use serde_json::{Value, json};
+
+const SESSION_KEY: &str = "test-session-key-test-session-key-0001";
+const WORKER_TOKEN: &str = "test-worker-token-test-worker-token-0001";
+const GH_TOKEN: &str = "ghp_platform_token";
+const CLIENT_SECRET: &str = "oauth-client-secret";
+const PAGES: &str = "https://octos-org.github.io";
+const EID: &str = "0b7e6a52-1f3c-4d2a-9e8b-7c6d5e4f3a21";
+const NOW: u64 = 1_790_985_600;
+
+fn block_on<F: Future>(f: F) -> F::Output {
+    let mut f = pin!(f);
+    let mut cx = Context::from_waker(Waker::noop());
+    match f.as_mut().poll(&mut cx) {
+        Poll::Ready(v) => v,
+        Poll::Pending => panic!("mock backend never pends"),
+    }
+}
+
+#[derive(Default)]
+struct FakeGitHub {
+    releases: BTreeMap<String, u64>,
+    assets: BTreeMap<u64, Vec<String>>,
+    dispatches: Vec<Value>,
+    /// (run id, eval id, status, conclusion)
+    runs: Vec<(u64, String, String, Option<String>)>,
+}
+
+/// value, metadata, expiry (unix seconds)
+type KvEntry = (Vec<u8>, Option<Value>, Option<u64>);
+
+struct Mock {
+    kv: RefCell<BTreeMap<String, KvEntry>>,
+    gh: RefCell<FakeGitHub>,
+    now: Cell<u64>,
+    logs: RefCell<Vec<String>>,
+}
+
+impl Mock {
+    fn new() -> Mock {
+        Mock {
+            kv: RefCell::default(),
+            gh: RefCell::default(),
+            now: Cell::new(NOW),
+            logs: RefCell::default(),
+        }
+    }
+
+    fn github(&self, r: &HttpRequest) -> HttpResponse {
+        let ok = |status: u16, v: Value| HttpResponse {
+            status,
+            body: serde_json::to_vec(&v).unwrap(),
+        };
+        let auth = r
+            .headers
+            .iter()
+            .find(|(k, _)| k == "authorization")
+            .map(|(_, v)| v.as_str());
+        assert!(
+            r.headers.iter().any(|(k, _)| k == "user-agent"),
+            "GitHub requires a User-Agent"
+        );
+        let mut gh = self.gh.borrow_mut();
+        let api = "https://api.github.com/repos/octos-org/octos-crucible/";
+
+        if r.url == "https://github.com/login/oauth/access_token" {
+            let body = String::from_utf8(r.body.clone().unwrap()).unwrap();
+            assert!(body.contains(&format!("client_secret={CLIENT_SECRET}")));
+            return if body.contains("code=good") {
+                ok(
+                    200,
+                    json!({"access_token": "gho_user", "token_type": "bearer"}),
+                )
+            } else {
+                ok(200, json!({"error": "bad_verification_code"}))
+            };
+        }
+        if r.url == "https://api.github.com/user" {
+            assert_eq!(auth, Some("Bearer gho_user"));
+            return ok(200, json!({"id": 42, "login": "octocat"}));
+        }
+        // Everything else is repo-scoped and uses the platform token.
+        assert_eq!(
+            auth,
+            Some(format!("Bearer {GH_TOKEN}").as_str()),
+            "{}",
+            r.url
+        );
+
+        if let Some(name) = r
+            .url
+            .strip_prefix("https://uploads.test/releases/")
+            .and_then(|rest| rest.split_once("/assets?name="))
+        {
+            let id: u64 = name.0.parse().unwrap();
+            let list = gh.assets.entry(id).or_default();
+            if list.contains(&name.1.to_string()) {
+                return ok(422, json!({"errors": [{"code": "already_exists"}]}));
+            }
+            list.push(name.1.to_string());
+            return ok(201, json!({"name": name.1}));
+        }
+        let path = r
+            .url
+            .strip_prefix(api)
+            .unwrap_or_else(|| panic!("unexpected URL {}", r.url));
+        match (r.method, path) {
+            ("GET", p) if p.starts_with("releases/tags/") => {
+                let tag = &p["releases/tags/".len()..];
+                match gh.releases.get(tag) {
+                    Some(id) => ok(200, release_json(*id)),
+                    None => ok(404, json!({"message": "Not Found"})),
+                }
+            }
+            ("POST", "releases") => {
+                let body: Value = serde_json::from_slice(r.body.as_ref().unwrap()).unwrap();
+                assert_eq!(body["prerelease"], true);
+                let id = 100 + gh.releases.len() as u64;
+                gh.releases
+                    .insert(body["tag_name"].as_str().unwrap().into(), id);
+                ok(201, release_json(id))
+            }
+            ("POST", "actions/workflows/eval.yml/dispatches") => {
+                let body: Value = serde_json::from_slice(r.body.as_ref().unwrap()).unwrap();
+                assert_eq!(body["ref"], "main");
+                let eval_id = body["inputs"]["eval_id"].as_str().unwrap().to_string();
+                gh.dispatches.push(body["inputs"].clone());
+                let id = 9000 + gh.runs.len() as u64;
+                gh.runs.push((id, eval_id, "queued".into(), None));
+                HttpResponse {
+                    status: 204,
+                    body: vec![],
+                }
+            }
+            ("GET", p) if p.starts_with("actions/workflows/eval.yml/runs?") => {
+                assert!(p.contains("event=workflow_dispatch"));
+                let runs: Vec<Value> = gh.runs.iter().map(run_json).collect();
+                ok(
+                    200,
+                    json!({"total_count": runs.len(), "workflow_runs": runs}),
+                )
+            }
+            ("GET", p) if p.starts_with("actions/runs/") && p.ends_with("/jobs?per_page=100") => {
+                ok(
+                    200,
+                    json!({"jobs": [
+                        {"name": "build", "status": "completed"},
+                        {"name": "generate (replica 1)", "status": "in_progress"}
+                    ]}),
+                )
+            }
+            ("GET", p) if p.starts_with("actions/runs/") => {
+                let id: u64 = p["actions/runs/".len()..].parse().unwrap();
+                let run = gh.runs.iter().find(|r| r.0 == id).unwrap();
+                ok(200, run_json(run))
+            }
+            ("GET", "contents/tasksets?ref=main") => ok(
+                200,
+                json!([
+                    {"type": "dir", "name": "github-full"},
+                    {"type": "file", "name": "README.md"}
+                ]),
+            ),
+            ("GET", "contents/tasksets/github-full/taskset.json?ref=main") => {
+                let ts = json!({
+                    "schema": 1, "name": "github-full", "version": "1.0",
+                    "scorer": {"name": "playwright"},
+                    "stages": [
+                        {"id": "stage-1", "inputs": ["stage-1/requirements.md"], "output": "web_app", "time_limit_s": 3600, "expected_total": 30},
+                        {"id": "stage-2", "inputs": ["stage-2/requirements.md"], "output": "web_app", "time_limit_s": 3600, "expected_total": 29}
+                    ]
+                });
+                ok(
+                    200,
+                    json!({"sha": "abc123", "content": b64_encode(ts.to_string().as_bytes())}),
+                )
+            }
+            (m, p) => panic!("unexpected GitHub call {m} {p}"),
+        }
+    }
+}
+
+fn release_json(id: u64) -> Value {
+    json!({"id": id, "upload_url": format!("https://uploads.test/releases/{id}/assets{{?name,label}}")})
+}
+
+fn run_json(r: &(u64, String, String, Option<String>)) -> Value {
+    json!({
+        "id": r.0,
+        "html_url": format!("https://github.com/octos-org/octos-crucible/actions/runs/{}", r.0),
+        "status": r.2, "conclusion": r.3, "display_title": format!("eval {}", r.1)
+    })
+}
+
+impl Backend for Mock {
+    async fn kv_get(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
+        let now = self.now.get();
+        Ok(self
+            .kv
+            .borrow()
+            .get(key)
+            .filter(|(_, _, exp)| exp.is_none_or(|e| e > now))
+            .map(|(v, _, _)| v.clone()))
+    }
+    async fn kv_put(&self, key: &str, value: &[u8], opts: PutOptions) -> Result<(), String> {
+        assert!(opts.ttl.is_none_or(|t| t >= 60), "KV TTL minimum is 60s");
+        if let Some(m) = &opts.metadata {
+            assert!(
+                serde_json::to_vec(m).unwrap().len() <= 1024,
+                "KV metadata limit"
+            );
+        }
+        let exp = opts.ttl.map(|t| self.now.get() + t);
+        self.kv
+            .borrow_mut()
+            .insert(key.into(), (value.to_vec(), opts.metadata, exp));
+        Ok(())
+    }
+    async fn kv_delete(&self, key: &str) -> Result<(), String> {
+        self.kv.borrow_mut().remove(key);
+        Ok(())
+    }
+    async fn kv_list(&self, prefix: &str, limit: usize) -> Result<Vec<KvKey>, String> {
+        Ok(self
+            .kv
+            .borrow()
+            .iter()
+            .filter(|(k, _)| k.starts_with(prefix))
+            .take(limit)
+            .map(|(k, (_, m, _))| KvKey {
+                name: k.clone(),
+                metadata: m.clone(),
+            })
+            .collect())
+    }
+    async fn fetch(&self, req: HttpRequest) -> Result<HttpResponse, String> {
+        Ok(self.github(&req))
+    }
+    fn now_s(&self) -> u64 {
+        self.now.get()
+    }
+    fn random_bytes(&self, n: usize) -> Vec<u8> {
+        vec![7; n]
+    }
+    fn log(&self, line: &str) {
+        self.logs.borrow_mut().push(line.to_owned());
+    }
+}
+
+fn config(dev: bool) -> Config {
+    Config::from_lookup(|name| {
+        Some(
+            match name {
+                "PAGES_ORIGIN" => PAGES,
+                "PAGES_URL" => "https://octos-org.github.io/octos-crucible/",
+                "GITHUB_REPO" => "octos-org/octos-crucible",
+                "ADMIN_GITHUB_IDS" => "1",
+                "GITHUB_CLIENT_ID" => "Iv1.client",
+                "GITHUB_CLIENT_SECRET" => CLIENT_SECRET,
+                "GITHUB_TOKEN" => GH_TOKEN,
+                "SESSION_HMAC_KEY" => SESSION_KEY,
+                "CRUCIBLE_WORKER_TOKEN" => WORKER_TOKEN,
+                "DEV_AUTH" if dev => "1",
+                _ => return None,
+            }
+            .to_string(),
+        )
+    })
+    .unwrap()
+}
+
+struct T {
+    mock: Mock,
+    cfg: Config,
+}
+
+impl T {
+    fn new() -> T {
+        T {
+            mock: Mock::new(),
+            cfg: config(false),
+        }
+    }
+
+    fn call(&self, method: &str, target: &str, headers: &[(&str, &str)], body: &[u8]) -> Resp {
+        let (path, query) = target.split_once('?').unwrap_or((target, ""));
+        let req = Req {
+            method: method.into(),
+            origin: "https://crucible.example.workers.dev".into(),
+            host: "crucible.example.workers.dev".into(),
+            path: path.into(),
+            query: query.into(),
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_ascii_lowercase(), v.to_string()))
+                .collect(),
+            body: body.to_vec(),
+        };
+        block_on(handle(&self.mock, &self.cfg, &req))
+    }
+
+    fn as_user(&self, method: &str, target: &str, token: &str, body: &[u8]) -> Resp {
+        let auth = format!("Bearer {token}");
+        self.call(method, target, &[("Authorization", &auth)], body)
+    }
+}
+
+fn json_of(r: &Resp) -> Value {
+    serde_json::from_slice(&r.body).unwrap_or(Value::Null)
+}
+
+fn err_code(r: &Resp) -> String {
+    json_of(r)["error"]["code"]
+        .as_str()
+        .unwrap_or("")
+        .to_string()
+}
+
+fn sealed(payload: &[u8]) -> Vec<u8> {
+    let mut b = Envelope::new(keys::current().key_id.clone()).header_line();
+    b.extend_from_slice(b"age-encryption.org/v1\n");
+    b.extend_from_slice(payload);
+    b
+}
+
+fn token(gid: u64, login: &str) -> String {
+    issue_session(SESSION_KEY.as_bytes(), gid, login, NOW)
+}
+
+#[test]
+fn oauth_login() {
+    let t = T::new();
+    let r = t.call("GET", "/auth/login", &[], b"");
+    assert_eq!(r.status, 302);
+    let loc = r.header("location").unwrap();
+    assert!(loc.starts_with("https://github.com/login/oauth/authorize?client_id=Iv1.client"));
+    assert!(
+        loc.contains("redirect_uri=https%3A%2F%2Fcrucible.example.workers.dev%2Fauth%2Fcallback")
+    );
+    let cookie = r.header("set-cookie").unwrap();
+    assert!(cookie.contains("HttpOnly") && cookie.contains("Secure"));
+    let nonce = cookie.split(';').next().unwrap().to_string();
+    let state = loc
+        .split("state=")
+        .nth(1)
+        .unwrap()
+        .split('&')
+        .next()
+        .unwrap();
+
+    // Good round trip.
+    let r = t.call(
+        "GET",
+        &format!("/auth/callback?code=good&state={state}"),
+        &[("Cookie", &nonce)],
+        b"",
+    );
+    assert_eq!(r.status, 302);
+    let loc = r.header("location").unwrap();
+    let tok = loc
+        .strip_prefix("https://octos-org.github.io/octos-crucible/#token=")
+        .expect(loc);
+    let me = t.as_user("GET", "/me", tok, b"");
+    assert_eq!(
+        json_of(&me),
+        json!({"github_id": 42, "login": "octocat", "is_admin": false})
+    );
+
+    // Missing/foreign cookie, bad code, denied, banned.
+    let r = t.call(
+        "GET",
+        &format!("/auth/callback?code=good&state={state}"),
+        &[],
+        b"",
+    );
+    assert!(
+        r.header("location")
+            .unwrap()
+            .ends_with("#error=oauth_state")
+    );
+    let r = t.call(
+        "GET",
+        &format!("/auth/callback?code=good&state={state}"),
+        &[("Cookie", "crucible_oauth=other")],
+        b"",
+    );
+    assert!(
+        r.header("location")
+            .unwrap()
+            .ends_with("#error=oauth_state")
+    );
+    let r = t.call(
+        "GET",
+        &format!("/auth/callback?code=bad&state={state}"),
+        &[("Cookie", &nonce)],
+        b"",
+    );
+    assert!(
+        r.header("location")
+            .unwrap()
+            .ends_with("#error=oauth_failed")
+    );
+    let r = t.call("GET", "/auth/callback?error=access_denied", &[], b"");
+    assert!(
+        r.header("location")
+            .unwrap()
+            .ends_with("#error=oauth_denied")
+    );
+    // Expired state.
+    t.mock.now.set(NOW + 601);
+    let r = t.call(
+        "GET",
+        &format!("/auth/callback?code=good&state={state}"),
+        &[("Cookie", &nonce)],
+        b"",
+    );
+    assert!(
+        r.header("location")
+            .unwrap()
+            .ends_with("#error=oauth_state")
+    );
+    t.mock.now.set(NOW);
+    block_on(t.mock.kv_put("ban/42", b"{}", PutOptions::default())).unwrap();
+    let r = t.call(
+        "GET",
+        &format!("/auth/callback?code=good&state={state}"),
+        &[("Cookie", &nonce)],
+        b"",
+    );
+    assert!(r.header("location").unwrap().ends_with("#error=banned"));
+
+    // The OAuth code and tokens never reach the log.
+    for line in t.mock.logs.borrow().iter() {
+        assert!(!line.contains("good") && !line.contains("gho_") && !line.contains(tok));
+    }
+}
+
+#[test]
+fn auth_and_cors() {
+    let t = T::new();
+    assert_eq!(t.call("GET", "/me", &[], b"").status, 401);
+    assert_eq!(t.as_user("GET", "/me", "v1.junk.junk", b"").status, 401);
+    let expired = issue_session(SESSION_KEY.as_bytes(), 42, "octocat", NOW - 2 * 86_400);
+    assert_eq!(t.as_user("GET", "/me", &expired, b"").status, 401);
+    let admin = t.as_user("GET", "/me", &token(1, "admin"), b"");
+    assert_eq!(json_of(&admin)["is_admin"], true);
+
+    let pre = t.call(
+        "OPTIONS",
+        "/evals",
+        &[("Origin", PAGES), ("Access-Control-Request-Method", "POST")],
+        b"",
+    );
+    assert_eq!(pre.status, 204);
+    assert_eq!(pre.header("access-control-allow-origin"), Some(PAGES));
+    assert!(
+        pre.header("access-control-allow-headers")
+            .unwrap()
+            .contains("X-Upload-Kind")
+    );
+    let evil = t.call(
+        "OPTIONS",
+        "/evals",
+        &[("Origin", "https://evil.example")],
+        b"",
+    );
+    assert_eq!(evil.header("access-control-allow-origin"), None);
+    let get = t.call("GET", "/pubkey", &[("Origin", PAGES)], b"");
+    assert_eq!(get.header("access-control-allow-origin"), Some(PAGES));
+    assert_eq!(json_of(&get)["key_id"], keys::current().key_id);
+    // Internal endpoints never answer cross-origin.
+    let internal = t.call("OPTIONS", "/internal/cred/x", &[("Origin", PAGES)], b"");
+    assert_eq!(internal.header("access-control-allow-origin"), None);
+
+    assert_eq!(err_code(&t.call("GET", "/nope", &[], b"")), "not_found");
+    assert_eq!(t.call("PUT", "/evals", &[], b"").status, 405);
+}
+
+#[test]
+fn dev_login_only_in_dev_on_localhost() {
+    let mut t = T::new();
+    assert_eq!(
+        t.call("GET", "/auth/dev-login?github_id=5&login=dev", &[], b"")
+            .status,
+        404
+    );
+    t.cfg = config(true);
+    // Still refused for a non-local host.
+    assert_eq!(
+        t.call("GET", "/auth/dev-login?github_id=5&login=dev", &[], b"")
+            .status,
+        404
+    );
+    let req = Req {
+        method: "GET".into(),
+        origin: "http://localhost:8787".into(),
+        host: "localhost".into(),
+        path: "/auth/dev-login".into(),
+        query: "github_id=5&login=dev".into(),
+        ..Default::default()
+    };
+    let r = block_on(handle(&t.mock, &t.cfg, &req));
+    assert_eq!(r.status, 200);
+    let tok = json_of(&r)["token"].as_str().unwrap().to_string();
+    assert_eq!(json_of(&t.as_user("GET", "/me", &tok, b""))["github_id"], 5);
+}
+
+#[test]
+fn full_flow() {
+    let t = T::new();
+    let alice = token(42, "octocat");
+    let bob = token(43, "bob");
+    let admin = token(1, "admin");
+
+    // Tasksets (public).
+    let ts = t.call("GET", "/tasksets", &[], b"");
+    assert_eq!(
+        json_of(&ts),
+        json!([{"name": "github-full", "version": "1.0", "stages": [
+            {"name": "stage-1", "time_limit_s": 3600, "total": 30},
+            {"name": "stage-2", "time_limit_s": 3600, "total": 29}
+        ]}])
+    );
+
+    // Upload.
+    let up = |tok: &str, kind: &str, body: &[u8]| {
+        let auth = format!("Bearer {tok}");
+        t.call(
+            "POST",
+            "/uploads",
+            &[("Authorization", &auth), ("X-Upload-Kind", kind)],
+            body,
+        )
+    };
+    assert_eq!(
+        err_code(&up(&alice, "agent", b"PK\x03\x04zip")),
+        "not_sealed"
+    );
+    assert_eq!(err_code(&up(&alice, "zip", &sealed(b"x"))), "bad_request");
+    let mut wrong = Envelope::new("ffffffffffffffff").header_line();
+    wrong.extend_from_slice(b"x");
+    assert_eq!(err_code(&up(&alice, "agent", &wrong)), "wrong_key");
+    let pkg = sealed(b"agent package ciphertext");
+    let r = up(&alice, "agent", &pkg);
+    assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+    let hash = json_of(&r)["hash"].as_str().unwrap().to_string();
+    assert_eq!(hash, sha256_hex(&pkg));
+    let tag = release_tag(&hash).unwrap();
+    assert!(t.mock.gh.borrow().releases.contains_key(&tag));
+    assert_eq!(up(&alice, "agent", &pkg).status, 200); // idempotent
+    assert_eq!(up(&bob, "agent", &pkg).status, 409); // not claimable
+    // Bytes already in the store but not uploaded by this user.
+    let foreign = sealed(b"someone's output");
+    {
+        let mut gh = t.mock.gh.borrow_mut();
+        let id = 777;
+        gh.releases
+            .insert(release_tag(&sha256_hex(&foreign)).unwrap(), id);
+        gh.assets.entry(id).or_default().push(sha256_hex(&foreign));
+    }
+    block_on(t.mock.kv_delete(&format!(
+        "cache/release/{}",
+        release_tag(&sha256_hex(&foreign)).unwrap()
+    )))
+    .unwrap();
+    assert_eq!(up(&bob, "agent", &foreign).status, 409);
+    assert_eq!(
+        t.call("POST", "/uploads", &[("X-Upload-Kind", "agent")], &pkg)
+            .status,
+        401
+    );
+
+    // Submit.
+    let cred = sealed(b"model key ciphertext");
+    let eval = json!({
+        "mode": "agent", "eval_id": EID, "upload_hash": hash, "taskset": "github-full",
+        "model": "glm-5.3", "replicas": 2, "budget": {"max_cost_usd": 5.0},
+        "cred_envelope": b64_encode(&cred), "score_public": true, "consent": true
+    });
+    let body = serde_json::to_vec(&eval).unwrap();
+    // Bob cannot use Alice's upload.
+    let mut bobs = eval.clone();
+    bobs["eval_id"] = json!("1b7e6a52-1f3c-4d2a-9e8b-7c6d5e4f3a21");
+    assert_eq!(
+        t.as_user("POST", "/evals", &bob, &serde_json::to_vec(&bobs).unwrap())
+            .status,
+        403
+    );
+    let mut no_consent = eval.clone();
+    no_consent["consent"] = json!(false);
+    assert_eq!(
+        err_code(&t.as_user(
+            "POST",
+            "/evals",
+            &alice,
+            &serde_json::to_vec(&no_consent).unwrap()
+        )),
+        "consent_required"
+    );
+    let mut too_many = eval.clone();
+    too_many["stages"] = json!(3);
+    assert_eq!(
+        t.as_user(
+            "POST",
+            "/evals",
+            &alice,
+            &serde_json::to_vec(&too_many).unwrap()
+        )
+        .status,
+        400
+    );
+    let mut wrong_kind = eval.clone();
+    wrong_kind["mode"] = json!("app");
+    wrong_kind
+        .as_object_mut()
+        .unwrap()
+        .retain(|k, _| !["model", "replicas", "budget", "cred_envelope"].contains(&k.as_str()));
+    assert_eq!(
+        t.as_user(
+            "POST",
+            "/evals",
+            &alice,
+            &serde_json::to_vec(&wrong_kind).unwrap()
+        )
+        .status,
+        400
+    );
+    let r = t.as_user("POST", "/evals", &alice, &body);
+    assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(json_of(&r), json!({"eval_id": EID}));
+    assert_eq!(t.as_user("POST", "/evals", &alice, &body).status, 409);
+
+    let inputs = t.mock.gh.borrow().dispatches[0].clone();
+    assert_eq!(
+        inputs,
+        json!({
+            "eval_id": EID, "mode": "agent", "agent_source": format!("blob:{hash}"),
+            "taskset": "github-full", "stages": "2", "model": "glm-5.3", "replicas": "2",
+            "budget": "{\"max_cost_usd\":5.0}", "cred_source": "kv", "owner_id": "42",
+            "owner_login": "octocat", "score_public": "true",
+            "results_url": format!("https://crucible.example.workers.dev/internal/results/{EID}")
+        })
+    );
+    let input_text = inputs.to_string();
+    assert!(!input_text.contains(&b64_encode(&cred)) && !input_text.contains("ciphertext"));
+
+    // Status before and while running.
+    let r = t.as_user("GET", &format!("/evals/{EID}"), &alice, b"");
+    assert_eq!(json_of(&r)["status"], "queued");
+    assert!(
+        json_of(&r)["run_url"]
+            .as_str()
+            .unwrap()
+            .ends_with("/actions/runs/9000")
+    );
+    t.mock.gh.borrow_mut().runs[0].2 = "in_progress".into();
+    let r = json_of(&t.as_user("GET", &format!("/evals/{EID}"), &alice, b""));
+    assert_eq!(
+        (r["status"].as_str(), r["phase"].as_str()),
+        (Some("running"), Some("generate (replica 1)"))
+    );
+    assert_eq!(
+        t.as_user("GET", &format!("/evals/{EID}"), &bob, b"").status,
+        403
+    );
+    assert_eq!(
+        t.as_user("GET", &format!("/evals/{EID}"), &admin, b"")
+            .status,
+        200
+    );
+    assert_eq!(
+        t.as_user("GET", "/evals/not-a-uuid", &alice, b"").status,
+        400
+    );
+
+    // Actions: fetch the credential, then delete it.
+    let cred_path = format!("/internal/cred/{EID}");
+    assert_eq!(t.call("GET", &cred_path, &[], b"").status, 401);
+    assert_eq!(t.as_user("GET", &cred_path, &alice, b"").status, 401);
+    let r = t.as_user("GET", &cred_path, WORKER_TOKEN, b"");
+    assert_eq!(r.status, 200);
+    assert_eq!(r.body, cred);
+    assert_eq!(
+        t.as_user("DELETE", &cred_path, WORKER_TOKEN, b"").status,
+        204
+    );
+    assert_eq!(t.as_user("GET", &cred_path, WORKER_TOKEN, b"").status, 404);
+
+    // Not downloadable yet.
+    assert_eq!(
+        err_code(&t.as_user("GET", &format!("/evals/{EID}/download"), &alice, b"")),
+        "not_ready"
+    );
+
+    // Results.
+    let zip = "c0".repeat(32);
+    let manifest = json!({
+        "schema": 1, "eval_id": EID, "created_at": "2026-10-03T00:00:00Z",
+        "taskset": "github-full", "agent": {"name": "uploaded", "version": "1"},
+        "model": "glm-5.3", "public": true,
+        "replicas": [{"replica": 1, "stages": [
+            {"stage": "stage-1", "score": {"status": "failed", "passed": 27, "total": 30},
+             "usage": {"requests": 3, "prompt_tokens": 10, "cached_tokens": 2, "completion_tokens": 5, "reasoning_tokens": 0}}
+        ]}],
+        "download": {"sha256": zip}
+    });
+    let results = format!("/internal/results/{EID}");
+    let mbody = serde_json::to_vec(&manifest).unwrap();
+    assert_eq!(t.as_user("POST", &results, &alice, &mbody).status, 401);
+    assert_eq!(t.as_user("POST", &results, WORKER_TOKEN, b"{}").status, 400);
+    let r = t.as_user("POST", &results, WORKER_TOKEN, &mbody);
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+
+    let r = json_of(&t.as_user("GET", &format!("/evals/{EID}"), &alice, b""));
+    assert_eq!(r["status"], "succeeded");
+    assert_eq!(
+        r["manifest"]["replicas"][0]["stages"][0]["score"]["passed"],
+        27
+    );
+    assert_eq!(r["total_score"], 27.0);
+    assert_eq!(r["download_available"], true);
+    assert!(r["manifest"].get("download").is_none());
+
+    let list = json_of(&t.as_user("GET", "/evals", &alice, b""));
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    assert_eq!(list[0]["eval_id"], EID);
+    assert_eq!(list[0]["status"], "succeeded");
+    assert_eq!(list[0]["total_score"], 27.0);
+    assert_eq!(json_of(&t.as_user("GET", "/evals", &bob, b"")), json!([]));
+    assert_eq!(t.as_user("GET", "/evals?all=1", &bob, b"").status, 403);
+    assert_eq!(
+        json_of(&t.as_user("GET", "/evals?all=1", &admin, b""))
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Download.
+    let dl = format!("/evals/{EID}/download");
+    let r = t.as_user("GET", &dl, &alice, b"");
+    assert_eq!(r.status, 302);
+    assert_eq!(
+        r.header("location").unwrap(),
+        format!(
+            "https://github.com/octos-org/octos-crucible/releases/download/{}/{zip}",
+            release_tag(&zip).unwrap()
+        )
+    );
+    let r = t.call(
+        "GET",
+        &dl,
+        &[
+            ("Authorization", &format!("Bearer {alice}")),
+            ("Accept", "application/json"),
+        ],
+        b"",
+    );
+    assert!(json_of(&r)["url"].as_str().unwrap().ends_with(&zip));
+    assert_eq!(t.as_user("GET", &dl, &bob, b"").status, 403);
+
+    // Nothing secret in the log.
+    for line in t.mock.logs.borrow().iter() {
+        for secret in [alice.as_str(), WORKER_TOKEN, GH_TOKEN, &b64_encode(&cred)] {
+            assert!(!line.contains(secret), "{line}");
+        }
+    }
+}
+
+#[test]
+fn app_mode_and_failures() {
+    let t = T::new();
+    let alice = token(42, "octocat");
+    let art = sealed(b"site zip");
+    let r = t.call(
+        "POST",
+        "/uploads",
+        &[
+            ("Authorization", &format!("Bearer {alice}")),
+            ("X-Upload-Kind", "app"),
+        ],
+        &art,
+    );
+    let hash = json_of(&r)["hash"].as_str().unwrap().to_string();
+    let eval = json!({
+        "mode": "app", "eval_id": EID, "upload_hash": hash, "taskset": "github-full",
+        "stages": 1, "score_public": false, "consent": true
+    });
+    let r = t.as_user(
+        "POST",
+        "/evals",
+        &alice,
+        &serde_json::to_vec(&eval).unwrap(),
+    );
+    assert_eq!(r.status, 201);
+    let inputs = t.mock.gh.borrow().dispatches[0].clone();
+    assert_eq!(inputs["cred_source"], "none");
+    assert_eq!(inputs["stages"], "1");
+    assert_eq!(inputs["model"], "");
+    assert!(
+        block_on(t.mock.kv_get(&format!("cred/{EID}")))
+            .unwrap()
+            .is_none()
+    );
+
+    // A failed run settles the eval.
+    t.mock.gh.borrow_mut().runs[0].2 = "completed".into();
+    t.mock.gh.borrow_mut().runs[0].3 = Some("failure".into());
+    let r = json_of(&t.as_user("GET", &format!("/evals/{EID}"), &alice, b""));
+    assert_eq!(r["status"], "failed");
+    let list = json_of(&t.as_user("GET", "/evals", &alice, b""));
+    assert_eq!(list[0]["status"], "failed");
+}
+
+#[test]
+fn cred_expires_after_a_day() {
+    let t = T::new();
+    let alice = token(42, "octocat");
+    let pkg = sealed(b"pkg");
+    let r = t.call(
+        "POST",
+        "/uploads",
+        &[
+            ("Authorization", &format!("Bearer {alice}")),
+            ("X-Upload-Kind", "agent"),
+        ],
+        &pkg,
+    );
+    let hash = json_of(&r)["hash"].as_str().unwrap().to_string();
+    let eval = json!({
+        "mode": "agent", "eval_id": EID, "upload_hash": hash, "taskset": "github-full",
+        "model": "m", "cred_envelope": b64_encode(&sealed(b"k")), "score_public": false, "consent": true
+    });
+    assert_eq!(
+        t.as_user(
+            "POST",
+            "/evals",
+            &alice,
+            &serde_json::to_vec(&eval).unwrap()
+        )
+        .status,
+        201
+    );
+    let path = format!("/internal/cred/{EID}");
+    assert_eq!(t.as_user("GET", &path, WORKER_TOKEN, b"").status, 200);
+    t.mock.now.set(NOW + 86_400);
+    assert_eq!(t.as_user("GET", &path, WORKER_TOKEN, b"").status, 404);
+}
+
+#[test]
+fn bans() {
+    let t = T::new();
+    let alice = token(42, "octocat");
+    let admin = token(1, "admin");
+    let ban = |tok: &str, id: u64| {
+        t.as_user(
+            "POST",
+            "/admin/ban",
+            tok,
+            &serde_json::to_vec(&json!({"github_id": id, "reason": "abuse"})).unwrap(),
+        )
+    };
+    assert_eq!(ban(&alice, 43).status, 403);
+    assert_eq!(ban(&admin, 1).status, 400); // admins cannot be banned
+    assert_eq!(ban(&admin, 42).status, 200);
+    let r = t.as_user("GET", "/me", &alice, b"");
+    assert_eq!((r.status, err_code(&r).as_str()), (403, "banned"));
+    assert_eq!(
+        t.call(
+            "POST",
+            "/uploads",
+            &[
+                ("Authorization", &format!("Bearer {alice}")),
+                ("X-Upload-Kind", "agent")
+            ],
+            &sealed(b"x"),
+        )
+        .status,
+        403
+    );
+    let r = t.as_user(
+        "POST",
+        "/admin/unban",
+        &admin,
+        &serde_json::to_vec(&json!({"github_id": 42})).unwrap(),
+    );
+    assert_eq!(r.status, 200);
+    assert_eq!(t.as_user("GET", "/me", &alice, b"").status, 200);
+    assert_eq!(
+        t.as_user("POST", "/admin/ban", &admin, b"{\"github_id\":\"x\"}")
+            .status,
+        400
+    );
+    // util is part of the public surface the tests rely on.
+    assert_eq!(util::rfc3339(NOW), "2026-10-03T00:00:00Z");
+}
