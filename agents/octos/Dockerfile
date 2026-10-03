@@ -4,6 +4,11 @@
 FROM gyataro/arcbench-runner:local-base
 ARG AGENT_REF=main
 
+# The runner image ships without zip/unzip, which arc/pack.sh and the
+# unpack step below need.
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends zip unzip \
+    && rm -rf /var/lib/apt/lists/*
+
 # Bundle: arc/pack.sh output unzipped as the runner's submission dir.
 RUN set -eu; \
     git clone --quiet https://github.com/octos-org/octos-arc /tmp/octos-arc; \
