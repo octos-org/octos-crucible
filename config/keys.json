@@ -1,0 +1,11 @@
+{
+  "current": "1ffa702796eb5ee8",
+  "keys": [
+    {
+      "key_id": "1ffa702796eb5ee8",
+      "public_key": "age1z9yuep6t9eh654z7huchldp4qqd5vea4y4cn444gzyg3apdm9ahqmjtcy3",
+      "created": "2026-10-03",
+      "private_key_locations": ["GitHub secret CRUCIBLE_AGE_KEY", "maintainer keychain"]
+    }
+  ]
+}
