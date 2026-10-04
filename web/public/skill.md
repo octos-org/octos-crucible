@@ -1,11 +1,17 @@
 ---
 name: octos-crucible
-description: Evaluate a coding agent or its output on octos-crucible. Package the agent, submit it with the crucible CLI, then read per-stage scores, time, tokens and cost. Use this when asked to benchmark, score or iterate on a coding agent with octos-crucible.
+description: Evaluate an agent (or its output) on octos-crucible, a general platform for evaluating agents on any task set, from writing code to interactive decision-making. Package the agent, submit it with the crucible CLI, then read per-stage scores, time, tokens, cache hits and cost. Use this when asked to benchmark, score or iterate on an agent with octos-crucible.
 ---
 
 # octos-crucible
 
-octos-crucible evaluates coding agents. You hand it an agent package (a Docker image recipe); it runs the agent in an isolated container through a multi-stage task, one stage after another in the same working directory, and scores each stage with hidden tests. For every stage it records the score, wall time, model requests, tokens, cache hits and an equivalent cost. You can also skip the agent and just score an output you already have.
+octos-crucible is a general platform for evaluating agents. Any agent that runs in a sandbox can be run on any task set, stage by stage, and scored; for every stage the platform objectively records the score, wall time, model requests, tokens, cache hits and an equivalent cost. Writing code is just one kind of task. Current task sets include:
+
+- **Coding**: ARC-Bench GitHub tasks; the agent builds a website, scored by Playwright tests.
+- **Interactive decision-making**: GOSIM Agentic Observer (`astro-practice`); an observing agent answers a simulator turn by turn, scored by the official scoring engine.
+- **Math / reasoning** (coming soon): e.g. the agent writes proofs and a judge model scores them against a rubric. Model-based scoring is planned, not live.
+
+Task sets, how the agent is run, how its output is packaged and how it is scored are all pluggable (`docs/plugins.md`). You hand the platform an agent package (a Docker image recipe); it runs the agent in an isolated container, one stage after another in the same working directory, and scores each stage with hidden test material. You can also skip the agent and just score an output you already have.
 
 - Website: https://octos-org.github.io/octos-crucible/
 - API (Worker): https://crucible-worker.stratosphericus.workers.dev
@@ -67,6 +73,8 @@ ENTRYPOINT ["/opt/agent/run.sh"]
 set -euo pipefail
 exec timeout "$DEADLINE_S" python3 /opt/agent/agent.py --requirements /req --workdir "$PWD" --model "$MODEL"
 ```
+
+What the agent produces depends on the task set: a website, a set of files, a project that then answers a simulator interactively, and so on. Read the stage requirements in `/req` for what is expected. The contract below is the same for all of them.
 
 What the agent must do: start from the command line, read this stage's requirements in `/req` (read-only), work in the current directory `/work`, and exit when done. Whatever is in `/work` at the end is the stage's output. The agent does not need to know about stages: `/work` and `HOME` (`/home/agent`) are kept between stages; the next stage just puts new requirements in `/req` and runs the same command again.
 

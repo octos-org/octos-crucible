@@ -160,7 +160,7 @@ export function Submit() {
       <p class="muted small">
         {mode === "agent"
           ? "平台用你的模型 key 按阶段运行 agent、逐阶段打分，给出每遍每阶段的分数、用时、token 和等价花销。"
-          : "上传已经生成好的产出（如网站的 zip），只打分，几分钟出结果。"}
+          : "上传已经生成好的产出（zip，内容由题目包决定），只打分，不运行 agent。"}
       </p>
 
       <fieldset class="card" disabled={busy}>

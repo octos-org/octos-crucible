@@ -50,7 +50,9 @@ function Login() {
   return (
     <main class="login">
       <h1>octos-crucible</h1>
-      <p class="lead">评测 coding agent：上传 agent 或产出，按阶段运行、打分，给出分数、用时、token 和等价花销。</p>
+      <p class="lead">
+        评测 agent 的通用平台：任何能在沙箱里运行的 agent，在任何题目上按阶段运行、打分，同时记录用时、token、缓存命中和等价花销。写代码、交互决策都只是其中一类题。
+      </p>
       <p class="small">
         让你的 agent 读这个：<a class="link" href={SKILL_URL}>{SKILL_URL}</a>
       </p>
