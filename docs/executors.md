@@ -4,7 +4,7 @@
 
 插件化（`docs/plugins.md`，P2 的 `plugins.json`、产出运行器 `workdir`、打包器、打分器）是本文的前提：插件决定"一步里做什么"，本文只决定"这一步在哪、用什么起容器、密钥怎么送到"。插件接口不因执行层而改变。
 
-第 5 节给出实施顺序，每一步单独上线。**已实现**：步骤层（`crucible step <名字>`，`crucible step list` 输出全部声明）、执行后端接口与 Docker 实现（沙箱按槽位分配，一台机器可同时跑多个评测）、单机运行 `crucible eval local`（用法见 §5.2 末尾）、Nomad 后端 `crucible eval nomad`（整步托管，用法见 `docs/nomad.md`）。Kubernetes 的执行后端 `K8sExecutor`（容器即 Pod、网络隔离用 NetworkPolicy、集群内 BuildKit + 镜像仓库，`deploy/k8s/`）已实现，调度（`crucible eval k8s`）进行中。
+第 5 节给出实施顺序，每一步单独上线。**已实现**：步骤层（`crucible step <名字>`，`crucible step list` 输出全部声明）、执行后端接口与 Docker 实现（沙箱按槽位分配，一台机器可同时跑多个评测）、单机运行 `crucible eval local`（用法见 §5.2 末尾）、Nomad 后端 `crucible eval nomad`（整步托管，用法见 `docs/nomad.md`）。原生 Kubernetes 后端 `crucible eval k8s`（容器即 Pod、网络隔离用 NetworkPolicy、集群内 BuildKit + 镜像仓库，用法见 `docs/kubernetes.md`），插件脚本经 `crucible ctr` 起容器，不再直接调 docker。
 
 ---
 
@@ -446,6 +446,8 @@ crucible eval local --root <仓库> --taskset hello-world --agent builtin:octos 
 - 前提：Linux、Docker（iptables 防火墙后端）、当前用户在 docker 组、`sudo -n iptables` 免密。
 
 ### 5.3 c. Kubernetes 后端
+
+**已实现（`crucible eval k8s`，`docs/kubernetes.md`）。** 与下面的计划相比：包搬运不走 blob 存储，每次评测一个命名空间和一个 PVC，所有步骤和容器都挂在 `/crucible`，驱动经装载 Pod 拷入拷出；快照不需要边车，步骤进程直接读卷上的工作目录（容器与步骤同节点）；没有 MinIO、Pod Security 标签和 RuntimeClass；可信与沙箱步骤暂不分节点池；新 Pod 的 NetworkPolicy 空窗由 init 容器 `netgate` 挡住；`--network container:` 不支持（arcbench-official 打分器只能用 Docker 后端）。
 
 **要改什么：**
 
