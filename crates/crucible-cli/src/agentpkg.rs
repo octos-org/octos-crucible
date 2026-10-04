@@ -32,7 +32,7 @@ pub enum Source {
     Blob(String),
 }
 
-fn ref_ok(r: &str) -> bool {
+pub(crate) fn ref_ok(r: &str) -> bool {
     !r.is_empty()
         && r.len() <= 100
         && !r.starts_with('-')

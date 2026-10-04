@@ -77,7 +77,7 @@ on:
         type: string
         default: ""
       options:
-        description: 'JSON, all optional: {"stages": N (first N stages only), "budget": {"max_requests","max_tokens","max_cost_usd","price"}, "results_url": "https://..."}'
+        description: 'JSON, all optional: {"stages": N (first N stages only), "budget": {"max_requests","max_tokens","max_cost_usd","price"}, "results_url": "https://...", "agent_ref": "<branch or tag of the upstream repo of a builtin agent>"}'
         type: string
         default: ""
 
@@ -94,6 +94,7 @@ jobs:
     outputs:
       agent_source: ${{ steps.plan.outputs.agent_source }}
       agent_kind: ${{ steps.plan.outputs.agent_kind }}
+      agent_ref: ${{ steps.plan.outputs.agent_ref }}
       model: ${{ steps.plan.outputs.model }}
       endpoint: ${{ steps.plan.outputs.endpoint }}
       cred_source: ${{ steps.plan.outputs.cred_source }}
@@ -262,6 +263,7 @@ jobs:
         timeout-minutes: 60
         env:
           AGENT_KIND: ${{ needs.setup.outputs.agent_kind }}
+          AGENT_REF: ${{ needs.setup.outputs.agent_ref }}
         run: |
           set -euo pipefail
           # Nothing from the package runs on the host: it is the build
@@ -273,7 +275,8 @@ jobs:
             # a full commit now and build exactly that (never a moving
             # "main"); `crucible build` checks the image's
             # /agent-build.json against it and build.json records it.
-            repo=$(jq -r .repo "$up"); ref=$(jq -r .ref "$up"); arg=$(jq -r .build_arg "$up")
+            # options.agent_ref (validated by `crucible plan`) overrides the ref.
+            repo=$(jq -r .repo "$up"); ref=${AGENT_REF:-$(jq -r .ref "$up")}; arg=$(jq -r .build_arg "$up")
             commit=$(git ls-remote "$repo" "$ref" | head -n1 | cut -f1)
             [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::cannot resolve $ref of $repo"; exit 1; }
             echo "agent source: $repo $ref = $commit"
