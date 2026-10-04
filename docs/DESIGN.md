@@ -35,7 +35,7 @@ octos-crucible 是评测 coding agent 的基础设施：运行 agent、计量、
    - 按阶段运行 agent：每阶段结束保存产出作为该阶段 checkpoint，然后在同一工作目录给出下一阶段需求。工作目录和 agent 的 HOME 在阶段之间原样保留。
    - 阶段内每 15 分钟自动快照；被强制结束时，用最后一份快照打分。
    - 容器限制：2G 内存、1 核、非 root、cap-drop ALL、no-new-privileges；只能访问计量代理和白名单软件源（npm、PyPI）；看不到测试。
-4. **打分**：在另一台机器上解密题目包，用指定打分器给每个阶段的 checkpoint 打分。
+4. **打分**：持钥 job 解密题目包的测试和各阶段 checkpoint，重新封到一把一次性钥匙交给不持有任何密钥的 job，由后者用指定打分器打分（测试可能是用户上传的不可信代码，见 `docs/scorer-contract.md` §7）。
 5. **汇总**：用时取平台进程在运行步骤内的计时，并用 GitHub job/step 时间戳核对（不采信 agent 自报），token 和花销取计量代理日志；产出和日志加密存为块；清单加密存档，提交者选择公开时才明文提交到数据分支；为提交者生成用下载密码加密的 zip。
 6. **清理**：删除模型 key 和下载密码；KV 另设 24 小时过期兜底。
 
@@ -84,15 +84,15 @@ octos-crucible 是评测 coding agent 的基础设施：运行 agent、计量、
 | `crucible-crypto` | 信封加密（公钥加密、私钥解密）、密码 zip |
 | `crucible-store` | `put`/`get`，GitHub Release 实现（32 分片） |
 | `crucible-report` | 多遍、多阶段汇总 |
-| `crucible-cli` | 二进制 `crucible`：taskset / plan / fetch / build / run / package / cred / seal-outputs / manifest / score / report / put / get；用户侧 submit / status（个人 API 令牌） |
+| `crucible-cli` | 二进制 `crucible`：taskset / plan / fetch / build / run / package / cred / seal-outputs / manifest / score-handoff / score / report / put / get；用户侧 submit / status（个人 API 令牌） |
 | `crucible-worker` | Cloudflare Worker 后端 |
 
 ## 8. 安全边界
 
 - 上传的代码只在容器里运行；宿主机只执行平台自己的代码。
-- 每个 job 只拿它需要的东西：生成 job 拿不到题目；打分 job 不运行 agent；只有发布 job 有写仓库权限。workflow 顶层 `permissions: {}`。
+- 每个 job 只拿它需要的东西：生成 job 拿不到题目；跑测试的 job（`score-tests`）拿不到任何平台密钥，`permissions: {}`；只有发布 job 有写仓库权限。workflow 顶层 `permissions: {}`。
 - 所有输入经正则校验后通过 env 传入 shell，不做表达式拼接。
-- 已知残余风险：容器逃逸可拿到该机器上的模型 key 和私钥。缓解：机器一次性使用、key 用完即删、钥匙可更换。
+- 已知残余风险：生成 job 里的容器逃逸可拿到该机器上的模型 key 和私钥（打分时的逃逸拿不到，见上）。缓解：机器一次性使用、key 用完即删、钥匙可更换。
 - 已知残余风险：只有一对钥匙，题目包的 inputs 块和 tests 块用同一把公钥加密，生成 job 为了解开 inputs 块持有私钥，因此技术上也能解开 tests 块。"生成 job 拿不到题目"靠的是生成 job 只下载 inputs 块（`crucible taskset inputs` 只读 `inputs_blob`），不是密码学隔离。要做到密码学隔离需为 tests 块单设一把只在打分 job 使用的钥匙。
 
 ## 9. 维护

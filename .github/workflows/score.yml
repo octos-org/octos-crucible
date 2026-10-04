@@ -3,9 +3,11 @@ name: score
 # Quick feedback (app mode): score an uploaded output on one stage of a
 # taskset. Inputs as docs/api.md (SCORE_WORKFLOW).
 #
-#   score     runs no agent code, holds only the platform key: fetches the
-#             sealed upload and the stage's tests blob, opens both into temp
-#             dirs, runs scorers/<scorer>/score.sh (hidden visibility),
+#   score     holds the platform key, runs no test or agent code: fetches the
+#             sealed upload and the stage's tests blob and re-seals both to a
+#             one-run key (`crucible score-handoff`) for score-tests.
+#   score-tests  (score-tests.yml) holds no secret: runs
+#             scorers/<scorer>/score.sh (hidden visibility) on the handoff and
 #             checks total == expected_total. Only score.json leaves it.
 #   publish   the only job with contents: write: builds the manifest
 #             (mode app), archives it sealed, commits it in clear to the data
@@ -72,6 +74,7 @@ jobs:
       owner: ${{ steps.plan.outputs.owner }}
       results_url: ${{ steps.plan.outputs.results_url }}
       worker_url: ${{ steps.plan.outputs.worker_url }}
+      run_key: ${{ steps.handoff.outputs.run_key }}
     env:
       STORE: github:${{ github.repository }}
     steps:
@@ -132,26 +135,11 @@ jobs:
           EVAL_ID: ${{ steps.plan.outputs.eval_id }}
         run: '"$CRUCIBLE" worker --worker-url "$WORKER_URL" --eval-id "$EVAL_ID" status scoring'
 
-      # Chromium's own sandbox needs unprivileged user namespaces, which
-      # ubuntu-24.04 restricts via AppArmor. Throwaway VM.
-      - name: Prepare the scorer
-        env:
-          TASKSET_PATH: ${{ steps.plan.outputs.taskset_path }}
-        run: |
-          set -euo pipefail
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
-          scorer=$(jq -r .scorer.name "$TASKSET_PATH")
-          [[ "$scorer" =~ ^[a-z0-9][a-z0-9-]*$ ]] || { echo "::error::bad scorer name"; exit 1; }
-          if [ -d "scorers/$scorer/image" ]; then
-            docker build -q -t "crucible-scorer-$scorer:run" "scorers/$scorer/image" >/dev/null
-            echo "CRUCIBLE_SCORER_IMAGE=crucible-scorer-$scorer:run" >> "$GITHUB_ENV"
-          fi
-
-      - name: Score the upload
+      - name: Hand off the stage to score-tests
+        id: handoff
         env:
           CRUCIBLE_AGE_KEY: ${{ secrets.CRUCIBLE_AGE_KEY }}
           GITHUB_TOKEN: ${{ github.token }}
-          CRUCIBLE_PRUNE_BUILD_CACHE: "1"
           HASH: ${{ steps.plan.outputs.artifact_hash }}
           TASKSET_PATH: ${{ steps.plan.outputs.taskset_path }}
           STAGE: ${{ steps.plan.outputs.stage }}
@@ -160,23 +148,44 @@ jobs:
           set -euo pipefail
           # Same layout as an agent run: <results>/1/<stage>/checkpoint.sealed.
           d="$RUNNER_TEMP/results/1/$STAGE_ID"
-          mkdir -p "$d" "$RUNNER_TEMP/scores"
+          h="$RUNNER_TEMP/handoff"
+          mkdir -p "$d" "$h/bin"
           "$CRUCIBLE" get --store "$STORE" "$HASH" --out "$d/checkpoint.sealed"
-          "$CRUCIBLE" score --taskset "$TASKSET_PATH" --stage "$STAGE" \
-            --results "$RUNNER_TEMP/results" --out "$RUNNER_TEMP/scores" \
-            --store "$STORE" --identity-env CRUCIBLE_AGE_KEY --scorers-dir scorers
+          "$CRUCIBLE" score-handoff --taskset "$TASKSET_PATH" --stage "$STAGE" \
+            --results "$RUNNER_TEMP/results" --store "$STORE" --identity-env CRUCIBLE_AGE_KEY \
+            --out "$h" --key-out "$RUNNER_TEMP/run.key"
+          cp "$CRUCIBLE" "$h/bin/crucible"
+          cp -R scorers "$h/scorers"
+          echo "run_key=$(cat "$RUNNER_TEMP/run.key")" >> "$GITHUB_OUTPUT"
+          rm -f "$RUNNER_TEMP/run.key"
+
+      # Re-sealed to the one-run key: safe in a public repository's artifacts.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: score-handoff
+          path: ${{ runner.temp }}/handoff
+          retention-days: 1
+          if-no-files-found: error
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: score-files
-          path: |
-            ${{ runner.temp }}/bin/crucible
-            ${{ runner.temp }}/scores
+          path: ${{ runner.temp }}/bin/crucible
           retention-days: 3
           if-no-files-found: error
 
-  publish:
+  score-tests:
     needs: score
+    permissions: {}
+    uses: ./.github/workflows/score-tests.yml
+    with:
+      handoff: score-handoff
+      scores: scores
+    secrets:
+      run_key: ${{ needs.score.outputs.run_key }}
+
+  publish:
+    needs: [score, score-tests]
     if: always() && needs.score.outputs.eval_id != ''
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -206,7 +215,13 @@ jobs:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: score-files
-          path: ${{ runner.temp }}/files
+          path: ${{ runner.temp }}/files/bin
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: needs.score-tests.result == 'success'
+        with:
+          name: scores
+          path: ${{ runner.temp }}/files/scores
 
       - name: Build the manifest
         env:

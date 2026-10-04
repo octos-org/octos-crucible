@@ -1,0 +1,83 @@
+name: score-tests
+
+# The only place test code runs (called by eval.yml and score.yml).
+#
+# Test material can be untrusted (user-uploaded tasksets), and so are the
+# outputs under test. This job therefore holds no platform secret: no
+# private key, no Worker token, and a GITHUB_TOKEN with no permissions.
+# Its only input is the caller's handoff artifact (written by
+# `crucible score-handoff` on the machine with the platform key): the
+# tests and checkpoints of the stages to score, re-sealed to a one-run key
+# that opens nothing else. That key arrives as a workflow_call secret so
+# GitHub masks it, and `crucible score` removes it from the scorer's
+# environment. Only score.json (status / passed / total) leaves the job.
+#
+# The scorer adds its own walls (docs/scorer-contract.md §5, §7): test
+# container non-root, cap-drop ALL, no-new-privileges, no environment, on an
+# internal network whose traffic to the host or out of the network is
+# dropped (CRUCIBLE_SCORER_FIREWALL=1).
+
+on:
+  workflow_call:
+    inputs:
+      handoff:
+        description: "artifact: bin/crucible, scorers/, taskset.json, tests/, results/"
+        type: string
+        required: true
+      scores:
+        description: "artifact to write: <replica>/<stage>/score.json"
+        type: string
+        required: true
+    secrets:
+      run_key:
+        description: "the handoff's one-run key"
+        required: true
+
+permissions: {}
+
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions: {}
+    env:
+      H: ${{ github.workspace }}/handoff
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ inputs.handoff }}
+          path: ${{ github.workspace }}/handoff
+
+      # Chromium's own sandbox needs unprivileged user namespaces, which
+      # ubuntu-24.04 restricts via AppArmor. Throwaway VM.
+      - name: Prepare the scorer
+        run: |
+          set -euo pipefail
+          chmod 0755 "$H/bin/crucible"
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          scorer=$(jq -r .scorer.name "$H/taskset.json")
+          [[ "$scorer" =~ ^[a-z0-9][a-z0-9-]*$ ]] || { echo "::error::bad scorer name"; exit 1; }
+          [ -f "$H/scorers/$scorer/score.sh" ] || { echo "::error::unknown scorer $scorer"; exit 1; }
+          if [ -d "$H/scorers/$scorer/image" ]; then
+            docker build -q -t "crucible-scorer-$scorer:run" "$H/scorers/$scorer/image" >/dev/null
+            echo "CRUCIBLE_SCORER_IMAGE=crucible-scorer-$scorer:run" >> "$GITHUB_ENV"
+          fi
+
+      - name: Run the tests
+        env:
+          RUN_KEY: ${{ secrets.run_key }}
+          CRUCIBLE_SCORER_FIREWALL: "1"
+          CRUCIBLE_PRUNE_BUILD_CACHE: "1"
+        run: |
+          set -euo pipefail
+          mkdir -p "$H/results" "$RUNNER_TEMP/scores"
+          "$H/bin/crucible" score --taskset "$H/taskset.json" \
+            --results "$H/results" --tests-dir "$H/tests" --out "$RUNNER_TEMP/scores" \
+            --identity-env RUN_KEY --scorers-dir "$H/scorers"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ inputs.scores }}
+          path: ${{ runner.temp }}/scores
+          retention-days: 1
+          if-no-files-found: warn

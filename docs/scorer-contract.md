@@ -81,6 +81,7 @@ score.sh --artifact FILE --tests DIR --out result.json
 - 被测应用与测试运行在不同容器里；应用看不到测试材料，测试只通过网络访问应用。
 - 打分结束（包括被中断）后删除本次创建的所有容器、网络、应用镜像和临时目录。容器、网络名带每次运行唯一的后缀，多个打分可以共用一个 docker daemon。
 - 打分器不调用模型、不读任何密钥。
+- 测试容器（跑测试材料的那个）：只有 `BASE_URL`、`READY_TIMEOUT`、`CHROMIUM_SANDBOX` 三个环境变量；非 root、`--cap-drop ALL`、`no-new-privileges`；只在 `--internal` 网络上。设 `CRUCIBLE_SCORER_FIREWALL=1`（CI 上）时，再用 iptables 丢弃这个网络发往宿主机的一切流量（INPUT，v4 与 v6）以及离开这个网络的流量（DOCKER-USER），因此只能访问被测应用；规则装不上即 `system_error`。
 
 ## 6. Playwright 打分器（`scorers/playwright`）
 
@@ -118,3 +119,21 @@ score.sh --artifact FILE --tests DIR --out result.json
 环境变量：`CRUCIBLE_SCORER_IMAGE`（用预构建镜像，默认现场构建 `image/`）、`CHROMIUM_SANDBOX=0`（宿主不支持非特权 user namespace 时关闭浏览器沙箱）、`CRUCIBLE_PRUNE_BUILD_CACHE=1`（一次性 CI 机器上打完清 build cache；默认关，因为会清掉整个 daemon 的缓存）。
 
 注意：`TMPDIR` 必须是 docker daemon 能挂载的路径（例如 colima / Docker Desktop 默认只共享用户主目录时，要把 `TMPDIR` 设到主目录下）。
+
+## 7. 打分隔离边界（不可信的测试）
+
+用户可以上传题目包，测试材料因此和 agent 产出一样是**不可信代码**。边界靠 job 划分保证，不靠测试"老实"：
+
+| job | 持有 | 运行 |
+|---|---|---|
+| `score`（eval.yml / score.yml） | 平台私钥 `CRUCIBLE_AGE_KEY`、Worker 令牌 | 只跑平台自己的 `crucible score-handoff`：解开所选阶段的 tests 块和各副本的 checkpoint，**用一把本次新生成的一次性钥匙重新封好**，连同 `taskset.json`、`crucible`、`scorers/` 作为 artifact `score-handoff`（保留 1 天）交出；一次性钥匙作为 job output 交出。不跑任何测试或 agent 代码。 |
+| `score-tests`（`score-tests.yml`，`workflow_call`） | 只有一次性钥匙（以 workflow_call secret 传入，GitHub 自动打码）；`permissions: {}`；不 checkout | `crucible score --tests-dir`：用一次性钥匙解开 handoff，调用打分器（打分器进程的环境里删掉了这把钥匙）。只输出 `score.json`（artifact `scores`）。 |
+| `publish` | 平台私钥、写仓库权限 | 收尾：读 `scores`，生成清单、回传 Worker。 |
+
+要点：
+- 跑测试的机器上没有平台私钥、Worker 令牌、模型 key，`GITHUB_TOKEN` 没有任何权限。一次性钥匙只能打开本次 handoff 里的东西，而这些东西本来就要交给这台机器。
+- handoff 是密文：仓库是公开的，公开仓库的 Actions artifact 任何登录用户都能下载，所以绝不能把明文测试或产出放进 artifact。
+- 一次性钥匙经 job output 传递。GitHub 不在网页或 API 里展示 job output；它只在 `score-tests` 里以 secret 的身份出现，日志中打码。
+- 已知残余风险：从测试或应用容器逃逸的代码可以伪造本次 `score.json`（它能写 `scores` artifact）。这只影响它自己参与的这次分数：题目包作者本来就决定测试怎么判，agent 产出逃逸则与以前相同。
+
+验证：`scorers/playwright/test/fixtures/hostile/` 是一份"恶意"测试包（读环境变量里的密钥、看自身权限、连外网和 DNS、连宿主机网关的常见端口、连云元数据服务），每个用例只有在尝试**被挡住**时才通过，最后一个用例确认被测应用照常可访问。`scorer.yml` 的 e2e 在 `CRUCIBLE_SCORER_FIREWALL=1` 下要求它 5/5。

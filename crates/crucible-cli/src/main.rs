@@ -195,6 +195,12 @@ enum Cmd {
     Manifest(Box<ManifestArgs>),
     /// Score stage checkpoints with the taskset's scorer: <results>/<replica>/<stage>/checkpoint.sealed -> <out>/<replica>/<stage>/score.json.
     Score(Box<ScoreArgs>),
+    /// On the machine with the platform key: re-seal the selected stages'
+    /// tests and checkpoints to a fresh one-run key for a scoring machine
+    /// that holds no secret (`crucible score --tests-dir`). Writes
+    /// <out>/{taskset.json,tests/<stage>.sealed,results/<r>/<stage>/checkpoint.sealed}
+    /// and the one-run key to --key-out (mode 0600).
+    ScoreHandoff(Box<ScoreHandoffArgs>),
     /// AES-256 zip of every stage's output and logs, locked with the
     /// download password from the Worker credential; stored as a plain blob
     /// and recorded as `download` in the manifest. Skipped (exit 0) when the
@@ -250,15 +256,51 @@ struct ScoreArgs {
     #[arg(long)]
     out: PathBuf,
     /// Store of the tests blobs.
+    #[arg(
+        long,
+        required_unless_present = "tests_dir",
+        conflicts_with = "tests_dir"
+    )]
+    store: Option<String>,
+    /// Tests from `crucible score-handoff` (`<dir>/<stage>.sealed`) instead of the store.
     #[arg(long)]
-    store: String,
+    tests_dir: Option<PathBuf>,
     #[arg(long)]
     identity: Vec<PathBuf>,
+    /// Environment variable holding a private key; removed from the scorer's environment.
     #[arg(long)]
     identity_env: Vec<String>,
     /// Directory of scorers (`<dir>/<taskset scorer>/score.sh`).
     #[arg(long, default_value = "scorers")]
     scorers_dir: PathBuf,
+}
+
+#[derive(clap::Args)]
+struct ScoreHandoffArgs {
+    #[arg(long)]
+    taskset: PathBuf,
+    #[arg(long, conflicts_with = "stage")]
+    stages: Option<usize>,
+    #[arg(long)]
+    stage: Option<usize>,
+    #[arg(long)]
+    results: PathBuf,
+    #[arg(long)]
+    store: String,
+    #[arg(long)]
+    identity_env: Vec<String>,
+    #[arg(long)]
+    out: PathBuf,
+    #[arg(long)]
+    key_out: PathBuf,
+}
+
+fn stage_indices(n: usize, stage: Option<usize>, stages: Option<usize>) -> Result<Vec<usize>> {
+    match (stage, stages) {
+        (Some(k), _) if (1..=n).contains(&k) => Ok(vec![k - 1]),
+        (Some(_), _) => bail!("--stage must be 1..={n}"),
+        (None, s) => Ok((0..s.unwrap_or(n).min(n)).collect()),
+    }
 }
 
 #[derive(clap::Args)]
@@ -578,29 +620,49 @@ async fn run(cmd: Cmd) -> Result<()> {
         Cmd::Score(a) => {
             let ts = taskset_cmd::load(&a.taskset)?;
             ts.validate(crucible_core::taskset::MAX_TOTAL_TIME_S)?;
-            let n = ts.stages.len();
-            let stages: Vec<usize> = match (a.stage, a.stages) {
-                (Some(k), _) if (1..=n).contains(&k) => vec![k - 1],
-                (Some(_), _) => bail!("--stage must be 1..={n}"),
-                (None, s) => (0..s.unwrap_or(n).min(n)).collect(),
-            };
+            let stages = stage_indices(ts.stages.len(), a.stage, a.stages)?;
             if !crucible_core::is_slug(&ts.scorer.name, 64) {
                 bail!("bad scorer name");
             }
             let scorer = a.scorers_dir.join(&ts.scorer.name).join("score.sh");
             let keys = load_identities(&a.identity, &a.identity_env)?;
-            let store = Store::parse(&a.store)?;
+            let store = a.store.as_deref().map(Store::parse).transpose()?;
+            let tests = match (&store, &a.tests_dir) {
+                (_, Some(d)) => score::TestsFrom::Dir(d),
+                (Some(s), None) => score::TestsFrom::Store(s),
+                (None, None) => bail!("--store or --tests-dir"),
+            };
             let done = score::score(&score::ScoreOpts {
                 taskset: &ts,
                 stages,
                 results: &a.results,
                 out: &a.out,
-                store: &store,
+                tests,
                 keys: &keys,
                 scorer: &scorer,
+                scrub_env: &a.identity_env,
             })
             .await?;
             eprintln!("scored {} stage checkpoints", done.len());
+            Ok(())
+        }
+        Cmd::ScoreHandoff(a) => {
+            let ts = taskset_cmd::load(&a.taskset)?;
+            ts.validate(crucible_core::taskset::MAX_TOTAL_TIME_S)?;
+            let stages = stage_indices(ts.stages.len(), a.stage, a.stages)?;
+            let keys = load_identities(&[], &a.identity_env)?;
+            let run_key = score::handoff(
+                &ts,
+                &stages,
+                &a.results,
+                &Store::parse(&a.store)?,
+                &keys,
+                &a.out,
+            )
+            .await?;
+            std::fs::copy(&a.taskset, a.out.join("taskset.json"))?;
+            write_private(&a.key_out, run_key.to_secret_string().as_bytes())?;
+            eprintln!("handoff written for {} stage(s)", stages.len());
             Ok(())
         }
         Cmd::DownloadZip(a) => {
@@ -998,6 +1060,18 @@ fn agent_ref(
         package,
         commit,
     })
+}
+
+/// Create `path` readable by its owner only, then write `data`.
+fn write_private(path: &Path, data: &[u8]) -> Result<()> {
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    o.open(path)
+        .with_context(|| format!("creating {}", path.display()))?
+        .write_all(data)?;
+    Ok(())
 }
 
 /// A missing log means no requests were made (prototype behaviour).

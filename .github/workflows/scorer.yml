@@ -59,4 +59,5 @@ jobs:
         env:
           CRUCIBLE_SCORER_IMAGE: crucible-scorer-playwright:ci
           CRUCIBLE_PRUNE_BUILD_CACHE: "1"
+          CRUCIBLE_SCORER_FIREWALL: "1"
         run: scorers/playwright/test/e2e.sh
