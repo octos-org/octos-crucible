@@ -1,0 +1,57 @@
+{
+  "schema": 1,
+  "name": "todo-mini",
+  "description": "Public tuning task: a small server-backed todo app built over 3 stages, each stage extending the previous stage's code (add/persist; complete/delete/counter; filters/clear/stats page). Requirements and tests are public (source/), written for this platform (not from ARC). Scored with Playwright browser tests (3 / 4 / 4).",
+  "scorer": {
+    "name": "playwright"
+  },
+  "aggregate": {
+    "items": "sum",
+    "stages": "ratio"
+  },
+  "total_time_limit_s": 2700,
+  "stages": [
+    {
+      "id": "stage-1",
+      "inputs_blob": {
+        "sha256": "a51411a6974dce7d45de7640cad5f8d731fb340f102614b69286fdc2952517ce",
+        "key_id": "1ffa702796eb5ee8"
+      },
+      "tests_blob": {
+        "sha256": "06ca1e03a840e2d85bede1af94310cde08e075d3b5272566f1f45e3b3022be97",
+        "key_id": "1ffa702796eb5ee8"
+      },
+      "output": "web-app",
+      "time_limit_s": 900,
+      "expected_total": 3
+    },
+    {
+      "id": "stage-2",
+      "inputs_blob": {
+        "sha256": "52e81ab135cf1361537fd0fb2fd56b38aa4f74897b0cba3bb5ee70fdc053bf6c",
+        "key_id": "1ffa702796eb5ee8"
+      },
+      "tests_blob": {
+        "sha256": "5f95d58e9980f7bf8312704f4547610fea6a8bb4fdadfdb7403d042aec7c30ca",
+        "key_id": "1ffa702796eb5ee8"
+      },
+      "output": "web-app",
+      "time_limit_s": 900,
+      "expected_total": 4
+    },
+    {
+      "id": "stage-3",
+      "inputs_blob": {
+        "sha256": "795637b06129b74209d89e74affc9263b0c1f075f49c56b3dc11f26bc7675b17",
+        "key_id": "1ffa702796eb5ee8"
+      },
+      "tests_blob": {
+        "sha256": "c2c1e13ccdb52e6e985544022a264b71b3c1d7c6cc8802c3f50b2a5f25b467f8",
+        "key_id": "1ffa702796eb5ee8"
+      },
+      "output": "web-app",
+      "time_limit_s": 900,
+      "expected_total": 4
+    }
+  ]
+}

@@ -1,0 +1,55 @@
+id: ROOT
+name: Todo - Stage 3
+type: FOLDER
+dependencies: []
+description: The todo application already exists from the previous stages (home page
+  `/` with the “Todo” heading, “New task” input, “Add” button, a server-stored task
+  list where each task has a checkbox named by its text and a “Delete <text>”
+  button, and the “Remaining: N” counter). Everything it does must keep working.
+  This stage adds list filters, clearing completed tasks and a statistics page.
+children:
+- id: REQ-7
+  name: Filters
+  type: ATOMIC
+  dependencies: []
+  description: |-
+    The home page has three buttons named “All”, “Active” and “Completed”. “Active” shows only the tasks that are not done, “Completed” only the done ones, and “All” every task. Opening or reloading the page shows “All”. Filtering only changes what is shown; the “Remaining: N” counter still counts all not-done tasks.
+  scenarios:
+  - name: 'REQ-7: Filters - Scenario 1'
+    steps:
+    - keyword: GIVEN
+      content: 'The list holds “Read book” (not done) and “Cook dinner” (done).'
+    - keyword: WHEN
+      content: 'The visitor presses “Active”.'
+    - keyword: THEN
+      content: '“Read book” is listed and “Cook dinner” is not; after pressing “Completed” it is the other way round; after “All” both are listed.'
+- id: REQ-8
+  name: Clear Completed
+  type: ATOMIC
+  dependencies: []
+  description: |-
+    The home page has a button named “Clear completed”. Pressing it deletes every done task from the server; tasks that are not done stay.
+  scenarios:
+  - name: 'REQ-8: Clear Completed - Scenario 1'
+    steps:
+    - keyword: GIVEN
+      content: 'The list holds “Water plants” (done) and “Call mom” (not done).'
+    - keyword: WHEN
+      content: 'The visitor presses “Clear completed” and reloads the page.'
+    - keyword: THEN
+      content: '“Call mom” is listed and “Water plants” is not.'
+- id: REQ-9
+  name: Statistics Page
+  type: ATOMIC
+  dependencies: []
+  description: |-
+    The home page has a link named “Stats” leading to the page `/stats`. That page shows a level-1 heading “Stats”, the text “Total: N” (number of stored tasks) and the text “Done: M” (number of done tasks), computed from the server's current tasks each time the page is opened, and a link named “Back” to the home page.
+  scenarios:
+  - name: 'REQ-9: Statistics Page - Scenario 1'
+    steps:
+    - keyword: GIVEN
+      content: 'The server stores 3 tasks, 1 of them done.'
+    - keyword: WHEN
+      content: 'The visitor follows the “Stats” link on the home page.'
+    - keyword: THEN
+      content: 'The page `/stats` shows the heading “Stats”, “Total: 3” and “Done: 1”; its “Back” link returns to the home page.'

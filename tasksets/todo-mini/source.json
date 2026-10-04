@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "name": "todo-mini",
+  "description": "Public tuning task: a small server-backed todo app built over 3 stages, each stage extending the previous stage's code (add/persist; complete/delete/counter; filters/clear/stats page). Requirements and tests are public (source/), written for this platform (not from ARC). Scored with Playwright browser tests (3 / 4 / 4).",
+  "scorer": {"name": "playwright"},
+  "aggregate": "sum",
+  "total_time_limit_s": 2700,
+  "stages": [
+    {"id": "stage-1", "dir": "todo-stage-1", "inputs": ["requirements.yaml"], "tests": ["tests"], "output": "web-app", "time_limit_s": 900, "expected_total": 3},
+    {"id": "stage-2", "dir": "todo-stage-2", "inputs": ["requirements.yaml"], "tests": ["tests"], "output": "web-app", "time_limit_s": 900, "expected_total": 4},
+    {"id": "stage-3", "dir": "todo-stage-3", "inputs": ["requirements.yaml"], "tests": ["tests"], "output": "web-app", "time_limit_s": 900, "expected_total": 4}
+  ]
+}
