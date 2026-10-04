@@ -35,12 +35,19 @@ pub async fn run(args: RunArgs) -> Result<()> {
     // The credential first: one line on stdin, then stdin is done.
     let cred = crucible_meter::read_credential(&mut std::io::stdin().lock())
         .map_err(|e| anyhow!("{e}"))?;
-    run_with(&args, &cred, &|_| {}).await
+    run_with(
+        &crate::executor::docker::DockerExecutor,
+        &args,
+        &cred,
+        &|_| {},
+    )
+    .await
 }
 
 /// Run the stages with an opened credential; `on_stage` is called with
 /// each stage id as it starts (progress reports).
-pub async fn run_with(
+pub async fn run_with<E: crate::executor::Executor>(
+    exec: &E,
     args: &RunArgs,
     cred: &crucible_meter::Credential,
     on_stage: &(dyn Fn(&str) + Sync),
@@ -74,6 +81,7 @@ pub async fn run_with(
         &args.scratch_dir
     })?;
     let env = Env {
+        exec,
         args,
         cred,
         agent: &agent,

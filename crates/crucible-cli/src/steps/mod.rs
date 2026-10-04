@@ -460,6 +460,18 @@ pub async fn run(cmd: StepCmd, secrets: Option<Secrets>) -> Result<()> {
     }
 }
 
+/// Refuse to run a step on a backend that cannot give it what it needs
+/// (never run with weaker isolation).
+pub fn check_caps(step: &StepSpec, caps: crate::executor::Caps) -> Result<()> {
+    if step.needs.sandbox_net && !caps.sandbox_net {
+        bail!("step {}: this backend has no sandbox network", step.name);
+    }
+    if step.needs.containers && !caps.pids_limit {
+        bail!("step {}: this backend cannot limit processes", step.name);
+    }
+    Ok(())
+}
+
 /// Fail if any file under `dir` is not a sealed envelope; with `delete`,
 /// remove those files instead (only sealed files leave a sandbox step).
 pub fn sealed_only(dir: &Path, delete: bool) -> Result<()> {

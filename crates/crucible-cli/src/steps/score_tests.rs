@@ -10,7 +10,8 @@ use std::path::PathBuf;
 use anyhow::{Result, bail};
 
 use super::{Common, Secret, Secrets};
-use crate::sandbox::SandboxNet;
+use crate::executor::Executor;
+use crate::executor::docker::DockerExecutor;
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -22,6 +23,10 @@ pub struct Args {
     /// Score only this replica.
     #[arg(long)]
     pub replica: Option<u32>,
+    /// Label of this step's sandbox (`crucible.run=<label>`); what an
+    /// earlier attempt with the same label left is removed first.
+    #[arg(long)]
+    pub run_label: Option<String>,
     /// `<out>/<replica>/<stage>/score.json`.
     #[arg(long)]
     pub out: PathBuf,
@@ -34,6 +39,7 @@ pub async fn run(a: Args, s: &Secrets) -> Result<()> {
     let ts = crate::taskset_cmd::load(&h.join("taskset.json"))?;
     ts.validate(crucible_core::taskset::MAX_TOTAL_TIME_S)?;
     let keys = s.keys(Secret::RunKey)?;
+    super::check_caps(super::spec("score-tests"), DockerExecutor.caps())?;
 
     // The container plugins the taskset uses, from the registry compiled
     // into crucible; `crucible score` hands each its image.
@@ -67,9 +73,14 @@ pub async fn run(a: Args, s: &Secrets) -> Result<()> {
         eprintln!("{} {} ready", v.kind, p.name);
     }
 
+    let label = match &a.run_label {
+        Some(l) if !l.is_empty() => l.clone(),
+        _ => format!("score-{}", std::process::id()),
+    };
+    DockerExecutor.cleanup(&label);
     let cred = h.join("cred.sealed");
     let net = if cred.is_file() {
-        Some(SandboxNet::up(&METER_PORT.to_string())?)
+        Some(DockerExecutor.sandbox(&[METER_PORT], &label)?)
     } else {
         eprintln!("no model credential in the handoff");
         None
@@ -81,7 +92,7 @@ pub async fn run(a: Args, s: &Secrets) -> Result<()> {
             &h.join("pricing.json"),
             &keys,
             &n.network,
-            &n.gateway,
+            &n.host,
             METER_PORT,
         )?),
         None => None,
@@ -105,6 +116,7 @@ pub async fn run(a: Args, s: &Secrets) -> Result<()> {
     .await;
     drop(model);
     drop(net);
+    DockerExecutor.cleanup(&label);
     eprintln!("scored {} stage checkpoints", done?.len());
     Ok(())
 }

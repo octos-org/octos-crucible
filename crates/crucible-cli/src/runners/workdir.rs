@@ -25,10 +25,9 @@
 //! `agent.log` only.
 
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::{Duration, Instant, SystemTime};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use crucible_core::taskset::Stage;
 use crucible_core::{AgentSpec, UsageRecord};
 use crucible_meter::{Credential, Limits, MeterConfig, Upstream};
@@ -36,7 +35,7 @@ use crucible_metering::{Price, Pricing};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
-use crate::build::docker;
+use crate::executor::Executor;
 use crate::plan::Budget;
 
 #[derive(Debug, clap::Args)]
@@ -134,57 +133,18 @@ pub struct ContainerSpec {
     pub label: String,
 }
 
-/// The label key every container of a run carries.
-pub const RUN_LABEL: &str = "crucible.run";
-
 pub const CONTAINER_HOME: &str = "/home/agent";
 
-pub fn docker_run_args(c: &ContainerSpec) -> Vec<String> {
+/// The backend-neutral container of an agent stage.
+pub fn agent_container(c: &ContainerSpec) -> crate::executor::ContainerSpec {
     let meter = format!("http://{}:{}/v1", c.agent_host, c.meter_port);
     let egress = format!("http://{}:{}", c.agent_host, c.egress_port);
     let no_proxy = format!("{},localhost,127.0.0.1", c.agent_host);
-    let mount = |src: &Path, dst: &str, ro: bool| {
-        format!(
-            "type=bind,source={},target={dst}{}",
-            src.display(),
-            if ro { ",readonly" } else { "" }
-        )
+    let mount = |src: &Path, dst: &str, read_only: bool| crate::executor::Mount {
+        src: src.to_path_buf(),
+        dst: dst.into(),
+        read_only,
     };
-    let mut a: Vec<String> = vec![
-        "run".into(),
-        "-d".into(),
-        "--init".into(),
-        "--name".into(),
-        c.name.clone(),
-        "--label".into(),
-        format!("{RUN_LABEL}={}", c.label),
-        "--network".into(),
-        c.network.clone(),
-        "--dns".into(),
-        "127.0.0.1".into(),
-        "--user".into(),
-        c.user.clone(),
-        "--memory".into(),
-        "2g".into(),
-        "--memory-swap".into(),
-        "2g".into(),
-        "--cpus".into(),
-        "1".into(),
-        "--pids-limit".into(),
-        "1024".into(),
-        "--cap-drop".into(),
-        "ALL".into(),
-        "--security-opt".into(),
-        "no-new-privileges".into(),
-        "--mount".into(),
-        mount(&c.req, "/req", true),
-        "--mount".into(),
-        mount(&c.work, "/work", false),
-        "--mount".into(),
-        mount(&c.home, CONTAINER_HOME, false),
-        "--workdir".into(),
-        "/work".into(),
-    ];
     let env = [
         ("REQ_DIR", "/req".to_string()),
         ("WORK_DIR", "/work".to_string()),
@@ -200,20 +160,33 @@ pub fn docker_run_args(c: &ContainerSpec) -> Vec<String> {
         ("NO_PROXY", no_proxy.clone()),
         ("no_proxy", no_proxy),
     ];
-    for (k, v) in env {
-        a.push("--env".into());
-        a.push(format!("{k}={v}"));
+    crate::executor::ContainerSpec {
+        name: c.name.clone(),
+        image: c.image.clone(),
+        entrypoint: c.entrypoint.clone(),
+        env: env.into_iter().map(|(k, v)| (k.to_owned(), v)).collect(),
+        user: c.user.clone(),
+        limits: crate::executor::Limits {
+            memory: "2g".into(),
+            cpus: "1".into(),
+            pids: 1024,
+        },
+        network: c.network.clone(),
+        dns: Some("127.0.0.1".into()),
+        mounts: vec![
+            mount(&c.req, "/req", true),
+            mount(&c.work, "/work", false),
+            mount(&c.home, CONTAINER_HOME, false),
+        ],
+        workdir: Some("/work".into()),
+        label: c.label.clone(),
     }
-    let mut tail = Vec::new();
-    if let Some(ep) = &c.entrypoint {
-        a.push("--entrypoint".into());
-        a.push(ep[0].clone());
-        tail.extend(ep[1..].iter().cloned());
-    }
-    a.push("--".into());
-    a.push(c.image.clone());
-    a.extend(tail);
-    a
+}
+
+/// `docker run` arguments of an agent stage's container.
+#[cfg(test)]
+pub fn docker_run_args(c: &ContainerSpec) -> Vec<String> {
+    crate::executor::docker::DockerExecutor::run_args(&agent_container(c))
 }
 
 /// Usage so far, as the meter's budget counts it.
@@ -294,27 +267,12 @@ async fn package_to(stage: &Stage, work: PathBuf, cmd: Vec<String>, dest: PathBu
     .await?
 }
 
-async fn docker_out(args: &[&str]) -> Result<String> {
-    let out = tokio::process::Command::from(docker())
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .await?;
-    if !out.status.success() {
-        // docker's own message (never holds the credential: it is not
-        // passed to docker in any form).
-        let err = String::from_utf8_lossy(&out.stderr);
-        let err: String = err.trim().chars().take(300).collect();
-        bail!("docker {} failed: {err}", args.first().unwrap_or(&""));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
-}
-
 fn mb(b: u64) -> String {
     format!("{:.1} MB", b as f64 / 1e6)
 }
 
-pub(super) struct Env<'a> {
+pub(super) struct Env<'a, E: Executor> {
+    pub exec: &'a E,
     pub args: &'a RunArgs,
     pub cred: &'a Credential,
     pub agent: &'a AgentSpec,
@@ -346,8 +304,8 @@ async fn shutdown_signal() -> Interrupt {
 }
 
 /// Run one stage; returns its timing and whether the run was interrupted.
-pub(super) async fn run_stage(
-    env: &Env<'_>,
+pub(super) async fn run_stage<E: Executor>(
+    env: &Env<'_, E>,
     stage: &Stage,
     limits: Limits,
 ) -> Result<(Timing, bool)> {
@@ -409,13 +367,13 @@ pub(super) async fn run_stage(
     eprintln!("[{}] start, limit {}s", stage.id, stage.time_limit_s);
     let started_at = now_rfc3339();
     let t0 = Instant::now();
-    let run_args = docker_run_args(&spec);
-    let cid = docker_out(&run_args.iter().map(String::as_str).collect::<Vec<_>>()).await?;
+    let exec = env.exec;
+    let cid = exec.start(&agent_container(&spec)).await?;
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(stage.time_limit_s);
     let interval = Duration::from_secs(a.snapshot_interval_s.max(1));
     let mut next_snap = tokio::time::Instant::now() + interval;
-    let mut wait = Box::pin(docker_out_owned(vec!["wait".into(), cid.clone()]));
+    let mut wait = Box::pin(exec.wait(&cid));
     let mut snapshots = 0u32;
     let mut interrupted = false;
     let mut ended = "exited";
@@ -425,7 +383,7 @@ pub(super) async fn run_stage(
     loop {
         tokio::select! {
             r = &mut wait => {
-                exit_code = r.ok().and_then(|s| s.parse().ok());
+                exit_code = r.ok().flatten();
                 break;
             }
             _ = tokio::time::sleep_until(next_snap) => {
@@ -443,17 +401,17 @@ pub(super) async fn run_stage(
         eprintln!("[{}] {ended}: stopping the container", stage.id);
         // Cancelled runs get little time: the runner kills this process soon.
         let grace = if interrupted { 2 } else { a.grace_s };
-        let _ = docker_out(&["stop", "-t", &grace.to_string(), &cid]).await;
-        exit_code = wait.await.ok().and_then(|s| s.parse().ok());
+        exec.stop(&cid, Duration::from_secs(grace)).await;
+        exit_code = wait.await.ok().flatten();
     }
     let wall_s = t0.elapsed().as_secs_f64();
     let ended_at = now_rfc3339();
 
     // Container output goes to agent.log only.
-    let mut logs = docker();
-    logs.args(["logs", "--tail", LOG_TAIL_LINES, &cid]);
-    let _ = write_log(logs, &sdir.join("agent.log")).await;
-    let _ = docker_out(&["rm", "-f", &cid]).await;
+    let _ = exec
+        .logs(&cid, LOG_TAIL_LINES, &sdir.join("agent.log"))
+        .await;
+    exec.remove(&cid).await;
     meter.abort();
     egress.abort();
     let _ = meter.await;
@@ -518,24 +476,7 @@ pub(super) async fn run_stage(
 }
 
 /// agent.log keeps at most this many of the container's last output lines.
-const LOG_TAIL_LINES: &str = "200000";
-
-/// Run `cmd` (`docker logs`) with its stdout and stderr both going to `path`.
-async fn write_log(cmd: std::process::Command, path: &Path) -> Result<()> {
-    let log = std::fs::File::create(path)?;
-    tokio::process::Command::from(cmd)
-        .stdin(Stdio::null())
-        .stdout(log.try_clone()?)
-        .stderr(log)
-        .status()
-        .await?;
-    Ok(())
-}
-
-async fn docker_out_owned(args: Vec<String>) -> Result<String> {
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    docker_out(&refs).await
-}
+const LOG_TAIL_LINES: usize = 200_000;
 
 #[cfg(test)]
 mod tests {
@@ -643,21 +584,6 @@ mod tests {
         assert_eq!(l.max_tokens, None);
         assert_eq!(l.max_cost_usd, Some(0.0));
         assert!(remaining(&Budget::default(), u).is_unlimited());
-    }
-
-    #[tokio::test]
-    async fn agent_log_has_stdout_and_stderr() {
-        let dir = std::env::temp_dir().join(format!("crucible-agentlog-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("agent.log");
-        // Stands in for `docker logs`, which replays both streams.
-        let mut cmd = std::process::Command::new("sh");
-        cmd.args(["-c", "echo to-stdout; echo to-stderr >&2"]);
-        write_log(cmd, &path).await.unwrap();
-        let log = std::fs::read_to_string(&path).unwrap();
-        std::fs::remove_dir_all(&dir).unwrap();
-        assert!(log.contains("to-stdout"), "{log}");
-        assert!(log.contains("to-stderr"), "{log}");
     }
 
     #[test]

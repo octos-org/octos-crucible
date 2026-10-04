@@ -26,19 +26,26 @@
 # (github.com) and direct connections (example.com by IP, 1.1.1.1:443)
 # must fail. Exits non-zero if any of them succeeds.
 #
-# clean: removes whatever an earlier job may have left on a reused
-# (self-hosted) machine: crucible-* containers, scorer containers
-# (label crucible.scorer.run) and their networks, volumes and iptables
-# rules, and the sandbox network. GitHub-hosted machines are fresh: no-op.
+# clean (manual fallback only): removes every crucible container, network,
+# volume and iptables rule on the machine, whoever's they are, so never run
+# it while evaluations may be running. Steps clean up their own sandbox and
+# containers by their run label (`crucible`, scoped), workflows do not call
+# this.
+#
+# Several sandboxes can live on one machine (concurrent evaluations):
+# `crucible` picks a free slot and passes its names in SANDBOX_NET,
+# SANDBOX_BRIDGE, SANDBOX_SUBNET and SANDBOX_GW (defaults: slot 0 above),
+# and the run label in SANDBOX_LABEL (on the network, `crucible.run`).
+# `up` exits 3 when the network cannot be created (the slot is taken).
 #
 # Needs passwordless sudo for iptables. `down` and `clean` ignore what is
 # already gone.
 set -euo pipefail
 
-NET=crucible-sbx
-BR=crucible0
-SUBNET=172.31.250.0/24
-GW=172.31.250.1
+NET=${SANDBOX_NET:-crucible-sbx}
+BR=${SANDBOX_BRIDGE:-crucible0}
+SUBNET=${SANDBOX_SUBNET:-172.31.250.0/24}
+GW=${SANDBOX_GW:-172.31.250.1}
 # The scoring job opens only the meter port (SANDBOX_PORTS=8787).
 PORTS=${SANDBOX_PORTS:-8787,3128}
 # busybox 1.37.0, pinned by digest.
@@ -74,7 +81,7 @@ preflight() {
 # own) that names one of our bridges.
 drop_rules() {
   local cmd=$1 line
-  sudo -n "$cmd" -S 2>/dev/null | grep -E -- "^-A (INPUT|DOCKER-USER) .*-[io] ($BR|crs[0-9]+|crb[0-9]+) " | while IFS= read -r line; do
+  sudo -n "$cmd" -S 2>/dev/null | grep -E -- "^-A (INPUT|DOCKER-USER) .*-[io] (crucible[0-9]+|crs[0-9]+|crb[0-9]+) " | while IFS= read -r line; do
     # shellcheck disable=SC2086 # the rule text is split into iptables args
     sudo -n "$cmd" -D ${line#-A } 2>/dev/null || true
   done || true
@@ -85,7 +92,7 @@ clean() {
     | sort -u | xargs -r docker rm -f >/dev/null 2>&1 || true
   { docker network ls -q --filter name=crucible-net-; docker network ls -q --filter name=crucible-bnet-; } \
     | sort -u | xargs -r docker network rm >/dev/null 2>&1 || true
-  docker network rm "$NET" >/dev/null 2>&1 || true
+  docker network ls -q --filter name=crucible-sbx | xargs -r docker network rm >/dev/null 2>&1 || true
   docker volume ls -q --filter name=crucible- | xargs -r docker volume rm -f >/dev/null 2>&1 || true
   drop_rules iptables
   drop_rules ip6tables
@@ -110,10 +117,11 @@ case "${1:-}" in
   up)
     preflight
     docker network create --driver bridge --subnet "$SUBNET" --gateway "$GW" \
+      --label "crucible.run=${SANDBOX_LABEL:-}" \
       -o com.docker.network.bridge.name="$BR" \
       -o com.docker.network.bridge.enable_ip_masquerade=false \
       -o com.docker.network.bridge.enable_icc=false \
-      "$NET" >/dev/null
+      "$NET" >/dev/null || exit 3
     rules -I
     echo "sandbox network $NET up ($SUBNET, host $GW, ports $PORTS)"
     ;;
