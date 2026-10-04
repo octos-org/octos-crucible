@@ -1,0 +1,75 @@
+# 智能体巡天（GOSIM Agentic Observer）接入说明
+
+把 GOSIM「智能体巡天黑客松」的公开入门包接进 crucible：题目包 `tasksets/astro-practice/`，打分器 `scorers/astro-survey/`。平台核心（crates/、workflows、web/、Worker、config/）没有改动。
+
+## 来源（锁定）
+
+| 内容 | 来源 |
+|---|---|
+| 入门包 | 比赛网站资源页的公开下载 `gosim-observer-examples.zip`（GitHub release `gosimfoundation/hackathon-survey26` `examples-2026-10-02`），sha256 `55aa1e72bf97b8e27801793fbc48b749061ed12aa2f01f151e2bd56674e42711` |
+| 引擎 + 评分 | 入门包 `runner/` 原样拷到 `scorers/astro-survey/image/engine/`；`ENGINE_MANIFEST.json` 把 16 个文件钉在 survey26 commit `db4bddf3`，镜像构建时跑 `verify_engine.py`，有改动即构建失败 |
+| 练习卡 | 入门包 `local-cards/L1`–`L4` → `tasksets/astro-practice/source/L1`–`L4` |
+| 示例 agent | 入门包 `python/` → `tasksets/astro-practice/example-agent/`，只改了 `observer.project.json` 的 `environment`（见下） |
+
+入门包材料按 CC BY-NC 4.0 授权（`LICENSE.md` 随拷贝保留），引用：GOSIM 2026 Agentic Observer Hackathon（https://create.gosim.org/survey26/）。
+
+## 映射
+
+| 比赛 | crucible |
+|---|---|
+| 参赛者的观测 agent 项目（zip，根目录 `observer.project.json`，`protocol: jsonl-v4`） | 产出，`output: files`；app 模式上传的 zip，agent 模式下 coding agent 的工作目录打包 |
+| 一张练习卡 | 一个阶段（`l1`–`l4`） |
+| 卡片 `card.md` | 阶段输入（`inputs`） |
+| 卡片 `config/` `public/` `truth/`（真值、天气、事件） | 测试材料（`tests`，只有打分容器能看到） |
+| 引擎的 `score_report.total`（连续分） | `passed / total` = 毫分 / 10,000 分（见「计分」） |
+
+## 打分器 `scorers/astro-survey`
+
+`score.sh` 接口同 `docs/scorer-contract.md`（另加 `--run-timeout`，默认 1500 s，只是兜底）。流程：
+
+1. 建一个私有 docker volume，里面两个 FIFO（`to_agent` / `from_agent`）。
+2. **agent 容器**：只挂 agent zip 和 FIFO；`agent_entry.py` 安全解压（拒绝绝对路径、`..`、符号链接；≤5000 文件、≤200 MB），读 `observer.project.json`，在 FIFO 上启动 `run` 命令。
+3. **引擎容器**：只挂卡片（只读）、输出目录和 FIFO；运行入门包自己的 `run_local.py`，它把 agent 命令当成 `bridge.py`——一个把 stdin/stdout 原样转发到 FIFO 的中继。时间墙、消息流、计分全部由未改动的引擎完成。
+4. 两个容器都是 `--network none`、只读根、`--cap-drop ALL`、2 GB / 2 CPU / 256 pids、调用者 uid。agent 看不到卡片真值；打分器不调用模型、不读密钥。
+
+`run_local.py` 发给 agent 的环境变量（`PARTICIPANT_PROTOCOL`、`SAC_SCENARIO`、`SAC_WALLCLOCK_SECONDS`、`SAC_LOCAL_RUNNER` 等）由 `bridge.py` 经 `/pipes/env.json` 转给 agent 容器，再叠加项目的 `environment`。
+
+### 计分
+
+`ScoreResult` 只有整数 `passed / total`，manifest 的总分是 Σpassed / Σtotal（0–1）。所以：
+
+- `passed = clamp(round(S × 1000), 0, 10,000,000)`，`total = 10,000,000`（`expected_total` 同值）。S 是引擎的 `score_report.total`；
+- `detail` 保留原始分：`survey score 4458.556163 (survey_complete)`；
+- 有分数就是 `failed`（意为「已计分」），只有到上限才是 `passed`；agent 没能启动/初始化：`failed` 0 分；引擎没产出：`system_error`；
+- public 可见性下，`tests` 列出 5 个分项（sum_best_scores、required_penalty、uniformity_penalty、report_settlement、observation_request_reward）。
+
+### 限制
+
+- 只支持入门包 `python:3.12-slim` 能直接运行的项目：`build` 步骤不支持（TypeScript / Rust 示例需要先构建，暂不能用）；`image` 字段忽略。
+- 打分时没有模型可用。入门包的 Python 示例要求 `OPENAI_API_KEY` 非空，`example-agent/observer.project.json` 里写了占位值 `offline-no-model` 和不可达的 `OPENAI_BASE_URL`：模型调用立即失败，示例退回它自带的规则路径，结果确定。
+
+## 用法
+
+```bash
+# 打包示例 agent
+python3 tasksets/astro-practice/example-agent/pack_agent.py --out /tmp/astro-agent.zip
+
+# 本地打分（colima / Docker Desktop 下 TMPDIR 与 zip 要在主目录下）
+scorers/astro-survey/score.sh --artifact /tmp/astro-agent.zip \
+  --tests tasksets/astro-practice/source/L1 --out /tmp/result.json
+
+# 走平台（app 模式）：seal + put，然后 score.yml
+crucible seal --recipient "$(jq -r '.keys[0].public_key' config/keys.json)" --in /tmp/astro-agent.zip --out /tmp/a.sealed
+crucible put --store github:octos-org/octos-crucible /tmp/a.sealed     # 输出 <hash>
+gh workflow run score.yml -f artifact_source=blob:<hash> -f taskset=astro-practice -f stage=1
+
+# 对照：入门包自带的本地裁判
+OPENAI_API_KEY=offline-no-model OPENAI_BASE_URL=http://127.0.0.1:9/v1 \
+  python3 runner/run_local.py --inherit-env --card local-cards/L1 --agent "python3 agent.py" --agent-cwd python
+```
+
+题目包重打：`crucible taskset pack --source tasksets/astro-practice/source.json --src-dir tasksets/astro-practice/source --keys config/keys.json --store github:octos-org/octos-crucible --out tasksets/astro-practice/taskset.json`。
+
+## agent 模式（可行，未实现）
+
+`output: files` 会把 coding agent 的整个工作目录打包成 zip，正好就是 observer 项目。让 Octos 之类的 agent 读阶段输入（`card.md`，最好再把入门包 `docs/participant-guide.*.md` 加进 `inputs`），在工作目录写出带 `observer.project.json` 的 Python 项目，产出直接交给同一个打分器即可，不需要改核心。

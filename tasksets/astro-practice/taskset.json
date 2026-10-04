@@ -1,0 +1,68 @@
+{
+  "schema": 1,
+  "name": "astro-practice",
+  "description": "GOSIM Agentic Observer Hackathon (智能体巡天黑客松) public practice cards L1-L4: an observing agent drives a simulated fibre-fed telescope survey over participant-agent-protocol-v4. Output: an observer project zip (observer.project.json at the root). Scored by the starter kit's own v4 engine (scorer astro-survey); a stage's passed/total is the survey score in milli-points out of 10,000 points (docs/astro-survey.md).",
+  "scorer": {
+    "name": "astro-survey"
+  },
+  "aggregate": "sum",
+  "total_time_limit_s": 14400,
+  "stages": [
+    {
+      "id": "l1",
+      "inputs_blob": {
+        "sha256": "cc6bf8c0c7e31c753e307f73b79b6ab8bd7ed5a662dee85dd30ad9a977971d65",
+        "key_id": "1ffa702796eb5ee8"
+      },
+      "tests_blob": {
+        "sha256": "d5c7f2db5893c51bd047b77a3b1db2275198b6eaca7e83b24feabec549a9c405",
+        "key_id": "1ffa702796eb5ee8"
+      },
+      "output": "files",
+      "time_limit_s": 3600,
+      "expected_total": 10000000
+    },
+    {
+      "id": "l2",
+      "inputs_blob": {
+        "sha256": "08fd9c42db35c410f659bb86cfb56f4945ded2d24860ed7520b1b3b1bcf975bd",
+        "key_id": "1ffa702796eb5ee8"
+      },
+      "tests_blob": {
+        "sha256": "e393ec2e096e6619a2e418f1eb36cff15f844a7485b0f726c3e10b82a9b3a97a",
+        "key_id": "1ffa702796eb5ee8"
+      },
+      "output": "files",
+      "time_limit_s": 3600,
+      "expected_total": 10000000
+    },
+    {
+      "id": "l3",
+      "inputs_blob": {
+        "sha256": "163f7c8556e973919810b4c9f8219afa1f05bf036086da0ec5d598e1842ca634",
+        "key_id": "1ffa702796eb5ee8"
+      },
+      "tests_blob": {
+        "sha256": "4e5aca4edbcb61bb6121de7741377279fd3f966625110dd2a0085d3764458cc6",
+        "key_id": "1ffa702796eb5ee8"
+      },
+      "output": "files",
+      "time_limit_s": 3600,
+      "expected_total": 10000000
+    },
+    {
+      "id": "l4",
+      "inputs_blob": {
+        "sha256": "a862bf84d53f2c1b377593aac74a6a59f6382aa0dff6e112ca244f0dd03c3d79",
+        "key_id": "1ffa702796eb5ee8"
+      },
+      "tests_blob": {
+        "sha256": "22193dd3c76478243711eccfc4e7c3753f36557133bde1a25b94b893414891f6",
+        "key_id": "1ffa702796eb5ee8"
+      },
+      "output": "files",
+      "time_limit_s": 3600,
+      "expected_total": 10000000
+    }
+  ]
+}
