@@ -10,6 +10,6 @@
               "total": {"name": "关键字总数", "unit": "个", "decimals": 0}},
   "total_time_limit_s": 600,
   "stages": [
-    {"id": "s1", "dir": "s1", "inputs": ["task.md"], "tests": ["tests"], "time_limit_s": 600}
+    {"id": "s1", "dir": "s1", "inputs": ["task.md"], "tests": ["keywords.json"], "time_limit_s": 600}
   ]
 }
