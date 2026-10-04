@@ -8,7 +8,7 @@ A general platform for evaluating agents: any agent that runs in a sandbox, on a
 
 Tasksets, runners, packagers and scorers are pluggable ([docs/plugins.md](docs/plugins.md)).
 
-Design: [docs/DESIGN.md](docs/DESIGN.md) · Agent packages: [docs/agent-contract.md](docs/agent-contract.md)
+Design: [docs/DESIGN.md](docs/DESIGN.md) · Agent packages: [docs/agent-contract.md](docs/agent-contract.md) · Self-hosted runners: [docs/self-hosted.md](docs/self-hosted.md)
 
 ## Layout
 
