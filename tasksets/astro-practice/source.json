@@ -2,9 +2,14 @@
   "schema": 2,
   "name": "astro-practice",
   "description": "GOSIM Agentic Observer Hackathon (智能体巡天黑客松) public practice cards L1-L4: an observing agent drives a simulated fibre-fed telescope survey over participant-agent-protocol-v4. Output: an observer project zip (observer.project.json at the root). Scored by the starter kit's own v4 engine (scorer astro-survey); a stage's score is the engine's survey score, the total is the sum over the cards (docs/astro-survey.md).",
+  "runner": "workdir",
+  "packager": "files",
+  "packager_options": {"require": ["observer.project.json"]},
+  "interactive": {"name": "astro-v4", "time_limit_s": 1500},
   "scorer": {
     "name": "astro-survey"
   },
+  "model": {"interactive": "optional"},
   "aggregate": {
     "stages": "sum"
   },
@@ -24,9 +29,9 @@
   },
   "total_time_limit_s": 14400,
   "stages": [
-    {"id": "l1", "dir": "L1", "inputs": ["card.md"], "tests": ["config", "public", "truth"], "output": "files", "time_limit_s": 3600},
-    {"id": "l2", "dir": "L2", "inputs": ["card.md"], "tests": ["config", "public", "truth"], "output": "files", "time_limit_s": 3600},
-    {"id": "l3", "dir": "L3", "inputs": ["card.md"], "tests": ["config", "public", "truth"], "output": "files", "time_limit_s": 3600},
-    {"id": "l4", "dir": "L4", "inputs": ["card.md"], "tests": ["config", "public", "truth"], "output": "files", "time_limit_s": 3600}
+    {"id": "l1", "dir": "L1", "inputs": ["card.md"], "tests": ["config", "public", "truth"], "time_limit_s": 3600},
+    {"id": "l2", "dir": "L2", "inputs": ["card.md"], "tests": ["config", "public", "truth"], "time_limit_s": 3600},
+    {"id": "l3", "dir": "L3", "inputs": ["card.md"], "tests": ["config", "public", "truth"], "time_limit_s": 3600},
+    {"id": "l4", "dir": "L4", "inputs": ["card.md"], "tests": ["config", "public", "truth"], "time_limit_s": 3600}
   ]
 }

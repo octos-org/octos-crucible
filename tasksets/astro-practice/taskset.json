@@ -22,6 +22,9 @@
       "decimals": 2
     }
   },
+  "model": {
+    "interactive": "optional"
+  },
   "total_time_limit_s": 14400,
   "stages": [
     {
@@ -35,7 +38,16 @@
         "key_id": "1ffa702796eb5ee8"
       },
       "output": "files",
-      "time_limit_s": 3600
+      "time_limit_s": 3600,
+      "packager_options": {
+        "require": [
+          "observer.project.json"
+        ]
+      },
+      "interactive": {
+        "name": "astro-v4",
+        "time_limit_s": 1500
+      }
     },
     {
       "id": "l2",
@@ -48,7 +60,16 @@
         "key_id": "1ffa702796eb5ee8"
       },
       "output": "files",
-      "time_limit_s": 3600
+      "time_limit_s": 3600,
+      "packager_options": {
+        "require": [
+          "observer.project.json"
+        ]
+      },
+      "interactive": {
+        "name": "astro-v4",
+        "time_limit_s": 1500
+      }
     },
     {
       "id": "l3",
@@ -61,7 +82,16 @@
         "key_id": "1ffa702796eb5ee8"
       },
       "output": "files",
-      "time_limit_s": 3600
+      "time_limit_s": 3600,
+      "packager_options": {
+        "require": [
+          "observer.project.json"
+        ]
+      },
+      "interactive": {
+        "name": "astro-v4",
+        "time_limit_s": 1500
+      }
     },
     {
       "id": "l4",
@@ -74,7 +104,16 @@
         "key_id": "1ffa702796eb5ee8"
       },
       "output": "files",
-      "time_limit_s": 3600
+      "time_limit_s": 3600,
+      "packager_options": {
+        "require": [
+          "observer.project.json"
+        ]
+      },
+      "interactive": {
+        "name": "astro-v4",
+        "time_limit_s": 1500
+      }
     }
   ]
 }

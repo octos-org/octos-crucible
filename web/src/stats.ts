@@ -151,6 +151,43 @@ export interface ReplicaTotals {
   usage: UsageTotals;
   /** null when any stage's price is unknown. */
   cost_usd: number | null;
+  /** Model use while scoring, summed over stages and slots (apart from `usage`). */
+  eval: EvalUse;
+}
+
+export interface EvalUse {
+  /** Any stage used a model while scoring. */
+  any: boolean;
+  usage: UsageTotals;
+  /** null when a price is unknown. */
+  cost_usd: number | null;
+}
+
+/** The scoring slots' model use of one stage, as `[slot label, usage, cost]`. */
+export function evalSlots(s: StageEntry): [string, UsageTotals, number | null][] {
+  const e = s.eval_usage ?? {};
+  const out: [string, UsageTotals, number | null][] = [];
+  for (const [label, slot] of [
+    ["交互运行", e.interactive],
+    ["模型评判", e.scorer],
+  ] as const) {
+    if (slot) out.push([label, usageOf({ stage: s.stage, usage: slot.usage }), slot.cost_usd ?? null]);
+  }
+  return out;
+}
+
+export function evalUseOf(stages: StageEntry[]): EvalUse {
+  let usage = ZERO;
+  let cost: number | null = 0;
+  let any = false;
+  for (const s of stages) {
+    for (const [, u, c] of evalSlots(s)) {
+      any = true;
+      usage = addUsage(usage, u);
+      cost = cost !== null && c !== null ? cost + c : null;
+    }
+  }
+  return { any, usage, cost_usd: any ? cost : null };
 }
 
 const ZERO: UsageTotals = {
@@ -211,6 +248,7 @@ export function replicaTotals(r: ReplicaEntry, agg: Aggregate = { stages: "ratio
     wall_s: stages.length ? wall : null,
     usage,
     cost_usd: stages.length ? cost : null,
+    eval: evalUseOf(stages),
   };
 }
 

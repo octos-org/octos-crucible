@@ -8,7 +8,7 @@
 //! `{stages, budget?, results_url}`.
 //!
 //! App mode targets the scoring workflow (`SCORE_WORKFLOW`, default
-//! `score.yml`): `eval_id, artifact_source, taskset, stage, cred_source,
+//! `score.yml`): `eval_id, artifact_source, taskset, stage, cred_source, model,
 //! score_public, owner, results_url`.
 
 use serde_json::{Value, json};
@@ -62,6 +62,7 @@ pub fn inputs(cfg: &Config, rec: &EvalRecord, has_cred: bool, worker_url: &str) 
                 "taskset": rec.taskset,
                 "stage": rec.stages.to_string(),
                 "cred_source": cred_source,
+                "model": rec.model.clone().unwrap_or_default(),
                 "score_public": score_public,
                 "owner": owner,
                 "results_url": results,

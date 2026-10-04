@@ -73,6 +73,18 @@ function rows(stages: string[], base: EvalStats): Row[] {
   ];
 }
 
+/** Model use while scoring (judge, interactive agent): its own rows, never added to the above. */
+const evalRows: Row[] = [
+  { label: "评测模型请求数", get: (s) => ms(s.eval_requests, fmtCount), better: "down", diff: "rel" },
+  { label: "评测模型 token", get: (s) => ms(s.eval_tokens, fmtCount), better: "down", diff: "rel" },
+  {
+    label: "评测模型花销",
+    get: (s) => (s.eval_cost_usd ? ms(s.eval_cost_usd, fmtUsd) : { value: null, text: "未知价格" }),
+    better: "down",
+    diff: "rel",
+  },
+];
+
 function DeltaText({ base, x, row }: { base: number | null; x: number | null; row: Row }) {
   if (!row.better) return null;
   const d = delta(base, x, row.better);
@@ -123,7 +135,7 @@ export function ComparePage({ ids }: { ids: string[] }) {
   const mans: Partial<Manifest>[] = details.map((d) => d.manifest ?? {});
   const al = alignStages(mans);
   const stats = mans.map((m) => evalStats(m, al.common));
-  const table = rows(al.common, stats[0]);
+  const table = [...rows(al.common, stats[0]), ...(stats.some((s) => s.eval_any) ? evalRows : [])];
   const anyDropped = al.dropped.some((d) => d.length > 0);
 
   return (

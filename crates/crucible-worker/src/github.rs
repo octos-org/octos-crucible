@@ -66,6 +66,16 @@ pub struct TasksetInfo {
     /// The taskset's `display` (docs/plugins.md §9), when it declares one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display: Option<crucible_core::taskset::Display>,
+    /// Scoring needs the submitter's model (`model.*: required`,
+    /// docs/plugins.md §10): an uploaded output must come with a credential.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub model_required: bool,
+}
+
+/// Does a taskset's `model` declaration require a credential to score?
+pub fn model_required(m: Option<&crucible_core::taskset::ModelDecl>) -> bool {
+    use crucible_core::taskset::ModelUse::Required;
+    m.is_some_and(|m| m.interactive == Required || m.scorer == Required)
 }
 
 pub struct GitHub<'a, B: Backend> {
@@ -427,6 +437,8 @@ struct TasksetFile {
     stages: Vec<StageFile>,
     #[serde(default)]
     display: Option<crucible_core::taskset::Display>,
+    #[serde(default)]
+    model: Option<crucible_core::taskset::ModelDecl>,
 }
 
 #[derive(Deserialize)]
@@ -477,6 +489,7 @@ pub fn parse_taskset_file(dir: &str, file: &Value) -> Option<TasksetInfo> {
                 total: s.expected_total,
             })
             .collect(),
+        model_required: model_required(ts.model.as_ref()),
         display: ts.display.filter(|d| !d.is_empty()),
         ..Default::default()
     })

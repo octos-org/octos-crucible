@@ -283,6 +283,27 @@ struct ScoreArgs {
     /// root, or a handoff holding `scorers/`).
     #[arg(long, default_value = ".")]
     plugins_root: PathBuf,
+    /// Score only this replica.
+    #[arg(long)]
+    replica: Option<u32>,
+    /// The submitter's model credential, sealed to one of the identities
+    /// (from `score-handoff --cred-stdin`); opened only in this process.
+    #[arg(long, requires_all = ["model_plan", "pricing"])]
+    cred: Option<PathBuf>,
+    /// model.json from `score-handoff` (model name, budgets per replica).
+    #[arg(long)]
+    model_plan: Option<PathBuf>,
+    /// Price table (config/pricing.json) for the scoring job's meters.
+    #[arg(long)]
+    pricing: Option<PathBuf>,
+    /// Docker network for plugins that get a model (tools/sandbox-net.sh).
+    #[arg(long, default_value = "crucible-sbx")]
+    model_network: String,
+    /// Address the scoring job's meter listens on (the network's host side).
+    #[arg(long, default_value = "172.31.250.1")]
+    model_bind: String,
+    #[arg(long, default_value_t = 8787)]
+    model_port: u16,
 }
 
 #[derive(clap::Args)]
@@ -303,6 +324,19 @@ struct ScoreHandoffArgs {
     out: PathBuf,
     #[arg(long)]
     key_out: PathBuf,
+    /// Read the opened model credential (one JSON line, as `crucible cred
+    /// open` prints it) on stdin and seal it to the one-run key as
+    /// <out>/cred.sealed, with <out>/model.json — only if the taskset gives
+    /// a scoring slot a model (docs/plugins.md §10).
+    #[arg(long)]
+    cred_stdin: bool,
+    /// The submitter's model (a taskset's `model.name` wins).
+    #[arg(long, default_value = "")]
+    model: String,
+    /// Run-wide caps as `crucible plan` writes them; what the generation
+    /// used is subtracted per replica.
+    #[arg(long, default_value = "")]
+    budget: String,
 }
 
 fn stage_indices(n: usize, stage: Option<usize>, stages: Option<usize>) -> Result<Vec<usize>> {
@@ -660,6 +694,37 @@ async fn run(cmd: Cmd) -> Result<()> {
                 (Some(s), None) => score::TestsFrom::Store(s),
                 (None, None) => bail!("--store or --tests-dir"),
             };
+            let model = match &a.cred {
+                None => None,
+                Some(c) => {
+                    let plain = crucible_crypto::open(&keys, &std::fs::read(c)?)
+                        .context("opening the model credential")?;
+                    let cred: crucible_meter::Credential = serde_json::from_slice(&plain)
+                        .map_err(|_| anyhow!("model credential is not {{api_key, endpoint}}"))?;
+                    drop(plain);
+                    let plan: score::ModelPlan = serde_json::from_slice(&std::fs::read(
+                        a.model_plan.as_ref().expect("clap: requires"),
+                    )?)?;
+                    let pricing = Pricing::from_json(&std::fs::read_to_string(
+                        a.pricing.as_ref().expect("clap: requires"),
+                    )?)?;
+                    let user_price = match &plan.price {
+                        Some(p) => crucible_metering::parse_price(p)?,
+                        None => None,
+                    };
+                    eprintln!("model credential present: slots that use a model get the meter");
+                    Some(score::ModelSetup {
+                        cred,
+                        model: plan.model,
+                        pricing,
+                        user_price,
+                        network: a.model_network.clone(),
+                        bind: a.model_bind.clone(),
+                        port: a.model_port,
+                        budgets: plan.budgets,
+                    })
+                }
+            };
             let done = score::score(&score::ScoreOpts {
                 taskset: &ts,
                 stages,
@@ -669,6 +734,8 @@ async fn run(cmd: Cmd) -> Result<()> {
                 keys: &keys,
                 plugins_root: &a.plugins_root,
                 scrub_env: &a.identity_env,
+                replica: a.replica,
+                model: model.as_ref(),
             })
             .await?;
             eprintln!("scored {} stage checkpoints", done.len());
@@ -705,6 +772,73 @@ async fn run(cmd: Cmd) -> Result<()> {
             )
             .await?;
             std::fs::copy(&a.taskset, a.out.join("taskset.json"))?;
+            let (mi, ms) = ts.model_use();
+            let wants_model = mi != crucible_core::taskset::ModelUse::None
+                || ms != crucible_core::taskset::ModelUse::None;
+            // Read the credential whenever it is piped in, so the writer
+            // never sees a broken pipe; drop it unless a slot needs it.
+            let cred = if a.cred_stdin {
+                Some(
+                    crucible_meter::read_credential(&mut std::io::stdin().lock())
+                        .map_err(|e| anyhow!("{e}"))?,
+                )
+            } else {
+                None
+            };
+            if let (Some(cred), true) = (cred, wants_model) {
+                let model = ts
+                    .model
+                    .as_ref()
+                    .and_then(|m| m.name.clone())
+                    .unwrap_or_else(|| a.model.trim().to_owned());
+                if !crucible_core::taskset::model_name_ok(&model) {
+                    bail!("a model name is needed (taskset model.name or --model)");
+                }
+                let budget = plan::Budget::parse(&a.budget)?;
+                let mut budgets = std::collections::BTreeMap::new();
+                for r in score::replicas(&a.results)? {
+                    let mut u = runners::workdir::Used::default();
+                    for st in &ts.stages {
+                        let sdir = a.results.join(r.to_string()).join(&st.id);
+                        if let (Some(raw), _) = publish::stage_numbers(&sdir, &keys)? {
+                            let g = runners::workdir::used(&crucible_report::usage::parse_jsonl(
+                                &String::from_utf8_lossy(&raw),
+                            ));
+                            u.requests += g.requests;
+                            u.tokens += g.tokens;
+                            u.cost += g.cost;
+                        }
+                    }
+                    let l = runners::workdir::remaining(&budget, u);
+                    budgets.insert(
+                        r,
+                        plan::Budget {
+                            max_requests: l.max_requests,
+                            max_tokens: l.max_tokens,
+                            max_cost_usd: l.max_cost_usd,
+                            price: None,
+                        },
+                    );
+                }
+                let line = serde_json::to_vec(&serde_json::json!({
+                    "api_key": cred.api_key,
+                    "endpoint": cred.endpoint,
+                }))?;
+                std::fs::write(
+                    a.out.join("cred.sealed"),
+                    crucible_crypto::seal(&run_key.public(), &line)?,
+                )?;
+                drop(line);
+                let plan = score::ModelPlan {
+                    model,
+                    budgets,
+                    price: budget.price.clone(),
+                };
+                std::fs::write(a.out.join("model.json"), serde_json::to_vec_pretty(&plan)?)?;
+                eprintln!("model credential handed off (sealed to the one-run key)");
+            } else if a.cred_stdin {
+                eprintln!("the taskset gives no scoring slot a model: credential not handed off");
+            }
             write_private(&a.key_out, run_key.to_secret_string().as_bytes())?;
             eprintln!("handoff written for {} stage(s)", stages.len());
             Ok(())

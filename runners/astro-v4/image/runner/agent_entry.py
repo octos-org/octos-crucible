@@ -10,8 +10,10 @@ Only `run`, `working_directory` and `environment` are honoured; `build`
 steps are not supported (the project must run as is on python:3.12-slim).
 
 Environment for the agent = what run_local.py gives its agent (forwarded by
-bridge.py via /pipes/env.json) + the project's `environment`, with PATH,
-HOME and TMPDIR fixed here. stdout belongs to the protocol; the agent's
+bridge.py via /pipes/env.json) + the model variables this container was
+started with (OPENAI_BASE_URL = the platform's meter, OPENAI_API_KEY =
+dummy, OPENAI_MODEL / MODEL; only when the taskset gives the agent a model)
++ the project's `environment`, with PATH, HOME and TMPDIR fixed here. stdout belongs to the protocol; the agent's
 stderr is this container's stderr.
 
 Exit codes: the agent's own, or 64 = the package is not a valid project.
@@ -32,6 +34,7 @@ MAX_FILES = 5000
 MAX_BYTES = 200 << 20
 SAFE_ENV_KEY = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 PROTECTED = {"PATH", "HOME", "TMPDIR", "LD_PRELOAD", "PYTHONPATH", "PYTHONSTARTUP"}
+MODEL_ENV = ("OPENAI_BASE_URL", "OPENAI_API_KEY", "OPENAI_MODEL", "MODEL")
 
 
 def bad(reason: str) -> int:
@@ -97,6 +100,7 @@ def main() -> int:
     with open(os.path.join(PIPES, "env.json"), encoding="utf-8") as f:
         env = {str(k): str(v) for k, v in json.load(f).items()}
     from_agent = os.open(os.path.join(PIPES, "from_agent"), os.O_WRONLY)
+    env.update({k: os.environ[k] for k in MODEL_ENV if k in os.environ})
     env.update({"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": home, "TMPDIR": home})
     for k, v in extra.items():
         if SAFE_ENV_KEY.match(str(k)) and str(k) not in PROTECTED:

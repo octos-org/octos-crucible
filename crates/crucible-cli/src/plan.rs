@@ -73,9 +73,15 @@ pub struct ScorePlanInputs {
     /// 1-based stage number.
     #[arg(long, env = "IN_STAGE", default_value = "")]
     pub stage: String,
-    /// `none` or `workers-kv` (only used to delete the credential).
+    /// `none`, `workers-kv` or `github-secret` (development): the model
+    /// credential for scoring slots that use a model; `workers-kv` is
+    /// deleted at the end.
     #[arg(long, env = "IN_CRED_SOURCE", default_value = "none")]
     pub cred_source: String,
+    /// The submitter's model, for scoring slots that use one (a taskset's
+    /// `model.name` wins).
+    #[arg(long, env = "IN_MODEL", default_value = "")]
+    pub model: String,
     #[arg(long, env = "IN_SCORE_PUBLIC", default_value = "false")]
     pub score_public: String,
     #[arg(long, env = "IN_OWNER", default_value = "")]
@@ -306,8 +312,23 @@ pub fn plan_score(inp: &ScorePlanInputs, root: &Path) -> Result<BTreeMap<&'stati
     let cred = match inp.cred_source.trim() {
         "" | "none" => "none",
         "workers-kv" => "workers-kv",
-        _ => bail!("cred_source must be none or workers-kv"),
+        "github-secret" => "github-secret",
+        _ => bail!("cred_source must be none, workers-kv or github-secret"),
     };
+    let model = inp.model.trim();
+    if !model.is_empty() && !model_ok(model) {
+        bail!("model has unsupported characters");
+    }
+    {
+        use crucible_core::taskset::ModelUse::Required;
+        let (mi, ms) = ts.model_use();
+        if (mi == Required || ms == Required) && cred == "none" {
+            bail!(
+                "taskset {} scores with a model: a credential is required",
+                ts.name
+            );
+        }
+    }
     let results_url = inp.results_url.trim();
     check_url("results_url", results_url)?;
     let worker = worker_url(results_url, &inp.worker_url)?;
@@ -329,6 +350,7 @@ pub fn plan_score(inp: &ScorePlanInputs, root: &Path) -> Result<BTreeMap<&'stati
     out.insert("stage", stage.to_string());
     out.insert("stage_id", ts.stages[stage - 1].id.clone());
     out.insert("cred_source", cred.to_owned());
+    out.insert("model", model.to_owned());
     out.insert("score_public", score_public(&inp.score_public)?.to_string());
     out.insert("owner", owner.to_owned());
     out.insert("results_url", results_url.to_owned());
@@ -565,7 +587,7 @@ mod tests {
             ("hash", Box::new(|i| i.artifact_source = "blob:AB".into())),
             ("stage 0", Box::new(|i| i.stage = "0".into())),
             ("stage 4", Box::new(|i| i.stage = "4".into())),
-            ("cred", Box::new(|i| i.cred_source = "github-secret".into())),
+            ("cred", Box::new(|i| i.cred_source = "github-sekret".into())),
             ("kv", Box::new(|i| i.cred_source = "workers-kv".into())),
             ("public", Box::new(|i| i.score_public = "yes".into())),
             ("owner", Box::new(|i| i.owner = "x".into())),

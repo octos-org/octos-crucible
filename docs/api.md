@@ -158,7 +158,7 @@ workflow（持私钥，不运行上传的代码）解密 zip、检查、按阶�
 | `model` | 必填，`[A-Za-z0-9][A-Za-z0-9._:/-]{0,79}` | 可选，规则相同 |
 | `replicas` | 1..=10，默认 1 | 只能不填或填 1 |
 | `budget` | 可选；`max_requests` 取 1..=1e7，`max_tokens` 取 1..=1e10，`max_cost_usd` 取 (0, 10000] | 不接受 |
-| `cred_envelope` | 必填 | 可选 |
+| `cred_envelope` | 必填 | 可选；题目包声明打分要用模型（`model.*: required`，`GET /tasksets` 里 `model_required: true`）时必填 |
 | `score_public` | 必填（布尔） | 必填（布尔） |
 | `consent` | 必须为 `true` | 必须为 `true` |
 
@@ -176,7 +176,7 @@ workflow（持私钥，不运行上传的代码）解密 zip、检查、按阶�
 
 `total_score` 按该评测 manifest 里的 `scoring` 快照计算（与 `crucible manifest` 同一个函数 `crucible-core` `Manifest::compute_total_score`），保留 4 位小数；没有分数时不出现该字段。`aggregate.stages` 为 `ratio`（旧评测没有快照时也按它）时是 0–1 之间的 Σscore / Σmax（即旧的 Σpassed / Σtotal）；`sum` / `mean` / `weighted` 时是各遍总分的平均，单位与阶段分相同，可为负。`display` 是快照里总分的展示方式（`name`、`unit`、`direction`、`decimals`、`format` 等），旧评测没有此字段，按百分比显示。
 
-manifest（`schema: 2`）的阶段分数 `replicas[].stages[].score` 是 result v2 去掉文本字段：`{status: "scored"|"error", error?, score?, max?, passed?, items?}`；旧 manifest（`schema: 1`）里是 `{status: passed|failed|system_error|rejected, passed, total}`，读取方按 `docs/scorer-contract.md` §4 的换算表读，数据不改写。新 manifest 另有 `scoring`：`{aggregate, display: {stage, total}, plugins: [{kind, name, version}]}`，是 publish 时从题目包取的快照，题目包以后改了展示方式，旧评测不受影响。
+manifest（`schema: 2`）的阶段分数 `replicas[].stages[].score` 是 result v2 去掉文本字段：`{status: "scored"|"error", error?, score?, max?, passed?, items?}`；旧 manifest（`schema: 1`）里是 `{status: passed|failed|system_error|rejected, passed, total}`，读取方按 `docs/scorer-contract.md` §4 的换算表读，数据不改写。新 manifest 另有 `scoring`：`{aggregate, display: {stage, total}, plugins: [{kind, name, version}]}`，是 publish 时从题目包取的快照，题目包以后改了展示方式，旧评测不受影响。阶段条目可以有 `eval_usage: {interactive?: {usage, cost_usd}, scorer?: {usage, cost_usd}}`：打分 job 里交互运行和模型评判用掉的模型（提交者的 key），与 `usage`（agent 产出阶段）分开记，网页也分开展示（`docs/plugins.md` §10）。
 
 ### `GET /evals/:id`（仅 owner 或管理员，否则 403）
 ```json
@@ -240,7 +240,7 @@ workflow 通过 `/internal/status` 上报的精确状态优先。估计值只能
 
 **app 模式 → `SCORE_WORKFLOW`（默认 `score.yml`）**
 
-`eval_id`，`artifact_source` = `blob:<upload_hash>`，`taskset`，`stage`（从 1 开始的序号），`cred_source`（有凭据时为 `workers-kv`，否则为 `none`），`score_public`，`owner`，`results_url`。
+`eval_id`，`artifact_source` = `blob:<upload_hash>`，`taskset`，`stage`（从 1 开始的序号），`cred_source`（有凭据时为 `workers-kv`，否则为 `none`），`model`（提交时填的模型，可为空；打分阶段用模型时使用，题目包的 `model.name` 优先），`score_public`，`owner`，`results_url`。
 
 两个 workflow 的 `run-name` 都必须包含 eval_id（Worker 靠它找到对应的 run）。workflow 用 `results_url` 的 origin 作为 Worker 地址，调用上面的内部接口。
 

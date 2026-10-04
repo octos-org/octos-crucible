@@ -15,7 +15,8 @@ use anyhow::{Context, Result, bail};
 use crucible_core::BlobRef;
 use crucible_core::TaskSet;
 use crucible_core::taskset::{
-    Aggregate, DEFAULT_RUNNER, Display, MAX_TOTAL_TIME_S, ModelDecl, ScorerRef, Stage,
+    Aggregate, DEFAULT_RUNNER, Display, InteractiveRef, MAX_TOTAL_TIME_S, ModelDecl, ScorerRef,
+    Stage,
 };
 use crucible_crypto::{PrivateKey, PublicKey};
 use serde::Deserialize;
@@ -39,6 +40,10 @@ pub struct PackSource {
     pub packager: Option<String>,
     #[serde(default)]
     pub packager_options: Option<serde_json::Value>,
+    #[serde(default)]
+    pub scorer_options: Option<serde_json::Value>,
+    #[serde(default)]
+    pub interactive: Option<InteractiveRef>,
     #[serde(default)]
     pub aggregate: Aggregate,
     #[serde(default)]
@@ -69,6 +74,10 @@ pub struct PackStage {
     pub runner: Option<String>,
     #[serde(default)]
     pub scorer: Option<ScorerRef>,
+    #[serde(default)]
+    pub scorer_options: Option<serde_json::Value>,
+    #[serde(default)]
+    pub interactive: Option<InteractiveRef>,
     pub time_limit_s: u64,
     #[serde(default)]
     pub expected_total: Option<u32>,
@@ -161,6 +170,11 @@ impl Prepared {
                         .or_else(|| src.runner.clone())
                         .filter(|r| r != DEFAULT_RUNNER),
                     scorer: s.scorer.clone().filter(|sc| *sc != src.scorer),
+                    scorer_options: s
+                        .scorer_options
+                        .clone()
+                        .or_else(|| src.scorer_options.clone()),
+                    interactive: s.interactive.clone().or_else(|| src.interactive.clone()),
                     time_limit_s: s.time_limit_s,
                     expected_total: s.expected_total,
                 })
@@ -381,7 +395,7 @@ mod tests {
         assert_eq!(p.zips[0].3, 2); // tests/a.spec.ts + tests/support/e2e.ts
         for (bad, why) in [
             (
-                SOURCE.replace("\"playwright\"", "\"astro-survey\""),
+                SOURCE.replace("\"playwright\"", "\"arcbench-official\""),
                 "scorer not offered to users",
             ),
             (
@@ -476,7 +490,6 @@ mod tests {
         ]);
         assert_eq!(ts.stages[1].packager, "files");
         assert!(ts.stages[1].packager_options.is_some());
-        assert!(prepare(&source, src.path(), true).is_err());
         std::fs::write(&source, SOURCE.replace("\"playwright\"", "\"nope\"")).unwrap();
         assert!(prepare(&source, src.path(), false).is_err());
     }
