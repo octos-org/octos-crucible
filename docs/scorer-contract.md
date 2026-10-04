@@ -8,7 +8,7 @@
 
 | 文件 | 作用 |
 |---|---|
-| `score.sh` | 编排脚本，命令行接口见下；宿主机只需要 bash 和 docker（外加 coreutils `timeout`） |
+| `score.sh` | 编排脚本，命令行接口见下；宿主机只需要 bash、`crucible`（外加 coreutils `timeout`）。起容器一律用 `"$CRUCIBLE" ctr run/build/logs/rm/net/volume/image ...`（参数是 docker 的一个固定子集），由步骤所在的执行后端执行（默认 Docker，见 `docs/executors.md` §2.3），脚本不直接调 `docker`、不碰 iptables |
 | `image/` | 打分器镜像的构建目录（`Dockerfile` 等）；版本全部钉死 |
 
 agent 的产出和测试材料**只在容器里**处理；宿主机脚本只做编排（建网络、起容器、限时、清理）。

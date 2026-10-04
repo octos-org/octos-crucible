@@ -10,8 +10,7 @@ use std::path::PathBuf;
 use anyhow::{Result, bail};
 
 use super::{Common, Secret, Secrets};
-use crate::executor::Executor;
-use crate::executor::docker::DockerExecutor;
+use crate::executor::{BuildSpec, Executor};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -39,7 +38,8 @@ pub async fn run(a: Args, s: &Secrets) -> Result<()> {
     let ts = crate::taskset_cmd::load(&h.join("taskset.json"))?;
     ts.validate(crucible_core::taskset::MAX_TOTAL_TIME_S)?;
     let keys = s.keys(Secret::RunKey)?;
-    super::check_caps(super::spec("score-tests"), DockerExecutor.caps())?;
+    let exec = crate::executor::backend()?;
+    super::check_caps(super::spec("score-tests"), exec.caps())?;
 
     // The container plugins the taskset uses, from the registry compiled
     // into crucible; `crucible score` hands each its image.
@@ -61,13 +61,20 @@ pub async fn run(a: Args, s: &Secrets) -> Result<()> {
         }
         if dir.join("image").is_dir() {
             let tag = format!("crucible-{}-{}:run", v.kind, p.name);
-            let st = crate::build::docker()
-                .args(["build", "-q", "-t", &tag])
-                .arg(dir.join("image"))
-                .stdout(std::process::Stdio::null())
-                .status()?;
-            if !st.success() {
-                bail!("{} {}: image build failed", v.kind, p.name);
+            let log = tempfile::NamedTempFile::new()?;
+            let b = BuildSpec {
+                dir: dir.join("image"),
+                tag: exec.image_ref(&tag),
+                quiet: true,
+                ..Default::default()
+            };
+            if let Err(e) = exec.build(&b, log.path()).await {
+                let out = std::fs::read(log.path()).unwrap_or_default();
+                eprintln!(
+                    "{}",
+                    String::from_utf8_lossy(&out[out.len().saturating_sub(3000)..])
+                );
+                bail!("{} {}: image build failed: {e:#}", v.kind, p.name);
             }
         }
         eprintln!("{} {} ready", v.kind, p.name);
@@ -77,10 +84,10 @@ pub async fn run(a: Args, s: &Secrets) -> Result<()> {
         Some(l) if !l.is_empty() => l.clone(),
         _ => format!("score-{}", std::process::id()),
     };
-    DockerExecutor.cleanup(&label);
+    exec.cleanup(&label);
     let cred = h.join("cred.sealed");
     let net = if cred.is_file() {
-        Some(DockerExecutor.sandbox(&[METER_PORT], &label)?)
+        Some(exec.sandbox(&[METER_PORT], &label)?)
     } else {
         eprintln!("no model credential in the handoff");
         None
@@ -112,11 +119,12 @@ pub async fn run(a: Args, s: &Secrets) -> Result<()> {
         scrub_env: &[],
         replica: a.replica,
         model: model.as_ref(),
+        run_label: Some(&label),
     })
     .await;
     drop(model);
     drop(net);
-    DockerExecutor.cleanup(&label);
+    exec.cleanup(&label);
     eprintln!("scored {} stage checkpoints", done?.len());
     Ok(())
 }

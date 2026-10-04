@@ -2,7 +2,7 @@
 # need() evals its argument later, so single quotes and "unused" vars are intended.
 # shellcheck disable=SC2016,SC2034
 # End-to-end check of score.sh against the fixture app and fixture tests.
-# Needs docker, zip and node. Uses CRUCIBLE_SCORER_IMAGE if set.
+# Needs docker, crucible (CRUCIBLE), zip and node. Uses CRUCIBLE_SCORER_IMAGE if set.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

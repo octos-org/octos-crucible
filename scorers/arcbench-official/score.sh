@@ -21,13 +21,15 @@
 #   test   Playwright, joins the serve container's network namespace, so it
 #          reaches the app at 127.0.0.1:3000 exactly as the official runner
 #          does, and nothing else. Non-root, cap-drop ALL.
-# The submission lives in a per-run docker volume (removed at the end).
+# The submission lives in a per-run volume (removed at the end). Containers
+# are started with `crucible ctr` (`$CRUCIBLE`, default on PATH), i.e. by the
+# step's execution backend (docs/executors.md §2.3).
 #
 # Exit status: 0 = result.json written (whatever the score), 2 = usage
 # error, 1 = could not write result.json at all.
 # Environment (optional): CRUCIBLE_SCORER_IMAGE (prebuilt image; default
-# builds ./image), CRUCIBLE_SCORER_FIREWALL=1 (iptables walls around the
-# build network, as in scorers/playwright).
+# builds ./image), CRUCIBLE_SCORER_FIREWALL=1 (Docker backend: iptables
+# walls around the build network, as in scorers/playwright).
 set -uo pipefail
 
 main() {
@@ -77,7 +79,9 @@ for v in "$TASK_ID" "$SUBMISSION_ID"; do
 done
 TIMEOUT_BIN="$(command -v timeout || command -v gtimeout || true)"
 [ -n "$TIMEOUT_BIN" ] || die_usage "needs \`timeout\` (GNU coreutils) on PATH"
-command -v docker >/dev/null || die_usage "needs docker on PATH"
+CRUCIBLE="${CRUCIBLE:-crucible}"
+command -v "$CRUCIBLE" >/dev/null || die_usage "needs crucible on PATH (or \$CRUCIBLE)"
+ctr() { "$CRUCIBLE" ctr "$@"; }
 
 abspath() { (cd "$(dirname "$1")" && printf '%s/%s\n' "$(pwd -P)" "$(basename "$1")"); }
 ARTIFACT="$(abspath "$ARTIFACT")"
@@ -90,12 +94,10 @@ RUN_ID="$(date +%s)$$${RANDOM}"
 LABEL="crucible.scorer.run=$RUN_ID"
 VOL="crucible-ws-$RUN_ID"
 NET="crucible-bnet-$RUN_ID"
-BRIDGE="crb$(printf '%s' "$RUN_ID" | cksum | cut -d' ' -f1)"
 PROXY_CTR="crucible-proxy-$RUN_ID"
 BUILD_CTR="crucible-build-$RUN_ID"
 SERVE_CTR="crucible-serve-$RUN_ID"
 TEST_CTR="crucible-test-$RUN_ID"
-FIREWALL_UP=0
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/crucible-score.XXXXXX")" || exit 1
 WORK="$(cd "$WORK" && pwd -P)"
@@ -110,20 +112,10 @@ cp "$ARTIFACT" "$WORK/app.zip" && chmod 0644 "$WORK/app.zip" || exit 1
 
 # shellcheck disable=SC2317,SC2329 # invoked via trap
 cleanup() {
-  docker rm -f "$TEST_CTR" "$SERVE_CTR" "$BUILD_CTR" "$PROXY_CTR" >/dev/null 2>&1 || true
-  [ "$FIREWALL_UP" = 1 ] && firewall -D >/dev/null 2>&1
-  FIREWALL_UP=0
-  docker network rm "$NET" >/dev/null 2>&1 || true
-  docker volume rm -f "$VOL" >/dev/null 2>&1 || true
+  ctr rm -f "$TEST_CTR" "$SERVE_CTR" "$BUILD_CTR" "$PROXY_CTR" >/dev/null 2>&1 || true
+  ctr net rm "$NET" >/dev/null 2>&1 || true
+  ctr volume rm -f "$VOL" >/dev/null 2>&1 || true
   rm -rf "$WORK" 2>/dev/null || true
-}
-# shellcheck disable=SC2317,SC2329 # also invoked from cleanup
-firewall() { # -I | -D: the build network may reach neither the host nor anything outside it
-  local rc=0
-  sudo -n iptables "$1" INPUT -i "$BRIDGE" -j DROP || rc=1
-  sudo -n ip6tables "$1" INPUT -i "$BRIDGE" -j DROP || rc=1
-  sudo -n iptables "$1" DOCKER-USER -i "$BRIDGE" ! -o "$BRIDGE" -j DROP || rc=1
-  return "$rc"
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
@@ -140,23 +132,23 @@ HARDEN=(--label "$LABEL" --platform linux/amd64 --security-opt no-new-privileges
 # 0. Scorer image.
 if [ -n "${CRUCIBLE_SCORER_IMAGE:-}" ]; then
   IMAGE="$CRUCIBLE_SCORER_IMAGE"
-  if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
-    n=0; until docker pull -q "$IMAGE" >/dev/null 2>&1; do n=$((n + 1)); [ "$n" -ge 3 ] && break; sleep 5; done
+  if ! ctr image exists "$IMAGE" >/dev/null 2>&1; then
+    n=0; until ctr image pull -q "$IMAGE" >/dev/null 2>&1; do n=$((n + 1)); [ "$n" -ge 3 ] && break; sleep 5; done
   fi
-  docker image inspect "$IMAGE" >/dev/null 2>&1 || set_outcome system_error "scorer image unavailable"
+  ctr image exists "$IMAGE" >/dev/null 2>&1 || set_outcome system_error "scorer image unavailable"
 else
   IMAGE="crucible-scorer-arcbench-official:local"
-  docker build -q --platform linux/amd64 -t "$IMAGE" "$HERE/image" >"$RESULTS/scorer-build.log" 2>&1 \
+  ctr build -q --platform linux/amd64 -t "$IMAGE" "$HERE/image" >"$RESULTS/scorer-build.log" 2>&1 \
     || set_outcome system_error "scorer image failed to build"
 fi
 
 # 1. Unpack into the workspace volume (/workspace/template, the official
 # PROJECT_DIR). A bad zip is the submission's fault.
 if [ -z "$STATUS" ]; then
-  if ! docker volume create --label "$LABEL" "$VOL" >/dev/null 2>"$RESULTS/volume.log"; then
+  if ! ctr volume create --label "$LABEL" "$VOL" >/dev/null 2>"$RESULTS/volume.log"; then
     set_outcome system_error "could not create the workspace volume"
   else
-    docker run --rm "${HARDEN[@]}" --network none --cap-drop ALL \
+    ctr run --rm "${HARDEN[@]}" --network none --cap-drop ALL \
       -v "$WORK/app.zip:/in/app.zip:ro" -v "$VOL:/workspace" --entrypoint python3 "$IMAGE" \
       /opt/crucible/official.py unpack /in/app.zip /workspace/template >"$RESULTS/unpack.log" 2>&1
     rc=$?
@@ -169,15 +161,12 @@ fi
 # 2. Build: official npm install / npm run build; egress only to the npm
 # registries through the proxy.
 if [ -z "$STATUS" ]; then
-  if ! docker network create --driver bridge --internal --label "$LABEL" \
-      -o com.docker.network.bridge.name="$BRIDGE" "$NET" >/dev/null 2>"$RESULTS/net.log"; then
+  if ! ctr net create --internal --label "$LABEL" "$NET" >/dev/null 2>"$RESULTS/net.log"; then
     set_outcome system_error "could not create the build network"
-  elif [ "${CRUCIBLE_SCORER_FIREWALL:-0}" = 1 ] && ! { FIREWALL_UP=1; firewall -I >>"$RESULTS/net.log" 2>&1; }; then
-    set_outcome system_error "could not install the build firewall"
-  elif ! docker run -d --name "$PROXY_CTR" "${HARDEN[@]}" --cap-drop ALL --user 65534:65534 \
+  elif ! ctr run -d --name "$PROXY_CTR" "${HARDEN[@]}" --cap-drop ALL --user 65534:65534 \
       --read-only -e "ALLOW_HOSTS=$ALLOW_HOSTS" --memory 256m --pids-limit 256 \
       --entrypoint python3 "$IMAGE" /opt/crucible/egress_proxy.py >/dev/null 2>>"$RESULTS/net.log" \
-    || ! docker network connect --alias egress "$NET" "$PROXY_CTR" >>"$RESULTS/net.log" 2>&1; then
+    || ! ctr net connect --alias egress "$NET" "$PROXY_CTR" >>"$RESULTS/net.log" 2>&1; then
     set_outcome system_error "could not start the egress proxy"
   fi
 fi
@@ -185,15 +174,15 @@ if [ -z "$STATUS" ]; then
   log "building (timeout ${BUILD_TIMEOUT_S}s)"
   P="http://egress:3128"
   rc=0
-  "$TIMEOUT_BIN" --kill-after=10 "$BUILD_TIMEOUT_S" docker run --name "$BUILD_CTR" "${HARDEN[@]}" \
+  "$TIMEOUT_BIN" --kill-after=10 "$BUILD_TIMEOUT_S" "$CRUCIBLE" ctr run --name "$BUILD_CTR" "${HARDEN[@]}" \
     --network "$NET" --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER \
     --memory 4g --memory-swap 4g --cpus 2 --pids-limit 1024 \
     -e "HTTPS_PROXY=$P" -e "HTTP_PROXY=$P" -e "https_proxy=$P" -e "http_proxy=$P" \
     -e "npm_config_proxy=$P" -e "npm_config_https_proxy=$P" -e "NO_PROXY=localhost,127.0.0.1" \
     -v "$VOL:/workspace" --entrypoint python3 "$IMAGE" /opt/crucible/official.py build \
     >"$RESULTS/build.log" 2>&1 || rc=$?
-  docker rm -f "$BUILD_CTR" >/dev/null 2>&1 || true
-  docker logs "$PROXY_CTR" >"$RESULTS/egress.log" 2>&1 || true
+  ctr rm -f "$BUILD_CTR" >/dev/null 2>&1 || true
+  ctr logs "$PROXY_CTR" >"$RESULTS/egress.log" 2>&1 || true
   denied=$(grep -c '^DENY' "$RESULTS/egress.log" || true)
   if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
     set_outcome zero "app build exceeded ${BUILD_TIMEOUT_S}s"
@@ -206,12 +195,12 @@ if [ -z "$STATUS" ]; then
       [ "${denied:-0}" != 0 ] && DETAIL="$DETAIL; egress proxy refused $denied request(s)"
     fi
   fi
-  docker rm -f "$PROXY_CTR" >/dev/null 2>&1 || true
+  ctr rm -f "$PROXY_CTR" >/dev/null 2>&1 || true
 fi
 
 # 3. Serve: official `npm run start`, no network but loopback.
 if [ -z "$STATUS" ]; then
-  if ! docker run -d --name "$SERVE_CTR" "${HARDEN[@]}" --network none \
+  if ! ctr run -d --name "$SERVE_CTR" "${HARDEN[@]}" --network none \
       --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER \
       --memory 2g --memory-swap 2g --cpus 1 --pids-limit 512 \
       -v "$VOL:/workspace" --entrypoint python3 "$IMAGE" /opt/crucible/official.py serve \
@@ -220,9 +209,9 @@ if [ -z "$STATUS" ]; then
   else
     t=0
     while :; do
-      if docker logs "$SERVE_CTR" 2>/dev/null | grep -q '^\[crucible\] app ready'; then break; fi
-      if docker logs "$SERVE_CTR" 2>/dev/null | grep -q '^\[crucible\] app not ready' \
-         || [ "$(docker inspect -f '{{.State.Running}}' "$SERVE_CTR" 2>/dev/null)" != "true" ]; then
+      if ctr logs "$SERVE_CTR" 2>/dev/null | grep -q '^\[crucible\] app ready'; then break; fi
+      if ctr logs "$SERVE_CTR" 2>/dev/null | grep -q '^\[crucible\] app not ready' \
+         || [ "$(ctr inspect -f running "$SERVE_CTR" 2>/dev/null)" != "true" ]; then
         set_outcome zero "app did not become ready within 120s"; break
       fi
       t=$((t + 1)); [ "$t" -ge "$READY_TIMEOUT_S" ] && { set_outcome zero "app did not become ready"; break; }
@@ -236,21 +225,21 @@ fi
 if [ -z "$STATUS" ]; then
   log "running tests (timeout ${RUN_TIMEOUT_S}s)"
   rc=0
-  "$TIMEOUT_BIN" --kill-after=10 "$RUN_TIMEOUT_S" docker run --name "$TEST_CTR" "${HARDEN[@]}" \
+  "$TIMEOUT_BIN" --kill-after=10 "$RUN_TIMEOUT_S" "$CRUCIBLE" ctr run --name "$TEST_CTR" "${HARDEN[@]}" \
     --network "container:$SERVE_CTR" --user "$RUN_AS" --cap-drop ALL \
     --memory 2g --memory-swap 2g --cpus 2 --pids-limit 1024 --shm-size 1g \
     --mount type=tmpfs,destination=/workspace,tmpfs-mode=1777 -e HOME=/tmp \
     -v "$TESTS:/pack:ro" -v "$RESULTS:/results" --entrypoint python3 "$IMAGE" \
     /opt/crucible/official.py test /pack /results >"$RESULTS/test.log" 2>&1 || rc=$?
-  docker rm -f "$TEST_CTR" >/dev/null 2>&1 || true
-  docker logs --tail 5000 "$SERVE_CTR" >"$RESULTS/app.log" 2>&1 || true
+  ctr rm -f "$TEST_CTR" >/dev/null 2>&1 || true
+  ctr logs --tail 5000 "$SERVE_CTR" >"$RESULTS/app.log" 2>&1 || true
   if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then set_outcome zero "test run exceeded ${RUN_TIMEOUT_S}s"
   elif [ "$rc" -eq 0 ] && [ -f "$RESULTS/official.json" ]; then set_outcome scored ""
   else set_outcome system_error "test runner exited $rc without official results"; fi
 fi
 
 # 5. result.json, whatever happened above.
-if docker image inspect "$IMAGE" >/dev/null 2>&1 && docker run --rm "${HARDEN[@]}" --network none \
+if ctr image exists "$IMAGE" >/dev/null 2>&1 && ctr run --rm "${HARDEN[@]}" --network none \
     --cap-drop ALL --user "$RUN_AS" -v "$RESULTS:/results" --entrypoint python3 "$IMAGE" \
     /opt/crucible/official.py result /results/official.json "$STATUS" "$DETAIL" "$VISIBILITY" \
     /results/result.json "$TASK_ID" "$SUBMISSION_ID" >"$RESULTS/result.log" 2>&1 \

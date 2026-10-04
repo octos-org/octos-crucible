@@ -47,6 +47,7 @@ use crucible_metering::{Price, Pricing};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
+use crate::executor::Executor;
 use crate::keys::Store;
 use crate::plan::Budget;
 use crate::runners::workdir::{Used, read_usage, remaining, used};
@@ -82,6 +83,8 @@ pub struct ScoreOpts<'a> {
     pub replica: Option<u32>,
     /// The submitter's model for slots that use one.
     pub model: Option<&'a ModelSetup>,
+    /// The step's run label: the plugins' containers carry it too.
+    pub run_label: Option<&'a str>,
 }
 
 /// Normalise a scorer result for the manifest: [`ScoreResult::finish`]
@@ -147,10 +150,12 @@ pub fn replicas(results: &Path) -> Result<Vec<u32>> {
 pub struct ContainerPlugin {
     pub entry: PathBuf,
     pub image: Option<String>,
+    /// `CRUCIBLE_RUN_LABEL` of the script (its containers carry it).
+    pub run_label: Option<String>,
 }
 
 /// Resolve a container plugin of the registry under `root`.
-pub fn container_plugin(
+pub async fn container_plugin(
     root: &Path,
     kind: Kind,
     reference: &str,
@@ -171,15 +176,18 @@ pub fn container_plugin(
             entry.display()
         );
     }
+    // Built by `step score-tests` (else the script builds its own).
     let tag = format!("crucible-{}-{}:run", kind.as_str(), p.name);
-    let image = Command::new("docker")
-        .args(["image", "inspect", "--format", "x", &tag])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
-        .then_some(tag);
-    Ok(ContainerPlugin { entry, image })
+    let exec = crate::executor::backend()?;
+    let image = exec
+        .image_exists(&exec.image_ref(&tag))
+        .await
+        .then(|| exec.image_ref(&tag));
+    Ok(ContainerPlugin {
+        entry,
+        image,
+        run_label: None,
+    })
 }
 
 /// The two slots of the scoring job that may use a model.
@@ -353,9 +361,16 @@ fn options_file(opts: Option<&serde_json::Value>) -> Result<Option<tempfile::Nam
 }
 
 /// Run a container plugin's entry script; the scrubbed variables and the
-/// other kind's image variable are removed from its environment.
+/// other kind's image variable are removed from its environment. It starts
+/// its containers with `"$CRUCIBLE" ctr ...` (this program, same backend).
 fn plugin_command(p: &ContainerPlugin, image_var: &str, scrub_env: &[String]) -> Command {
     let mut cmd = Command::new("bash");
+    if let Some(l) = &p.run_label {
+        cmd.env("CRUCIBLE_RUN_LABEL", l);
+    }
+    if let Ok(me) = std::env::current_exe() {
+        cmd.env("CRUCIBLE", me);
+    }
     for k in scrub_env {
         cmd.env_remove(k);
     }
@@ -524,6 +539,7 @@ impl StageJob<'_> {
                 ContainerPlugin {
                     entry: runner.entry.clone(),
                     image: runner.image.clone(),
+                    run_label: runner.run_label.clone(),
                 },
                 app.to_path_buf(),
                 self.tests.to_path_buf(),
@@ -589,6 +605,7 @@ impl StageJob<'_> {
         let sc = ContainerPlugin {
             entry: self.scorer.entry.clone(),
             image: self.scorer.image.clone(),
+            run_label: self.scorer.run_label.clone(),
         };
         let (app, tests, st) = (app.to_path_buf(), self.tests.to_path_buf(), stage.clone());
         let run = have_run.then(|| run_dir.path().to_path_buf());
@@ -643,19 +660,22 @@ pub async fn score(o: &ScoreOpts<'_>) -> Result<Vec<(u32, String, ScoreResult)>>
         if todo.is_empty() {
             continue;
         }
-        let scorer = container_plugin(
+        let label = o.run_label.map(str::to_owned);
+        let mut scorer = container_plugin(
             o.plugins_root,
             Kind::Scorer,
             &crucible_core::taskset::scorer_spec(stage.scorer_ref(o.taskset)),
             "score.sh",
-        )?;
+        )
+        .await?;
+        scorer.run_label = label.clone();
         let runner = match &stage.interactive {
-            Some(i) => Some(container_plugin(
-                o.plugins_root,
-                Kind::Runner,
-                &i.name,
-                "run.sh",
-            )?),
+            Some(i) => {
+                let mut r =
+                    container_plugin(o.plugins_root, Kind::Runner, &i.name, "run.sh").await?;
+                r.run_label = label.clone();
+                Some(r)
+            }
             None => None,
         };
         // The tests exist in clear only inside this scope.
@@ -1031,6 +1051,7 @@ printf '{"visibility":"hidden","status":"failed","passed":1,"total":2,"detail":"
             scrub_env: &[],
             replica: None,
             model: None,
+            run_label: None,
         })
         .await
         .unwrap();
@@ -1097,6 +1118,7 @@ printf '{"visibility":"hidden","status":"failed","passed":1,"total":2,"detail":"
             scrub_env: &["PATH_CRUCIBLE_TEST_KEY".into()],
             replica: Some(1),
             model: None,
+            run_label: None,
         })
         .await
         .unwrap();

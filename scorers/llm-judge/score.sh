@@ -16,7 +16,7 @@
 #
 # Exit status: 0 = result.json written, 2 = usage error, 1 = no result.json.
 # Environment (optional): CRUCIBLE_SCORER_IMAGE (prebuilt image; default:
-# build ./image).
+# build ./image). Containers: `crucible ctr` (`$CRUCIBLE`, default on PATH).
 set -uo pipefail
 
 main() {
@@ -51,7 +51,9 @@ case "$TASK_ID" in *[!A-Za-z0-9._-]*) die_usage "--task-id: only [A-Za-z0-9._-]"
 case "$NETWORK" in *[!A-Za-z0-9._-]*) die_usage "--model-network: bad name" ;; esac
 case "$MODEL_URL" in ''|http://*) ;; *) die_usage "--model-base-url must be the meter's http URL" ;; esac
 case "$MODEL" in *[!A-Za-z0-9._:/-]*) die_usage "--model: bad name" ;; esac
-command -v docker >/dev/null || die_usage "needs docker on PATH"
+CRUCIBLE="${CRUCIBLE:-crucible}"
+command -v "$CRUCIBLE" >/dev/null || die_usage "needs crucible on PATH (or \$CRUCIBLE)"
+ctr() { "$CRUCIBLE" ctr "$@"; }
 
 mkdir -p "$(dirname "$OUT")" || exit 1
 OUT="$(cd "$(dirname "$OUT")" && pwd -P)/$(basename "$OUT")"
@@ -78,9 +80,9 @@ if [ -n "${CRUCIBLE_SCORER_IMAGE:-}" ]; then
   IMAGE="$CRUCIBLE_SCORER_IMAGE"
 else
   IMAGE="crucible-scorer-llm-judge:local"
-  docker build -q -t "$IMAGE" "$HERE/image" >/dev/null 2>&1 || fail "scorer image failed to build"
+  ctr build -q -t "$IMAGE" "$HERE/image" >/dev/null 2>&1 || fail "scorer image failed to build"
 fi
-docker run --rm --network "$NETWORK" --dns 127.0.0.1 --read-only --cap-drop ALL \
+ctr run --rm --network "$NETWORK" --dns 127.0.0.1 --read-only --cap-drop ALL \
   --security-opt no-new-privileges --memory 512m --pids-limit 64 --user "$RUN_AS" \
   -v "$ARTIFACT:/in/output.zip:ro" -v "$TESTS:/tests:ro" -v "$WORK:/out" \
   --entrypoint python3 "$IMAGE" /opt/scorer/judge.py \
