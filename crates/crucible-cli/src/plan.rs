@@ -99,6 +99,10 @@ struct Options {
     stages: Option<u32>,
     #[serde(default)]
     results_url: Option<String>,
+    /// Builtin agents built from another repo (upstream.json): a branch or
+    /// tag of that repo to build instead of upstream.json's ref.
+    #[serde(default)]
+    agent_ref: Option<String>,
 }
 
 pub fn owner_ok(o: &str) -> bool {
@@ -363,8 +367,9 @@ pub fn plan(inp: &PlanInputs, root: &Path) -> Result<BTreeMap<&'static str, Stri
     let opts: Options = if inp.options.trim().is_empty() {
         Options::default()
     } else {
-        serde_json::from_str(&inp.options)
-            .map_err(|_| anyhow!("options must be JSON {{budget?, stages?, results_url?}}"))?
+        serde_json::from_str(&inp.options).map_err(|_| {
+            anyhow!("options must be JSON {{budget?, stages?, results_url?, agent_ref?}}")
+        })?
     };
     let budget_raw = match (&opts.budget, inp.budget.trim()) {
         (Some(_), b) if !b.is_empty() => bail!("budget given twice"),
@@ -377,6 +382,12 @@ pub fn plan(inp: &PlanInputs, root: &Path) -> Result<BTreeMap<&'static str, Stri
         (Some(n), _) => n.to_string(),
         (None, s) => s.to_owned(),
     };
+    let agent_ref = opts.agent_ref.unwrap_or_default();
+    if !agent_ref.is_empty()
+        && !(matches!(source, Source::Builtin(_)) && crate::agentpkg::ref_ok(&agent_ref))
+    {
+        bail!("agent_ref must be a branch or tag name, for a builtin agent only");
+    }
     let results_url = opts.results_url.unwrap_or_default();
     check_url("results_url", &results_url)?;
     let worker = worker_url(&results_url, &inp.worker_url)?;
@@ -409,6 +420,7 @@ pub fn plan(inp: &PlanInputs, root: &Path) -> Result<BTreeMap<&'static str, Stri
     let mut out = BTreeMap::new();
     out.insert("agent_source", inp.agent_source.trim().to_owned());
     out.insert("agent_kind", source.kind().to_owned());
+    out.insert("agent_ref", agent_ref);
     out.insert("model", model.to_owned());
     out.insert("endpoint", endpoint.to_owned());
     out.insert("cred_source", cred.to_owned());
@@ -504,6 +516,12 @@ mod tests {
         assert_eq!(out["owner"], "123456:octo-cat");
         assert!(out["results_url"].starts_with("https://"));
         assert_eq!(out["worker_url"], "https://crucible.example.workers.dev");
+        assert_eq!(out["agent_ref"], "");
+        let mut i = good();
+        i.options = r#"{"agent_ref":"loop/x-1"}"#.into();
+        assert_eq!(plan(&i, r.path()).unwrap()["agent_ref"], "loop/x-1");
+        i.options = r#"{"agent_ref":"--upload-pack=x"}"#.into();
+        assert!(plan(&i, r.path()).is_err());
         assert_eq!(plan(&good(), r.path()).unwrap()["worker_url"], "");
         let mut i = good();
         i.cred_source = "workers-kv".into();
