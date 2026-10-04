@@ -99,7 +99,13 @@ FIREWALL_UP=0
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/crucible-score.XXXXXX")" || exit 1
 WORK="$(cd "$WORK" && pwd -P)"
 RESULTS="$WORK/results"
-mkdir -p "$RESULTS" && chmod 0777 "$RESULTS"   # the test container runs as nobody
+mkdir -p "$RESULTS"
+# The test container runs as the caller's uid (it must read --tests, which
+# the caller may have made private), root callers fall back to 1000.
+if [ "$(id -u)" = "0" ]; then RUN_AS="1000:1000"; chmod 0777 "$RESULTS"; else RUN_AS="$(id -u):$(id -g)"; fi
+# Root without capabilities cannot read a private artifact: give the unpack
+# container a world-readable copy.
+cp "$ARTIFACT" "$WORK/app.zip" && chmod 0644 "$WORK/app.zip" || exit 1
 
 # shellcheck disable=SC2317,SC2329 # invoked via trap
 cleanup() {
@@ -150,11 +156,12 @@ if [ -z "$STATUS" ]; then
     set_outcome system_error "could not create the workspace volume"
   else
     docker run --rm "${HARDEN[@]}" --network none --cap-drop ALL \
-      -v "$ARTIFACT:/in/app.zip:ro" -v "$VOL:/workspace" --entrypoint python3 "$IMAGE" \
+      -v "$WORK/app.zip:/in/app.zip:ro" -v "$VOL:/workspace" --entrypoint python3 "$IMAGE" \
       /opt/crucible/official.py unpack /in/app.zip /workspace/template >"$RESULTS/unpack.log" 2>&1
     rc=$?
     if [ "$rc" -eq 1 ]; then set_outcome zero "zip failed validation (bad paths, links, or too large)"
     elif [ "$rc" -ne 0 ]; then set_outcome system_error "zip extraction exited $rc"; fi
+    [ "$rc" -ne 0 ] && sed 's/^/[unpack] /' "$RESULTS/unpack.log" | tail -5 >&2
   fi
 fi
 
@@ -229,7 +236,7 @@ if [ -z "$STATUS" ]; then
   log "running tests (timeout ${RUN_TIMEOUT_S}s)"
   rc=0
   "$TIMEOUT_BIN" --kill-after=10 "$RUN_TIMEOUT_S" docker run --name "$TEST_CTR" "${HARDEN[@]}" \
-    --network "container:$SERVE_CTR" --user 65534:65534 --cap-drop ALL \
+    --network "container:$SERVE_CTR" --user "$RUN_AS" --cap-drop ALL \
     --memory 2g --memory-swap 2g --cpus 2 --pids-limit 1024 --shm-size 1g \
     --mount type=tmpfs,destination=/workspace,tmpfs-mode=1777 -e HOME=/tmp \
     -v "$TESTS:/pack:ro" -v "$RESULTS:/results" --entrypoint python3 "$IMAGE" \
@@ -243,7 +250,7 @@ fi
 
 # 5. result.json, whatever happened above.
 if docker image inspect "$IMAGE" >/dev/null 2>&1 && docker run --rm "${HARDEN[@]}" --network none \
-    --cap-drop ALL --user 65534:65534 -v "$RESULTS:/results" --entrypoint python3 "$IMAGE" \
+    --cap-drop ALL --user "$RUN_AS" -v "$RESULTS:/results" --entrypoint python3 "$IMAGE" \
     /opt/crucible/official.py result /results/official.json "$STATUS" "$DETAIL" "$VISIBILITY" \
     /results/result.json "$TASK_ID" "$SUBMISSION_ID" >"$RESULTS/result.log" 2>&1 \
     && [ -f "$RESULTS/result.json" ]; then
