@@ -14,10 +14,29 @@ use crate::blob::BlobRef;
 /// to back on one machine, inside a 6 h GitHub job).
 pub const MAX_TOTAL_TIME_S: u64 = 18_000;
 
+/// Scorers a user-uploaded taskset may name: those reviewed for untrusted
+/// test material (docs/scorer-contract.md §7).
+pub const USER_SCORERS: &[&str] = &["playwright"];
+
+/// `u-` + 16 lower-case hex: the id of a user-uploaded taskset. Built-in
+/// taskset directories never start with `u-`.
+pub fn is_user_taskset_id(s: &str) -> bool {
+    s.strip_prefix("u-").is_some_and(|h| {
+        h.len() == 16
+            && h.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskSet {
     pub schema: u32,
     pub name: String,
+    /// Display name. User-uploaded tasksets are registered under a
+    /// platform id (`u-...`) as `name`; the name from their source.json
+    /// is kept here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     #[serde(default)]
     pub description: String,
     pub scorer: ScorerRef,

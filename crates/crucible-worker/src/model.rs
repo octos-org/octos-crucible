@@ -43,6 +43,44 @@ impl Mode {
     }
 }
 
+/// `X-Upload-Kind`: what an upload is for. An eval may only use an upload
+/// of its own mode; `POST /tasksets` only a `taskset` upload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UploadKind {
+    Agent,
+    App,
+    /// A taskset source zip (see `POST /tasksets`).
+    Taskset,
+}
+
+impl UploadKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UploadKind::Agent => "agent",
+            UploadKind::App => "app",
+            UploadKind::Taskset => "taskset",
+        }
+    }
+    pub fn parse(s: &str) -> Option<UploadKind> {
+        match s {
+            "agent" => Some(UploadKind::Agent),
+            "app" => Some(UploadKind::App),
+            "taskset" => Some(UploadKind::Taskset),
+            _ => None,
+        }
+    }
+}
+
+impl From<Mode> for UploadKind {
+    fn from(m: Mode) -> UploadKind {
+        match m {
+            Mode::Agent => UploadKind::Agent,
+            Mode::App => UploadKind::App,
+        }
+    }
+}
+
 // ---- status ------------------------------------------------------------
 //
 // Fixed values shared with the page:
@@ -313,9 +351,118 @@ fn check_budget(b: &Budget) -> Result<(), ApiError> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UploadRecord {
     pub owner_id: u64,
-    pub kind: Mode,
+    pub kind: UploadKind,
     pub size: u64,
     pub created_at: String,
+}
+
+// ---- user tasksets -----------------------------------------------------
+
+pub const TS_PACKING: &str = "packing";
+pub const TS_READY: &str = "ready";
+pub const TS_FAILED: &str = "failed";
+pub const MAX_TASKSET_BODY: usize = 256 * 1024;
+
+/// KV `tasksets/<id>`: a user-uploaded taskset. Private to its owner until
+/// an admin makes it public; built-in tasksets live in the repository.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UserTaskset {
+    /// `u-<16 hex>`; also the `name` in its taskset.json and in evals.
+    pub id: String,
+    pub owner_id: u64,
+    pub owner_login: String,
+    pub upload_hash: String,
+    /// `packing | ready | failed`.
+    pub status: String,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub public: bool,
+    /// The name from the uploaded source.json.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// The packed taskset.json (blob references, no test content).
+    #[serde(default)]
+    pub taskset: Option<Value>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// KV key metadata of `tasksets/<id>`: enough to decide who sees it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UserTasksetMeta {
+    pub owner_id: u64,
+    pub status: String,
+    pub public: bool,
+    pub created_at: String,
+}
+
+impl UserTaskset {
+    pub fn meta(&self) -> UserTasksetMeta {
+        UserTasksetMeta {
+            owner_id: self.owner_id,
+            status: self.status.clone(),
+            public: self.public,
+            created_at: self.created_at.clone(),
+        }
+    }
+
+    /// Who may see it in listings and details.
+    pub fn visible_to(&self, github_id: u64, is_admin: bool) -> bool {
+        is_admin || self.owner_id == github_id || (self.public && self.status == TS_READY)
+    }
+
+    /// Who may run evals on it: the owner, or anyone once it is public.
+    pub fn usable_by(&self, github_id: u64) -> bool {
+        self.status == TS_READY && (self.public || self.owner_id == github_id)
+    }
+
+    /// The parsed taskset.json of a ready taskset.
+    pub fn parsed(&self) -> Option<crucible_core::TaskSet> {
+        serde_json::from_value(self.taskset.clone()?).ok()
+    }
+}
+
+/// Body of `POST /internal/tasksets/:id` (from the taskset-pack workflow).
+pub enum PackResult {
+    Ready(crucible_core::TaskSet),
+    Failed(String),
+}
+
+pub fn parse_pack_result(body: &[u8], id: &str) -> Result<PackResult, ApiError> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Body {
+        status: String,
+        #[serde(default)]
+        taskset: Option<crucible_core::TaskSet>,
+        #[serde(default)]
+        error: Option<String>,
+    }
+    if body.len() > MAX_TASKSET_BODY {
+        return Err(ApiError::too_large(MAX_TASKSET_BODY));
+    }
+    let b: Body = serde_json::from_slice(body)
+        .map_err(|e| ApiError::bad_request(format!("invalid request body: {e}")))?;
+    match (b.status.as_str(), b.taskset, b.error) {
+        (TS_READY, Some(ts), None) => {
+            ts.validate(crucible_core::taskset::MAX_TOTAL_TIME_S)
+                .map_err(|e| ApiError::bad_request(e.to_string()))?;
+            if ts.name != id {
+                return Err(ApiError::bad_request("taskset.name must be the taskset id"));
+            }
+            if !crucible_core::taskset::USER_SCORERS.contains(&ts.scorer.name.as_str()) {
+                return Err(ApiError::bad_request(
+                    "scorer not offered for uploaded tasksets",
+                ));
+            }
+            Ok(PackResult::Ready(ts))
+        }
+        (TS_FAILED, None, Some(e)) => Ok(PackResult::Failed(e.chars().take(500).collect())),
+        _ => Err(ApiError::bad_request(
+            "body must be {status: ready, taskset} or {status: failed, error}",
+        )),
+    }
 }
 
 /// KV `evals/<eval_id>`.

@@ -158,6 +158,16 @@ impl Mock {
                     body: vec![],
                 }
             }
+            ("POST", "actions/workflows/taskset-pack.yml/dispatches") => {
+                let body: Value = serde_json::from_slice(r.body.as_ref().unwrap()).unwrap();
+                let mut inputs = body["inputs"].clone();
+                inputs["_workflow"] = json!("taskset-pack.yml");
+                gh.dispatches.push(inputs);
+                HttpResponse {
+                    status: 204,
+                    body: vec![],
+                }
+            }
             ("GET", p)
                 if p.starts_with("actions/workflows/eval.yml/runs?")
                     || p.starts_with("actions/workflows/score.yml/runs?") =>
@@ -1120,4 +1130,219 @@ fn api_tokens() {
     let cli2 = json_of(&r)["token"].as_str().unwrap().to_string();
     assert_eq!(t.as_user("POST", "/admin/ban", &admin, &ban).status, 200);
     assert_eq!(err_code(&t.as_user("GET", "/me", &cli2, b"")), "banned");
+}
+
+/// A packed taskset.json as the taskset-pack workflow posts it.
+fn packed(id: &str) -> Value {
+    let blob = json!({"sha256": "ab".repeat(32), "key_id": "1ffa702796eb5ee8"});
+    json!({
+        "schema": 1, "name": id, "title": "my-tasks", "scorer": {"name": "playwright"},
+        "total_time_limit_s": 1200,
+        "stages": [
+            {"id": "s1", "inputs_blob": blob, "tests_blob": blob, "output": "web-app", "time_limit_s": 600, "expected_total": 3},
+            {"id": "s2", "inputs_blob": blob, "tests_blob": blob, "output": "web-app", "time_limit_s": 600, "expected_total": 4}
+        ]
+    })
+}
+
+#[test]
+fn user_tasksets() {
+    let t = T::new();
+    let alice = token(42, "octocat");
+    let bob = token(43, "bob");
+    let admin = token(1, "admin");
+    let internal = format!("Bearer {WORKER_TOKEN}");
+    let up = |tok: &str, kind: &str, body: &[u8]| {
+        let r = t.call(
+            "POST",
+            "/uploads",
+            &[
+                ("Authorization", &format!("Bearer {tok}")),
+                ("X-Upload-Kind", kind),
+            ],
+            body,
+        );
+        assert!(r.status < 300, "{}", String::from_utf8_lossy(&r.body));
+        json_of(&r)["hash"].as_str().unwrap().to_string()
+    };
+    let register = |tok: &str, hash: &str| {
+        let body = serde_json::to_vec(&json!({"upload_hash": hash})).unwrap();
+        t.as_user("POST", "/tasksets", tok, &body)
+    };
+    let names = |tok: Option<&str>, q: &str| -> Vec<String> {
+        let r = match tok {
+            Some(tok) => t.as_user("GET", &format!("/tasksets{q}"), tok, b""),
+            None => t.call("GET", &format!("/tasksets{q}"), &[], b""),
+        };
+        json_of(&r)
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // Register: only one's own taskset uploads.
+    let zip = up(&alice, "taskset", &sealed(b"taskset zip"));
+    let agent = up(&alice, "agent", &sealed(b"agent zip"));
+    assert_eq!(err_code(&register(&alice, &agent)), "bad_request");
+    assert_eq!(register(&bob, &zip).status, 403);
+    assert_eq!(t.call("POST", "/tasksets", &[], b"{}").status, 401);
+    let r = register(&alice, &zip);
+    assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+    let id = json_of(&r)["id"].as_str().unwrap().to_string();
+    assert!(crucible_core::taskset::is_user_taskset_id(&id), "{id}");
+    assert_eq!(json_of(&r)["status"], "packing");
+    let d = t.mock.gh.borrow().dispatches.last().unwrap().clone();
+    assert_eq!(
+        d,
+        json!({"_workflow": "taskset-pack.yml", "taskset_id": id, "source": format!("blob:{zip}"),
+               "results_url": format!("https://crucible.example.workers.dev/internal/tasksets/{id}")})
+    );
+
+    // Packing: visible to the owner only, not usable yet.
+    assert_eq!(
+        names(Some(&alice), ""),
+        vec!["github-full".to_string(), id.clone()]
+    );
+    assert_eq!(names(Some(&bob), ""), vec!["github-full".to_string()]);
+    assert_eq!(names(None, ""), vec!["github-full".to_string()]);
+    let get = |tok: &str| t.as_user("GET", &format!("/tasksets/{id}"), tok, b"");
+    assert_eq!(json_of(&get(&alice))["status"], "packing");
+    assert_eq!(get(&bob).status, 404);
+    let iget = |gid: u64| {
+        t.call(
+            "GET",
+            &format!("/internal/tasksets/{id}?github_id={gid}"),
+            &[("Authorization", &internal)],
+            b"",
+        )
+    };
+    assert_eq!(iget(42).status, 409);
+
+    // The workflow reports it packed (internal token only, once).
+    let result = serde_json::to_vec(&json!({"status": "ready", "taskset": packed(&id)})).unwrap();
+    let ipost = |body: &[u8]| {
+        t.call(
+            "POST",
+            &format!("/internal/tasksets/{id}"),
+            &[("Authorization", &internal)],
+            body,
+        )
+    };
+    assert_eq!(
+        t.as_user("POST", &format!("/internal/tasksets/{id}"), &alice, &result)
+            .status,
+        401
+    );
+    let wrong_name =
+        serde_json::to_vec(&json!({"status": "ready", "taskset": packed("u-0000000000000000")}))
+            .unwrap();
+    assert_eq!(ipost(&wrong_name).status, 400);
+    let mut other_scorer = packed(&id);
+    other_scorer["scorer"]["name"] = json!("astro-survey");
+    let other_scorer =
+        serde_json::to_vec(&json!({"status": "ready", "taskset": other_scorer})).unwrap();
+    assert_eq!(ipost(&other_scorer).status, 400);
+    assert_eq!(ipost(&result).status, 200);
+    assert_eq!(ipost(&result).status, 409);
+    let info = json_of(&get(&alice));
+    assert_eq!(info["status"], "ready");
+    assert_eq!(info["title"], "my-tasks");
+    assert_eq!(info["public"], false);
+    assert_eq!(
+        info["stages"],
+        json!([
+            {"name": "s1", "time_limit_s": 600, "total": 3},
+            {"name": "s2", "time_limit_s": 600, "total": 4}
+        ])
+    );
+
+    // Private: only Alice may see and use it; the workflow's check agrees.
+    assert_eq!(get(&bob).status, 404);
+    assert_eq!(names(Some(&bob), ""), vec!["github-full".to_string()]);
+    assert_eq!(iget(42).status, 200);
+    assert_eq!(json_of(&iget(42))["name"], json!(id));
+    assert_eq!(iget(43).status, 403);
+    let app_eval = |tok: &str, eid: &str| {
+        let kind_hash = up(tok, "app", &sealed(format!("site {eid}").as_bytes()));
+        let body = json!({
+            "mode": "app", "eval_id": eid, "upload_hash": kind_hash, "taskset": id,
+            "stages": 2, "score_public": false, "consent": true
+        });
+        t.as_user("POST", "/evals", tok, &serde_json::to_vec(&body).unwrap())
+    };
+    let r = app_eval(&bob, "1b7e6a52-1f3c-4d2a-9e8b-7c6d5e4f3a21");
+    assert_eq!(err_code(&r), "bad_request");
+    let r = app_eval(&alice, EID);
+    assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+    let d = t.mock.gh.borrow().dispatches.last().unwrap().clone();
+    assert_eq!(
+        (d["taskset"].as_str(), d["stage"].as_str()),
+        (Some(id.as_str()), Some("2"))
+    );
+    // A taskset upload is not an eval upload.
+    let body = json!({
+        "mode": "app", "eval_id": "3b7e6a52-1f3c-4d2a-9e8b-7c6d5e4f3a21", "upload_hash": zip,
+        "taskset": id, "stages": 1, "score_public": false, "consent": true
+    });
+    assert_eq!(
+        err_code(&t.as_user(
+            "POST",
+            "/evals",
+            &alice,
+            &serde_json::to_vec(&body).unwrap()
+        )),
+        "bad_request"
+    );
+
+    // Admins see every upload with ?all=1 and may make one public.
+    assert_eq!(names(Some(&admin), ""), vec!["github-full".to_string()]);
+    assert_eq!(
+        names(Some(&admin), "?all=1"),
+        vec!["github-full".to_string(), id.clone()]
+    );
+    let public = |tok: &str, on: bool| {
+        let body = serde_json::to_vec(&json!({"public": on})).unwrap();
+        t.as_user("POST", &format!("/tasksets/{id}/public"), tok, &body)
+    };
+    assert_eq!(public(&alice, true).status, 403);
+    assert_eq!(public(&admin, true).status, 200);
+    assert_eq!(names(None, ""), vec!["github-full".to_string(), id.clone()]);
+    assert_eq!(get(&bob).status, 200);
+    assert_eq!(iget(43).status, 200);
+    let r = app_eval(&bob, "4b7e6a52-1f3c-4d2a-9e8b-7c6d5e4f3a21");
+    assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(public(&admin, false).status, 200);
+    assert_eq!(iget(43).status, 403);
+
+    // A refused upload: the reason goes to its owner only.
+    let zip2 = up(&alice, "taskset", &sealed(b"another zip"));
+    let id2 = json_of(&register(&alice, &zip2))["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(id2, id);
+    let r = t.call(
+        "POST",
+        &format!("/internal/tasksets/{id2}"),
+        &[("Authorization", &internal)],
+        br#"{"status": "failed", "error": "stage s1 tests: tests has no files"}"#,
+    );
+    assert_eq!(r.status, 200);
+    let info = json_of(&t.as_user("GET", &format!("/tasksets/{id2}"), &alice, b""));
+    assert_eq!(
+        (info["status"].as_str(), info["error"].as_str()),
+        (Some("failed"), Some("stage s1 tests: tests has no files"))
+    );
+    assert_eq!(
+        t.as_user(
+            "POST",
+            &format!("/tasksets/{id2}/public"),
+            &admin,
+            br#"{"public": true}"#
+        )
+        .status,
+        409
+    );
 }

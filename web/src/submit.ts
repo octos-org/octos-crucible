@@ -28,6 +28,18 @@ export async function resolveKey(backend: Backend): Promise<ResolvedKey> {
   return { key: bundled, rotated: false };
 }
 
+/** Upload a taskset zip: sealed in the browser, then registered. */
+export async function submitTaskset(
+  backend: Backend,
+  bytes: Uint8Array,
+): Promise<{ id: string; status: string }> {
+  const { key } = await resolveKey(backend);
+  const sealed = await seal(key, bytes);
+  if (sealed.length > MAX_UPLOAD) throw new Error("加密后文件超过 25 MB 上限");
+  const { hash } = await backend.upload("taskset", sealed);
+  return backend.registerTaskset(hash);
+}
+
 export type Step = "key" | "encrypt" | "upload" | "credential" | "submit";
 
 export const STEP_TEXT: Record<Step, string> = {

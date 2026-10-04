@@ -14,15 +14,24 @@ use crate::model::{
     UploadRecord, ValidEval, is_login, is_status, is_terminal, is_uuid_v4, parse_results,
     status_rank,
 };
+use crate::model::{
+    PackResult, TS_FAILED, TS_PACKING, TS_READY, UploadKind, UserTaskset, UserTasksetMeta,
+    parse_pack_result,
+};
 use crate::session;
 use crate::shard::{release_tag, sha256_hex};
 use crate::tokens::{self, TokenRecord, TokenSummary};
 use crate::util::{ct_eq, parse_query, query_get, rfc3339};
+use crucible_core::taskset::is_user_taskset_id;
 
 const OAUTH_COOKIE: &str = "crucible_oauth";
 const TASKSETS_CACHE: &str = "cache/tasksets";
 const TASKSETS_TTL_S: u64 = 300;
 const LIST_LIMIT: usize = 1000;
+/// KV prefix of user-uploaded tasksets.
+const USER_TASKSETS: &str = "tasksets/";
+/// Keeps `GET /tasksets` within the Worker's per-request KV budget.
+const MAX_LISTED_USER_TASKSETS: usize = 50;
 /// How long a run may be finished before missing results count as failure.
 const RESULTS_GRACE_S: u64 = 600;
 
@@ -82,6 +91,33 @@ fn cors(cfg: &Config, req: &Req, resp: &mut Resp) {
     }
 }
 
+/// How a user taskset appears in `GET /tasksets`.
+fn user_taskset_info(u: &UserTaskset) -> TasksetInfo {
+    let stages = u
+        .parsed()
+        .map(|ts| {
+            ts.stages
+                .into_iter()
+                .map(|s| crate::github::StageInfo {
+                    name: s.id,
+                    time_limit_s: s.time_limit_s,
+                    total: s.expected_total,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    TasksetInfo {
+        name: u.id.clone(),
+        version: "upload".into(),
+        stages,
+        title: u.title.clone(),
+        owner_login: Some(u.owner_login.clone()),
+        public: Some(u.public),
+        status: Some(u.status.clone()),
+        error: u.error.clone(),
+    }
+}
+
 struct App<'a, B: Backend> {
     b: &'a B,
     cfg: &'a Config,
@@ -111,7 +147,12 @@ impl<'a, B: Backend> App<'a, B> {
                 ))
             }
             ("GET", ["pubkey"]) => Ok(Resp::json(200, keys::current())),
-            ("GET", ["tasksets"]) => Ok(Resp::json(200, &self.tasksets().await?)),
+            ("GET", ["tasksets"]) => self.list_tasksets(req).await,
+            ("POST", ["tasksets"]) => self.create_taskset(req).await,
+            ("GET", ["tasksets", id]) => self.get_taskset(req, id).await,
+            ("POST", ["tasksets", id, "public"]) => self.set_taskset_public(req, id).await,
+            ("GET", ["internal", "tasksets", id]) => self.internal_get_taskset(req, id).await,
+            ("POST", ["internal", "tasksets", id]) => self.internal_taskset_result(req, id).await,
             ("POST", ["uploads"]) => self.upload(req).await,
             ("POST", ["evals"]) => self.create_eval(req).await,
             ("GET", ["evals"]) => self.list_evals(req).await,
@@ -382,14 +423,243 @@ impl<'a, B: Backend> App<'a, B> {
         Ok(list)
     }
 
+    // ---- user tasksets --------------------------------------------------
+
+    async fn load_user_taskset(&self, id: &str) -> Result<Option<UserTaskset>> {
+        if !is_user_taskset_id(id) {
+            return Ok(None);
+        }
+        self.kv_json(&format!("{USER_TASKSETS}{id}")).await
+    }
+
+    async fn save_user_taskset(&self, u: &UserTaskset) -> Result<()> {
+        self.kv_put(
+            &format!("{USER_TASKSETS}{}", u.id),
+            &serde_json::to_vec(u).expect("json"),
+            PutOptions {
+                ttl: None,
+                metadata: Some(serde_json::to_value(u.meta()).expect("json")),
+            },
+        )
+        .await
+    }
+
+    /// `GET /tasksets`: built-in tasksets for everyone; with a valid token
+    /// also the caller's own uploads and public ones (admins: `?all=1`
+    /// lists every upload). An invalid token is treated as anonymous.
+    async fn list_tasksets(&self, req: &Req) -> Result<Resp> {
+        let mut list = self.tasksets().await?;
+        let p = match req.bearer() {
+            Some(_) => self.principal(req).await.ok(),
+            None => None,
+        };
+        let all = query_get(&parse_query(&req.query), "all") == Some("1");
+        let keys = self
+            .b
+            .kv_list(USER_TASKSETS, LIST_LIMIT)
+            .await
+            .map_err(|e| self.storage_err(e))?;
+        let mut picked: Vec<(String, String)> = keys
+            .into_iter()
+            .filter_map(|k| {
+                let m: UserTasksetMeta = serde_json::from_value(k.metadata?).ok()?;
+                let mine = p.as_ref().is_some_and(|p| p.github_id == m.owner_id);
+                let admin_all = all && p.as_ref().is_some_and(|p| p.is_admin);
+                (mine || admin_all || (m.public && m.status == TS_READY))
+                    .then_some((m.created_at, k.name))
+            })
+            .collect();
+        picked.sort_by(|a, b| b.0.cmp(&a.0));
+        for (_, key) in picked.into_iter().take(MAX_LISTED_USER_TASKSETS) {
+            if let Some(u) = self.kv_json::<UserTaskset>(&key).await? {
+                list.push(user_taskset_info(&u));
+            }
+        }
+        Ok(Resp::json(200, &list))
+    }
+
+    /// `POST /tasksets {"upload_hash"}`: register an uploaded taskset zip.
+    async fn create_taskset(&self, req: &Req) -> Result<Resp> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Body {
+            upload_hash: String,
+        }
+        let p = self.principal(req).await?;
+        if req.body.len() > 4096 {
+            return Err(ApiError::too_large(4096));
+        }
+        let body: Body = serde_json::from_slice(&req.body)
+            .map_err(|e| ApiError::bad_request(format!("invalid request body: {e}")))?;
+        if !crate::shard::is_hash(&body.upload_hash) {
+            return Err(ApiError::bad_request(
+                "upload_hash must be 64 lower-case hex characters",
+            ));
+        }
+        let upload: UploadRecord = self
+            .kv_json(&format!("upload/{}", body.upload_hash))
+            .await?
+            .ok_or_else(|| ApiError::bad_request("upload_hash is unknown; upload first"))?;
+        if upload.owner_id != p.github_id {
+            return Err(ApiError::forbidden("upload_hash belongs to another user"));
+        }
+        if upload.kind != UploadKind::Taskset {
+            return Err(ApiError::bad_request(format!(
+                "upload_hash was uploaded as {}, not taskset",
+                upload.kind.as_str()
+            )));
+        }
+        let id = format!("u-{}", hex::encode(self.b.random_bytes(8)));
+        if self.load_user_taskset(&id).await?.is_some() {
+            return Err(ApiError::conflict("taskset id collision; retry"));
+        }
+        let now = rfc3339(self.b.now_s());
+        let mut u = UserTaskset {
+            id: id.clone(),
+            owner_id: p.github_id,
+            owner_login: p.login.clone(),
+            upload_hash: body.upload_hash.clone(),
+            status: TS_PACKING.into(),
+            error: None,
+            public: false,
+            title: None,
+            taskset: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        self.save_user_taskset(&u).await?;
+        let worker_url = self
+            .cfg
+            .worker_url
+            .clone()
+            .unwrap_or_else(|| req.origin.clone());
+        let inputs = json!({
+            "taskset_id": id,
+            "source": format!("blob:{}", body.upload_hash),
+            "results_url": format!("{worker_url}/internal/tasksets/{id}"),
+        });
+        if let Err(e) = self
+            .gh()
+            .dispatch(&self.cfg.taskset_workflow, &inputs)
+            .await
+        {
+            u.status = TS_FAILED.into();
+            u.error = Some("could not start packing; please retry".into());
+            u.updated_at = rfc3339(self.b.now_s());
+            let _ = self.save_user_taskset(&u).await;
+            return Err(e);
+        }
+        Ok(Resp::json(201, &json!({"id": id, "status": TS_PACKING})))
+    }
+
+    async fn get_taskset(&self, req: &Req, id: &str) -> Result<Resp> {
+        let p = self.principal(req).await?;
+        let u = self
+            .load_user_taskset(id)
+            .await?
+            .filter(|u| u.visible_to(p.github_id, p.is_admin))
+            .ok_or_else(|| ApiError::not_found("no such taskset"))?;
+        let mut out = serde_json::to_value(user_taskset_info(&u)).expect("json");
+        out["created_at"] = json!(u.created_at);
+        out["updated_at"] = json!(u.updated_at);
+        Ok(Resp::json(200, &out))
+    }
+
+    /// `POST /tasksets/:id/public {"public": bool}` (admins only).
+    async fn set_taskset_public(&self, req: &Req, id: &str) -> Result<Resp> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Body {
+            public: bool,
+        }
+        let p = self.principal(req).await?;
+        authz::require_admin(&p)?;
+        let body: Body = serde_json::from_slice(&req.body)
+            .map_err(|e| ApiError::bad_request(format!("invalid request body: {e}")))?;
+        let mut u = self
+            .load_user_taskset(id)
+            .await?
+            .ok_or_else(|| ApiError::not_found("no such taskset"))?;
+        if body.public && u.status != TS_READY {
+            return Err(ApiError::conflict(
+                "only a ready taskset can be made public",
+            ));
+        }
+        u.public = body.public;
+        u.updated_at = rfc3339(self.b.now_s());
+        self.save_user_taskset(&u).await?;
+        self.b.log(&format!(
+            "admin {} set {id} public={}",
+            p.github_id, u.public
+        ));
+        Ok(Resp::json(200, &json!({"id": u.id, "public": u.public})))
+    }
+
+    fn internal_taskset_id<'i>(&self, req: &Req, id: &'i str) -> Result<&'i str> {
+        self.internal_auth(req)?;
+        if !is_user_taskset_id(id) {
+            return Err(ApiError::bad_request("taskset id must be u-<16 hex>"));
+        }
+        Ok(id)
+    }
+
+    /// `GET /internal/tasksets/:id?github_id=N`: the taskset.json, only if
+    /// that user may use it (the workflow's own permission check).
+    async fn internal_get_taskset(&self, req: &Req, id: &str) -> Result<Resp> {
+        let id = self.internal_taskset_id(req, id)?;
+        let gid = query_get(&parse_query(&req.query), "github_id")
+            .and_then(|v| v.parse::<u64>().ok())
+            .ok_or_else(|| ApiError::bad_request("github_id is required"))?;
+        let u = self
+            .load_user_taskset(id)
+            .await?
+            .ok_or_else(|| ApiError::not_found("no such taskset"))?;
+        if u.status != TS_READY {
+            return Err(ApiError::conflict(format!("taskset is {}", u.status)));
+        }
+        if !u.usable_by(gid) {
+            return Err(ApiError::forbidden("this user may not use this taskset"));
+        }
+        Ok(Resp::json(200, u.taskset.as_ref().expect("ready")))
+    }
+
+    /// `POST /internal/tasksets/:id`: the taskset-pack outcome.
+    async fn internal_taskset_result(&self, req: &Req, id: &str) -> Result<Resp> {
+        let id = self.internal_taskset_id(req, id)?;
+        let mut u = self
+            .load_user_taskset(id)
+            .await?
+            .ok_or_else(|| ApiError::not_found("no such taskset"))?;
+        if u.status != TS_PACKING {
+            return Err(ApiError::conflict(format!(
+                "taskset is already {}",
+                u.status
+            )));
+        }
+        match parse_pack_result(&req.body, id)? {
+            PackResult::Ready(ts) => {
+                u.title = ts.title.clone();
+                u.taskset = Some(serde_json::to_value(&ts).expect("json"));
+                u.status = TS_READY.into();
+            }
+            PackResult::Failed(e) => {
+                u.error = Some(e);
+                u.status = TS_FAILED.into();
+            }
+        }
+        u.updated_at = rfc3339(self.b.now_s());
+        self.save_user_taskset(&u).await?;
+        Ok(Resp::json(200, &json!({"ok": true, "status": u.status})))
+    }
+
     // ---- uploads --------------------------------------------------------
 
     async fn upload(&self, req: &Req) -> Result<Resp> {
         let p = self.principal(req).await?;
         let kind = req
             .header("x-upload-kind")
-            .and_then(Mode::parse)
-            .ok_or_else(|| ApiError::bad_request("X-Upload-Kind must be agent or app"))?;
+            .and_then(UploadKind::parse)
+            .ok_or_else(|| ApiError::bad_request("X-Upload-Kind must be agent, app or taskset"))?;
         if req.body.len() > MAX_UPLOAD {
             return Err(ApiError::too_large(MAX_UPLOAD));
         }
@@ -467,18 +737,29 @@ impl<'a, B: Backend> App<'a, B> {
         if upload.owner_id != p.github_id {
             return Err(ApiError::forbidden("upload_hash belongs to another user"));
         }
-        if upload.kind != v.mode {
+        if upload.kind != UploadKind::from(v.mode) {
             return Err(ApiError::bad_request(format!(
                 "upload_hash was uploaded as {}, not {}",
                 upload.kind.as_str(),
                 v.mode.as_str()
             )));
         }
-        let tasksets = self.tasksets().await?;
-        let ts = tasksets
-            .iter()
-            .find(|t| t.name == v.taskset)
-            .ok_or_else(|| ApiError::bad_request("unknown taskset"))?;
+        let ts = if is_user_taskset_id(&v.taskset) {
+            // A user taskset: its owner's, or public (the workflow checks
+            // again with the Worker before using it).
+            let u = self
+                .load_user_taskset(&v.taskset)
+                .await?
+                .filter(|u| u.usable_by(p.github_id))
+                .ok_or_else(|| ApiError::bad_request("unknown taskset"))?;
+            user_taskset_info(&u)
+        } else {
+            self.tasksets()
+                .await?
+                .into_iter()
+                .find(|t| t.name == v.taskset)
+                .ok_or_else(|| ApiError::bad_request("unknown taskset"))?
+        };
         let names: Vec<String> = ts.stages.iter().map(|s| s.name.clone()).collect();
         let n = names.len() as u32;
         let (stages, stage_names) = match v.mode {

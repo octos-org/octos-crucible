@@ -1,0 +1,140 @@
+name: taskset-pack
+
+# Register a user-uploaded taskset (docs/api.md, POST /tasksets). The
+# Worker dispatches this with the id it allocated and the sealed upload (a
+# zip in the tasksets/hello-world/source layout: source.json + stage dirs).
+#
+#   pack   holds the platform key, runs no uploaded code (test files are
+#          only zipped, never executed here): opens the upload, checks it
+#          like `crucible taskset validate` (format, total time <= 18000 s,
+#          scorer offered to users), cuts every stage into an inputs and a
+#          tests blob, stores them sealed, and posts the resulting
+#          taskset.json (or the reason it was refused) to the Worker, which
+#          registers it in KV.
+#
+# The uploaded tree's file names and the rejection reason go only to the
+# Worker (the uploader sees them), never to the public log.
+#
+# Rules as eval.yml: top-level permissions are empty; inputs are validated
+# and reach shells only through env; actions pinned by SHA.
+
+on:
+  workflow_dispatch:
+    inputs:
+      taskset_id:
+        description: "u-<16 hex>"
+        type: string
+        required: true
+      source:
+        description: "blob:<sha256> of the sealed upload (a zip)"
+        type: string
+        required: true
+      results_url:
+        description: "<worker>/internal/tasksets/<taskset_id>; empty = do not report to the Worker"
+        type: string
+        default: ""
+
+run-name: taskset-pack ${{ inputs.taskset_id }}
+
+permissions: {}
+
+jobs:
+  pack:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      STORE: github:${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /Cargo.toml
+            /Cargo.lock
+            /crates/
+            /config/
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: crucible-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'crates/**/*.rs') }}
+          restore-keys: |
+            crucible-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-
+            crucible-${{ runner.os }}-
+
+      - name: Validate inputs
+        env:
+          IN_ID: ${{ inputs.taskset_id }}
+          IN_SOURCE: ${{ inputs.source }}
+          IN_RESULTS_URL: ${{ inputs.results_url }}
+        run: |
+          set -euo pipefail
+          [[ "$IN_ID" =~ ^u-[0-9a-f]{16}$ ]] || { echo "::error::taskset_id must be u-<16 hex>"; exit 1; }
+          [[ "$IN_SOURCE" =~ ^blob:[0-9a-f]{64}$ ]] || { echo "::error::source must be blob:<sha256>"; exit 1; }
+          worker=""
+          if [ -n "$IN_RESULTS_URL" ]; then
+            re='^(https://[A-Za-z0-9.-]+(:[0-9]{1,5})?)/internal/tasksets/(u-[0-9a-f]{16})$'
+            [[ "$IN_RESULTS_URL" =~ $re ]] && [ "${BASH_REMATCH[3]}" = "$IN_ID" ] \
+              || { echo "::error::results_url must be https://<worker>/internal/tasksets/$IN_ID"; exit 1; }
+            worker="${BASH_REMATCH[1]}"
+          fi
+          {
+            echo "ID=$IN_ID"
+            echo "HASH=${IN_SOURCE#blob:}"
+            echo "WORKER_URL=$worker"
+          } >> "$GITHUB_ENV"
+
+      - name: Build crucible
+        run: |
+          set -euo pipefail
+          rustup update stable --no-self-update >/dev/null
+          rustup default stable >/dev/null
+          cargo build --release --locked -p crucible-cli
+          mkdir -p "$RUNNER_TEMP/bin"
+          cp target/release/crucible "$RUNNER_TEMP/bin/crucible"
+          echo "CRUCIBLE=$RUNNER_TEMP/bin/crucible" >> "$GITHUB_ENV"
+
+      - name: Open, validate and pack
+        env:
+          CRUCIBLE_AGE_KEY: ${{ secrets.CRUCIBLE_AGE_KEY }}
+          CRUCIBLE_WORKER_TOKEN: ${{ secrets.CRUCIBLE_WORKER_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          t="$RUNNER_TEMP/pack"
+          mkdir -p "$t"
+          "$CRUCIBLE" get --store "$STORE" "$HASH" --out "$t/upload.sealed"
+          "$CRUCIBLE" open --identity-env CRUCIBLE_AGE_KEY --in "$t/upload.sealed" --out "$t/upload.zip"
+          rm -f "$t/upload.sealed"
+          # The log names the uploader's files: kept off the public log.
+          if ! env -u CRUCIBLE_WORKER_TOKEN "$CRUCIBLE" taskset pack --zip "$t/upload.zip" --name "$ID" \
+              --keys config/keys.json --store "$STORE" --out "$t/taskset.json" 2> "$t/pack.log"; then
+            echo "::error::the taskset was refused (the reason goes to the uploader)"
+            if [ -n "$WORKER_URL" ]; then
+              reason=$(grep '^crucible: ' "$t/pack.log" | tail -n1 | sed 's/^crucible: //')
+              "$CRUCIBLE" taskset report --worker-url "$WORKER_URL" --id "$ID" --error "${reason:-packing failed}"
+            fi
+            touch "$t/reported"
+            exit 1
+          fi
+          jq -c '{name, total_time_limit_s, stages: (.stages | length)}' "$t/taskset.json"
+          if [ -n "$WORKER_URL" ]; then
+            "$CRUCIBLE" taskset report --worker-url "$WORKER_URL" --id "$ID" --taskset "$t/taskset.json"
+          fi
+          touch "$t/reported"
+
+      - name: Report failure to the Worker
+        if: failure() && env.WORKER_URL != ''
+        env:
+          CRUCIBLE_WORKER_TOKEN: ${{ secrets.CRUCIBLE_WORKER_TOKEN }}
+        run: |
+          [ -f "$RUNNER_TEMP/pack/reported" ] && exit 0
+          [ -x "${CRUCIBLE:-}" ] || exit 0
+          "$CRUCIBLE" taskset report --worker-url "$WORKER_URL" --id "$ID" --error "packing failed on the platform side; please retry"

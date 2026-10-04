@@ -6,18 +6,24 @@ import { Decrypter, generateX25519Identity, identityToRecipient } from "age-encr
 import type { Backend } from "../src/api";
 import { keyIdOf } from "../src/crypto";
 import { currentKey } from "../src/keys";
-import { resolveKey, submitEval } from "../src/submit";
+import { resolveKey, submitEval, submitTaskset } from "../src/submit";
 import type { CreateEval } from "../src/types";
 import { emptyForm, type FormInput } from "../src/validate";
 
 function fakeBackend(pub: { key_id: string; public_key: string }) {
-  const calls: { uploads: Uint8Array[]; evals: CreateEval[] } = { uploads: [], evals: [] };
+  const calls: { uploads: Uint8Array[]; kinds: string[]; evals: CreateEval[]; tasksets: string[] } = {
+    uploads: [],
+    kinds: [],
+    evals: [],
+    tasksets: [],
+  };
   const b: Backend = {
     me: async () => ({ github_id: 1, login: "t", is_admin: false }),
     pubkey: async () => pub,
     tasksets: async () => [],
-    upload: async (_k, sealed) => {
+    upload: async (k, sealed) => {
       calls.uploads.push(sealed);
+      calls.kinds.push(k);
       return { hash: "h".repeat(64) };
     },
     createEval: async (body) => {
@@ -30,6 +36,11 @@ function fakeBackend(pub: { key_id: string; public_key: string }) {
     tokens: async () => [],
     createToken: async () => ({ id: "0".repeat(16), name: "cli", created_at: "", token: "crt_" }),
     deleteToken: async () => {},
+    registerTaskset: async (h) => {
+      calls.tasksets.push(h);
+      return { id: "u-0123456789abcdef", status: "packing" };
+    },
+    setTasksetPublic: async (id, on) => ({ id, public: on }),
   };
   return { b, calls };
 }
@@ -108,5 +119,23 @@ describe("submitEval", () => {
     expect((await resolveKey(b)).key).toEqual(currentKey());
     b.pubkey = async () => ({ key_id: "deadbeefdeadbeef", public_key: currentKey().public_key });
     await expect(resolveKey(b)).rejects.toThrow();
+  });
+});
+
+describe("submitTaskset", () => {
+  it("uploads the zip sealed as kind taskset, then registers that upload", async () => {
+    const id = await generateX25519Identity();
+    const rec = await identityToRecipient(id);
+    const { b, calls } = fakeBackend({ key_id: await keyIdOf(rec), public_key: rec });
+    const zip = new TextEncoder().encode("PK-PLAINTEXT-TESTS");
+    const res = await submitTaskset(b, zip);
+    expect(res).toEqual({ id: "u-0123456789abcdef", status: "packing" });
+    expect(calls.kinds).toEqual(["taskset"]);
+    expect(calls.tasksets).toEqual(["h".repeat(64)]);
+    expect(new TextDecoder().decode(calls.uploads[0])).not.toContain("PLAINTEXT");
+    const d = new Decrypter();
+    d.addIdentity(id);
+    const f = calls.uploads[0];
+    expect(await d.decrypt(f.subarray(f.indexOf(0x0a) + 1))).toEqual(zip);
   });
 });

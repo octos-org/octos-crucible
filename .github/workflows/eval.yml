@@ -148,6 +148,8 @@ jobs:
           IN_OWNER: ${{ inputs.owner }}
           IN_OPTIONS: ${{ inputs.options }}
           IN_WORKER_URL: ${{ vars.CRUCIBLE_WORKER_URL }}
+          # Only to fetch a user taskset (u-...) the submitter may use.
+          CRUCIBLE_WORKER_TOKEN: ${{ secrets.CRUCIBLE_WORKER_TOKEN }}
         run: |
           set -euo pipefail
           # The agent source may be a signed URL: keep it out of the log.
@@ -166,6 +168,15 @@ jobs:
         with:
           name: crucible-bin
           path: ${{ runner.temp }}/bin/crucible
+          retention-days: 1
+          if-no-files-found: error
+
+      # The taskset.json every later job reads (a user taskset is not in the
+      # repository; `crucible plan` fetched it from the Worker).
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: taskset
+          path: tasksets/${{ steps.plan.outputs.taskset }}/taskset.json
           retention-days: 1
           if-no-files-found: error
 
@@ -211,6 +222,11 @@ jobs:
         with:
           name: crucible-bin
           path: ${{ runner.temp }}/bin
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: taskset
+          path: tasksets/${{ needs.setup.outputs.taskset }}
 
       - name: Prepare
         run: |
@@ -387,6 +403,11 @@ jobs:
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
+          name: taskset
+          path: tasksets/${{ needs.setup.outputs.taskset }}
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
           pattern: gen-r*
           merge-multiple: true
           path: ${{ runner.temp }}/results
@@ -471,6 +492,11 @@ jobs:
         with:
           name: crucible-bin
           path: ${{ runner.temp }}/bin
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: taskset
+          path: tasksets/${{ needs.setup.outputs.taskset }}
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:

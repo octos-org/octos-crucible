@@ -117,6 +117,29 @@ impl Worker {
         Ok(())
     }
 
+    /// `GET /internal/tasksets/:id?github_id=N`: a user taskset's
+    /// taskset.json, if `github_id` may use it (owner, or public).
+    pub async fn get_user_taskset(&self, id: &str, github_id: u64) -> Result<Vec<u8>> {
+        self.expect_ok(
+            Method::GET,
+            &format!("/internal/tasksets/{id}?github_id={github_id}"),
+            None,
+        )
+        .await
+        .with_context(|| format!("taskset {id} for user {github_id}"))
+    }
+
+    /// `POST /internal/tasksets/:id`: the outcome of `taskset-pack`.
+    pub async fn taskset_result(&self, id: &str, body: &serde_json::Value) -> Result<()> {
+        self.expect_ok(
+            Method::POST,
+            &format!("/internal/tasksets/{id}"),
+            Some(serde_json::to_vec(body)?),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// `POST /internal/status/:id`.
     pub async fn status(&self, eval_id: &str, status: &str) -> Result<()> {
         let body = serde_json::to_vec(&serde_json::json!({ "status": status }))?;

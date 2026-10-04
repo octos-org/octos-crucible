@@ -65,15 +65,38 @@ GitHub 回调。换取 token、读取用户之后，用户的 GitHub token 立�
 ### `GET /pubkey`（无需登录）
 → `{"key_id": "1ffa702796eb5ee8", "public_key": "age1..."}`，来自 `config/keys.json` 的当前公钥（编译时嵌入）。`key_id` = SHA-256(public_key) 的前 16 个十六进制字符。
 
-### `GET /tasksets`（无需登录）
+### `GET /tasksets`（无需登录；带令牌时多返回用户上传的题目包）
 → `[{"name": "github-full", "version": "1.0", "stages": [{"name": "stage-1", "time_limit_s": 3600, "total": 30}]}]`
 
 数据读自仓库 `EVAL_REF`（默认 main）分支的 `tasksets/*/taskset.json`，在 KV 中缓存 5 分钟。`version` 取文件里的 `version` 字段，没有时用 `git-<blob sha 前 12 位>`。`total` 取 `expected_total`，可能为 `null`。目录名必须等于 `name`，不合规的题目包会被跳过。
 
+之后是用户上传的题目包（见下节），按上传时间倒序，最多 50 个：匿名只看到已公开且可用的；带令牌时另有自己上传的（任何状态）；管理员加 `?all=1` 看到全部。令牌无效时按匿名处理。上传的题目包多几个字段：
+`{"name": "u-0123456789abcdef", "version": "upload", "stages": [...], "title": "<source.json 里的 name>", "owner_login": "...", "public": false, "status": "packing|ready|failed", "error"?: "..."}`。`stages` 在 `ready` 之前为空。
+
+## 用户上传的题目包
+
+zip 的格式同 `tasksets/hello-world/source`（`source.json` + 各阶段目录），检查规则即 `crucible taskset validate`：格式（未知字段拒绝）、阶段 id、每阶段的输入与测试都存在且不重叠、无符号链接、各阶段限时之和 ≤ 总限时 ≤ 18000 s、打分器只能是 `playwright`（产出 `web-app`）。
+
+### `POST /tasksets`
+`{"upload_hash": "<POST /uploads 返回的 hash，X-Upload-Kind: taskset>"}` → `201 {"id": "u-<16 hex>", "status": "packing"}`
+
+`upload_hash` 必须是本人以 `taskset` 类型上传的。Worker 写入 KV `tasksets/<id>`（`packing`，私有），并触发 `TASKSET_WORKFLOW`（默认 `taskset-pack.yml`），参数：`taskset_id`、`source` = `blob:<upload_hash>`、`results_url` = `<worker>/internal/tasksets/<id>`。触发失败时记为 `failed`，接口返回 502。
+
+workflow（持私钥，不运行上传的代码）解密 zip、检查、按阶段拆成 inputs / tests 两个块分别封存，把 `taskset.json`（`name` 为 id，`title` 为原名）回传 Worker；检查不通过时回传原因（只给上传者看，不进公开日志）。
+
+### `GET /tasksets/:id`
+仅上传者、管理员，或已公开的题目包可见，否则 404。→ 上面列表里的一项，外加 `created_at`、`updated_at`。
+
+### `POST /tasksets/:id/public`（仅管理员）
+`{"public": true|false}` → `{"id", "public"}`。只有 `ready` 的题目包能设为公开（否则 409）。
+
+### 使用
+`POST /evals` 的 `taskset` 可以填 `u-...`：必须 `ready`，且是本人上传或已公开，否则 400 `unknown taskset`。workflow（eval.yml / score.yml 的 plan 步骤）用 `GET /internal/tasksets/:id?github_id=<owner>` 取 `taskset.json`，Worker 按同样规则再查一次提交者是否有权使用。
+
 ## 上传
 
 ### `POST /uploads`
-- 请求头：`Authorization`，`X-Upload-Kind: agent|app`，`Content-Type: application/octet-stream`
+- 请求头：`Authorization`，`X-Upload-Kind: agent|app|taskset`，`Content-Type: application/octet-stream`
 - 请求体：浏览器封好的 envelope 字节，不超过 25 × 1024 × 1024 字节。
 - Worker 只检查：内容是 crucible envelope 头、`key_id` 是当前公钥、头后面有密文。
 - 计算 SHA-256 后存为 GitHub Release asset：预发布 release `blobs-NN`，NN = 哈希第一个字节 >> 3（00…31），asset 名为完整的十六进制哈希。release 不存在时会创建为 prerelease。（规则与 crucible-store 一致。）
@@ -158,6 +181,8 @@ workflow 通过 `/internal/status` 上报的精确状态优先。估计值只能
 | `GET /internal/cred/:id` | → `200 application/octet-stream`：KV 中原样保存的 envelope 字节（即 `cred_envelope` 经 base64 解码后的内容）。不存在或已过期返回 404。`crucible cred open` 同时接受原始字节和 base64。 |
 | `DELETE /internal/cred/:id` | → 204（幂等）。 |
 | `POST /internal/status/:id` | `{"status": "building" \| "running:<阶段名>" \| "scoring" \| "failed"}` → `200 {"ok":true,"status"}`。评测已结束时返回 409。 |
+| `GET /internal/tasksets/:id?github_id=N` | `:id` 为 `u-<16 hex>`。→ 该题目包的 `taskset.json`；未就绪 409；该用户既不是上传者、题目包也未公开时 403。 |
+| `POST /internal/tasksets/:id` | taskset-pack 的结果：`{"status": "ready", "taskset": {...}}`（`name` 必须等于 id，打分器必须是用户可用的，校验通过）或 `{"status": "failed", "error": "<≤500 字符>"}`。只接受一次（之后 409）。 |
 | `POST /internal/results/:id` | 请求体是一个 crucible-core `Manifest`（`eval_id` 必须与 URL 一致；`download` 就是 Manifest 自带的字段，由 `crucible download-zip` 写入），外加两个可选的顶层字段：`download: {"sha256": "<密码 zip 的哈希>"}`，以及 `status`（默认 `done`；如果只是回传部分结果、run 还在继续，可填 `running:<阶段>` 或 `scoring`）。不超过 2 MiB。Worker 存下 manifest（去掉这两个字段），更新状态；进入终态时删除凭据。→ `200 {"ok":true,"status"}` |
 
 ## 触发参数（workflow_dispatch）
@@ -192,7 +217,8 @@ workflow 通过 `/internal/status` 上报的精确状态优先。估计值只能
 | `cred/<eval_id>` | 凭据 envelope 字节 | 24 小时；run 结束时删除 |
 | `evals/<eval_id>` | 评测记录（含 manifest），key metadata 是列表摘要 | 永久 |
 | `owner/<github_id>/<eval_id>` | 空值，key metadata 是列表摘要 | 永久 |
-| `upload/<sha256>` | `{owner_id, kind, size, created_at}` | 永久 |
+| `upload/<sha256>` | `{owner_id, kind, size, created_at}`，kind 为 `agent`/`app`/`taskset` | 永久 |
+| `tasksets/<u-id>` | 用户题目包 `{id, owner_id, owner_login, upload_hash, status, error, public, title, taskset, created_at, updated_at}`；key metadata 为 `{owner_id, status, public, created_at}` | 永久 |
 | `ban/<github_id>` | `{by, at, reason}` | 永久 |
 | `token/<id>` | `{owner_id, login, name, hash, created_at}`（hash = SHA-256(令牌)） | 撤销前永久 |
 | `tokens/<github_id>/<id>` | 空值，key metadata 是 `{id, name, created_at}` | 撤销前永久 |
@@ -218,7 +244,7 @@ workflow 通过 `/internal/status` 上报的精确状态优先。估计值只能
 | `GITHUB_REPO` | var | `octos-org/octos-crucible` |
 | `ADMIN_GITHUB_IDS` | var | 逗号分隔的 GitHub 数字 id |
 | `WORKER_URL` | var，可选 | `results_url` 的前缀，默认取请求的 origin |
-| `EVAL_WORKFLOW` / `SCORE_WORKFLOW` / `EVAL_REF` | var，可选 | 默认分别为 `eval.yml` / `score.yml` / `main` |
+| `EVAL_WORKFLOW` / `SCORE_WORKFLOW` / `TASKSET_WORKFLOW` / `EVAL_REF` | var，可选 | 默认分别为 `eval.yml` / `score.yml` / `taskset-pack.yml` / `main` |
 | `GITHUB_CLIENT_ID`、`GITHUB_CLIENT_SECRET` | secret | GitHub OAuth App |
 | `GITHUB_TOKEN` | secret | 细粒度 token，只授权本仓库 |
 | `SESSION_HMAC_KEY` | secret | ≥ 32 字节随机值 |

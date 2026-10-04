@@ -45,11 +45,23 @@ pub struct StageInfo {
     pub total: Option<u32>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TasksetInfo {
     pub name: String,
     pub version: String,
     pub stages: Vec<StageInfo>,
+    /// User-uploaded tasksets only (`name` is then their `u-...` id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_login: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public: Option<bool>,
+    /// `packing | ready | failed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 pub struct GitHub<'a, B: Backend> {
@@ -444,6 +456,7 @@ pub fn parse_taskset_file(dir: &str, file: &Value) -> Option<TasksetInfo> {
                 total: s.expected_total,
             })
             .collect(),
+        ..Default::default()
     })
 }
 
