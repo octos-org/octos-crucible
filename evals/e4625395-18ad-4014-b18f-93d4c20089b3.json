@@ -1,0 +1,116 @@
+{
+  "schema": 2,
+  "eval_id": "e4625395-18ad-4014-b18f-93d4c20089b3",
+  "created_at": "2026-10-04T18:30:32Z",
+  "taskset": "astro-practice",
+  "agent": {
+    "name": "uploaded-output",
+    "version": "-"
+  },
+  "model": "",
+  "mode": "app",
+  "owner": {
+    "github_id": 58540850,
+    "login": "BH3GEI"
+  },
+  "score_public": true,
+  "run": {
+    "repository": "octos-org/octos-crucible",
+    "run_id": 37224600334,
+    "run_attempt": 1
+  },
+  "replicas": [
+    {
+      "replica": 1,
+      "stages": [
+        {
+          "stage": "l4",
+          "score": {
+            "status": "scored",
+            "score": 3499.91386,
+            "items": [
+              {
+                "name": "sum_best_scores",
+                "score": 3812.730201
+              },
+              {
+                "name": "required_penalty",
+                "score": -300.0
+              },
+              {
+                "name": "uniformity_penalty",
+                "score": -12.816341
+              },
+              {
+                "name": "report_settlement",
+                "score": 0.0
+              },
+              {
+                "name": "observation_request_reward",
+                "score": 0.0
+              }
+            ]
+          },
+          "wall_s": null,
+          "usage": {
+            "requests": 0,
+            "prompt_tokens": 0,
+            "cached_tokens": 0,
+            "completion_tokens": 0,
+            "reasoning_tokens": 0
+          },
+          "cost_usd": 0.0,
+          "output": {
+            "sha256": "888256c15d416db5fbf7e4a95f035b940ac8a3b8f0a3c54e72759b1a0929c6b4",
+            "key_id": "1ffa702796eb5ee8"
+          }
+        }
+      ]
+    }
+  ],
+  "scoring": {
+    "aggregate": {
+      "items": "sum",
+      "stages": "sum"
+    },
+    "display": {
+      "stage": {
+        "name": "观测得分",
+        "unit": "分",
+        "direction": "higher",
+        "decimals": 2,
+        "format": "number"
+      },
+      "total": {
+        "name": "四卡总分",
+        "unit": "分",
+        "direction": "higher",
+        "decimals": 2,
+        "format": "number"
+      }
+    },
+    "plugins": [
+      {
+        "kind": "scorer",
+        "name": "astro-survey",
+        "version": "2"
+      },
+      {
+        "kind": "runner",
+        "name": "astro-v4",
+        "version": "1"
+      },
+      {
+        "kind": "runner",
+        "name": "workdir",
+        "version": "1"
+      },
+      {
+        "kind": "packager",
+        "name": "files",
+        "version": "1"
+      }
+    ]
+  },
+  "total_score": 3499.9139
+}
