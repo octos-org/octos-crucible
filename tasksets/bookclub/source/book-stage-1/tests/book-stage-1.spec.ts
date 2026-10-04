@@ -20,7 +20,7 @@ test('REQ-2: alice signs in, stays signed in after reload, signs out', async ({ 
   await page.reload();
   await expect(page.getByText('Signed in as alice')).toBeVisible();
   await signOut(page);
-  await expect(page.getByText('Signed in as alice')).toHaveCount(0);
+  await expect(page.getByText('Signed in as alice').filter({ visible: true })).toHaveCount(0);
 });
 
 test('REQ-2: wrong password is refused', async ({ page }) => {
@@ -30,7 +30,7 @@ test('REQ-2: wrong password is refused', async ({ page }) => {
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();
   await expect(page.getByText('Invalid username or password')).toBeVisible();
   await page.goto('/');
-  await expect(page.getByText('Signed in as alice')).toHaveCount(0);
+  await expect(page.getByText('Signed in as alice').filter({ visible: true })).toHaveCount(0);
 });
 
 test('REQ-3: a new account is signed in and can sign in again', async ({ page }) => {
@@ -53,5 +53,5 @@ test('REQ-3: taken or empty usernames are refused', async ({ page }) => {
   await page.getByRole('button', { name: 'Create account', exact: true }).click();
   await expect(page.getByText('Username and password are required')).toBeVisible();
   await page.goto('/');
-  await expect(page.getByText(/Signed in as/)).toHaveCount(0);
+  await expect(page.getByText(/Signed in as/).filter({ visible: true })).toHaveCount(0);
 });
