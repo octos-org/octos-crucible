@@ -43,6 +43,10 @@ on:
         description: 'JSON {"replica": [1, 2, ...]}'
         type: string
         default: '{"replica": [1]}'
+      runs_on:
+        description: 'runner labels, a JSON array (the caller resolves CRUCIBLE_SANDBOX_RUNNER; docs/self-hosted.md)'
+        type: string
+        default: '["ubuntu-latest"]'
     secrets:
       run_key:
         description: "the handoff's one-run key"
@@ -53,7 +57,7 @@ permissions: {}
 jobs:
   tests:
     name: tests r${{ matrix.replica }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
     timeout-minutes: 360
     permissions: {}
     strategy:
@@ -63,10 +67,23 @@ jobs:
     env:
       H: ${{ github.workspace }}/handoff
     steps:
+      # A self-hosted machine keeps its workspace between jobs.
+      - name: Clear the workspace
+        run: rm -rf "$H"
+
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: ${{ inputs.handoff }}
           path: ${{ github.workspace }}/handoff
+
+      # Check the machine and remove what an earlier job may have left
+      # (no-op on a fresh GitHub-hosted machine).
+      - name: Machine preflight and cleanup
+        run: |
+          set -euo pipefail
+          echo "runner: $RUNNER_NAME ($RUNNER_ENVIRONMENT)"
+          bash "$H/tools/sandbox-net.sh" preflight
+          bash "$H/tools/sandbox-net.sh" clean
 
       - name: Prepare the plugins
         run: |
@@ -100,7 +117,8 @@ jobs:
           RUN_KEY: ${{ secrets.run_key }}
           REPLICA: ${{ matrix.replica }}
           CRUCIBLE_SCORER_FIREWALL: "1"
-          CRUCIBLE_PRUNE_BUILD_CACHE: "1"
+          # Pruning clears the whole machine's build cache: fresh machines only.
+          CRUCIBLE_PRUNE_BUILD_CACHE: ${{ runner.environment == 'github-hosted' && '1' || '0' }}
         run: |
           set -euo pipefail
           mkdir -p "$H/results" "$RUNNER_TEMP/scores"
@@ -125,3 +143,9 @@ jobs:
           path: ${{ runner.temp }}/scores
           retention-days: 1
           if-no-files-found: warn
+
+      - name: Cleanup
+        if: always()
+        run: |
+          if [ -f "$H/tools/sandbox-net.sh" ]; then bash "$H/tools/sandbox-net.sh" clean || true; fi
+          rm -rf "$H"
