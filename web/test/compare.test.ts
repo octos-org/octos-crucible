@@ -60,7 +60,7 @@ describe("evalStats", () => {
     const s = evalStats(m, ["s1"]);
     expect(s.replicas).toBe(2);
     expect(s.score!.mean).toBeCloseTo(0.875);
-    expect(s.stages.s1).toMatchObject({ passed: 7, total: 8 });
+    expect(s.stages.s1).toMatchObject({ sum: 7, max: 8 });
     expect(s.stages.s1.score!.mean).toBeCloseTo(0.875);
     expect(s.wall_s!.mean).toBe(200);
     expect(s.requests!.mean).toBe(10);
@@ -82,3 +82,29 @@ describe("parseIds", () => {
     expect(parseIds("")).toEqual([]);
   });
 });
+
+describe("result v2 with a display snapshot", () => {
+  const v2 = (stage: string, score: number): StageEntry => ({ stage, score: { status: "scored", score }, wall_s: 1, cost_usd: 0 });
+  const astro = (...scores: number[]): Partial<Manifest> => ({
+    taskset: "astro-practice",
+    scoring: {
+      aggregate: { stages: "sum" },
+      display: { stage: { name: "观测得分", decimals: 2 }, total: { name: "四卡总分", decimals: 2 } },
+      plugins: [],
+    },
+    replicas: [{ replica: 1, stages: scores.map((x, i) => v2(`l${i + 1}`, x)) }],
+  });
+
+  it("sums raw scores and keeps them unscaled", () => {
+    const s = evalStats(astro(4458.556, -10), ["l1", "l2"]);
+    expect(s.score!.mean).toBeCloseTo(4448.556);
+    expect(s.stages.l1.score!.mean).toBe(4458.556);
+    expect(s.formats.total.name).toBe("四卡总分");
+  });
+
+  it("direction decides good and bad", () => {
+    expect(delta(4000, 4458.56, "up")!.tone).toBe("good");
+    expect(delta(4000, 4458.56, "down")!.tone).toBe("bad");
+  });
+});
+

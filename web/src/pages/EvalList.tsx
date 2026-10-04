@@ -87,7 +87,7 @@ export function EvalList() {
                         </div>
                       </div>
                       <div class="item-side">
-                        {typeof e.total_score === "number" && <span class="score">{fmtScore(e.total_score)}</span>}
+                        {typeof e.total_score === "number" && <span class="score">{fmtScore(e.total_score, e.display)}</span>}
                         <StatusBadge status={e.status} />
                       </div>
                     </a>

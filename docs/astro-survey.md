@@ -21,7 +21,7 @@
 | 一张练习卡 | 一个阶段（`l1`–`l4`） |
 | 卡片 `card.md` | 阶段输入（`inputs`） |
 | 卡片 `config/` `public/` `truth/`（真值、天气、事件） | 测试材料（`tests`，只有打分容器能看到） |
-| 引擎的 `score_report.total`（连续分） | `passed / total` = 毫分 / 10,000 分（见「计分」） |
+| 引擎的 `score_report.total`（连续分） | 阶段 `score`（result v2，原样，见「计分」） |
 
 ## 打分器 `scorers/astro-survey`
 
@@ -36,12 +36,16 @@
 
 ### 计分
 
-`ScoreResult` 只有整数 `passed / total`，manifest 的总分是 Σpassed / Σtotal（0–1）。所以：
+打分器输出 result v2（`docs/scorer-contract.md` §4），不做任何换算：
 
-- `passed = clamp(round(S × 1000), 0, 10,000,000)`，`total = 10,000,000`（`expected_total` 同值）。S 是引擎的 `score_report.total`；
-- `detail` 保留原始分：`survey score 4458.556163 (survey_complete)`；
-- 有分数就是 `failed`（意为「已计分」），只有到上限才是 `passed`；agent 没能启动/初始化：`failed` 0 分；引擎没产出：`system_error`；
-- public 可见性下，`tests` 列出 5 个分项（sum_best_scores、required_penalty、uniformity_penalty、report_settlement、observation_request_reward）。
+- `score` = 引擎的 `score_report.total`（连续分，可为负），不设 `max`、不填 `passed`；
+- `items` = 5 个分项（sum_best_scores、required_penalty、uniformity_penalty、report_settlement、observation_request_reward），名字由打分器代码固定，hidden 可见性下也保留；
+- `detail` = 引擎的结束原因（如 `survey_complete`）；
+- agent 没能启动/初始化、或 zip 不是有效的 observer 项目：`scored`，0 分；引擎没产出：`error`（system）。
+
+题目包 `astro-practice`（`schema: 2`）声明 `aggregate: {"stages": "sum"}`（总分 = 各卡得分之和，暂定）和 `display`：阶段分"观测得分"、总分"四卡总分"，单位"分"，越高越好，2 位小数。网页、`crucible status` 按此显示，例如示例 agent 在 L1 得 `4458.56 分`。
+
+P1 之前的评测（毫分 / 10,000,000 存为 `passed / total`）不改写，仍按旧的比例总分显示。
 
 ### 限制
 

@@ -207,7 +207,8 @@ export function Submit() {
               <option value="">{ts ? "请选择" : "先选择题目包"}</option>
               {ts?.stages.map((s, i) => (
                 <option value={String(i + 1)}>
-                  {s.name}（{s.total} 项测试）
+                  {s.name}
+                  {typeof s.total === "number" ? `（${s.total} 项测试）` : ""}
                 </option>
               ))}
             </select>

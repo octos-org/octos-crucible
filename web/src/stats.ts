@@ -1,6 +1,6 @@
 // Statistics and formatting for results. Pure functions, unit tested.
 
-import type { ReplicaEntry, StageEntry, UsageTotals } from "./types";
+import type { Aggregate, Display, Manifest, ReplicaEntry, ScoreFormat, StageEntry, StageScore, UsageTotals } from "./types";
 
 export interface Summary {
   n: number;
@@ -21,15 +21,93 @@ export function summarize(values: (number | null | undefined)[]): Summary | null
   return { n, mean, std, min: Math.min(...xs), max: Math.max(...xs) };
 }
 
-/** Whether a stage has a score that says something about the agent. */
-export function isScored(s: StageEntry): boolean {
-  const st = s.score?.status;
-  return (st === "passed" || st === "failed") && (s.score?.total ?? 0) > 0;
+// --- scores (result v2; docs/plugins.md §7) ---
+
+/** A stage score in the v2 shape, whatever format it was stored in. */
+export interface Score {
+  status: "scored" | "error";
+  error: "system" | "rejected" | null;
+  score: number | null;
+  max: number | null;
+  passed: boolean | null;
 }
 
-/** Fraction of tests passed, or null when not scored. */
-export function stageScore(s: StageEntry): number | null {
-  return isScored(s) ? s.score!.passed / s.score!.total : null;
+/**
+ * Read a stored stage score. Old scores (`passed|failed|system_error|rejected`
+ * with passed/total) are converted by the fixed table of docs/plugins.md §7.1,
+ * the same as crucible-core: passed/failed → scored, score = passed, max =
+ * total; system_error / rejected → error.
+ */
+export function readScore(sc: StageScore | null | undefined): Score | null {
+  if (!sc || typeof sc !== "object") return null;
+  const num = (x: unknown) => (typeof x === "number" && Number.isFinite(x) ? x : null);
+  switch (sc.status) {
+    case "passed":
+    case "failed":
+      return { status: "scored", error: null, score: num(sc.passed) ?? 0, max: num(sc.total) ?? 0, passed: sc.status === "passed" };
+    case "system_error":
+      return { status: "error", error: "system", score: null, max: null, passed: null };
+    case "rejected":
+      return { status: "error", error: "rejected", score: null, max: null, passed: null };
+    case "scored":
+      return { status: "scored", error: null, score: num(sc.score) ?? 0, max: num(sc.max), passed: typeof sc.passed === "boolean" ? sc.passed : null };
+    case "error":
+      return { status: "error", error: sc.error ?? "system", score: null, max: null, passed: null };
+    default:
+      return null;
+  }
+}
+
+/** Display of manifests without a `scoring` snapshot: test counts, ratio total as %. */
+export const LEGACY_STAGE: ScoreFormat = { format: "fraction", decimals: 0, direction: "higher" };
+export const LEGACY_TOTAL: ScoreFormat = { format: "percent", decimals: 1, direction: "higher", min: 0, max: 1 };
+
+export interface Formats {
+  stage: ScoreFormat;
+  total: ScoreFormat;
+  aggregate: Aggregate;
+}
+
+/** The manifest's own snapshot, or the old defaults. */
+export function formatsOf(m: Partial<Manifest> | null | undefined): Formats {
+  const sc = m?.scoring;
+  const d: Display = sc?.display ?? {};
+  return {
+    stage: d.stage ?? LEGACY_STAGE,
+    total: d.total ?? LEGACY_TOTAL,
+    aggregate: sc?.aggregate ?? { stages: "ratio" },
+  };
+}
+
+/** Same rules as crucible-core `ScoreFormat::fmt`. */
+export function fmtValue(f: ScoreFormat, v: number | null | undefined, max?: number | null): string {
+  if (typeof v !== "number" || !Number.isFinite(v)) return "—";
+  const d = Math.min(6, Math.max(0, f.decimals ?? 2));
+  if (f.format === "percent") return `${(v * 100).toFixed(d)}%`;
+  const s = f.format === "fraction" && typeof max === "number" ? `${v.toFixed(d)}/${max.toFixed(d)}` : v.toFixed(d);
+  return f.unit ? `${s} ${f.unit}` : s;
+}
+
+/** Whether a stage has a score that says something about the agent. */
+export function isScored(s: StageEntry): boolean {
+  return readScore(s.score)?.status === "scored";
+}
+
+/**
+ * The number a stage contributes to statistics: for test counts (fraction
+ * display) the share passed, score / max; otherwise the score itself.
+ * Null when not scored.
+ */
+export function stageScore(s: StageEntry, f: ScoreFormat = LEGACY_STAGE): number | null {
+  const r = readScore(s.score);
+  if (!r || r.status !== "scored") return null;
+  if (f.format === "fraction") return r.max && r.max > 0 ? r.score! / r.max : null;
+  return r.score;
+}
+
+/** How such a stage number is shown: share as %, else by the format. */
+export function fmtStageNumber(f: ScoreFormat, x: number): string {
+  return f.format === "fraction" ? fmtPct(x) : fmtValue(f, x);
 }
 
 export function usageOf(s: StageEntry): UsageTotals {
@@ -64,10 +142,11 @@ export function addUsage(a: UsageTotals, b: UsageTotals): UsageTotals {
 
 export interface ReplicaTotals {
   replica: number;
-  /** passed/total over all stages; null when any stage is unscored. */
+  /** By the aggregate (crucible-core `total_score`); null when any stage is unscored. */
   score: number | null;
-  passed: number;
-  total: number;
+  /** Σscore and Σmax of the scored stages. */
+  sum: number;
+  max: number;
   wall_s: number | null;
   usage: UsageTotals;
   /** null when any stage's price is unknown. */
@@ -82,18 +161,43 @@ const ZERO: UsageTotals = {
   reasoning_tokens: 0,
 };
 
-export function replicaTotals(r: ReplicaEntry): ReplicaTotals {
+/** Total of one replica's scored stages by the aggregate (docs/plugins.md §8). */
+export function combineStages(vals: { stage: string; score: number; max: number | null }[], a: Aggregate): number | null {
+  const mode = a.stages ?? "ratio";
+  if (mode === "ratio") {
+    const max = vals.reduce((x, v) => x + (v.max ?? 0), 0);
+    return max > 0 ? vals.reduce((x, v) => x + v.score, 0) / max : null;
+  }
+  const xs: { v: number; w: number }[] = [];
+  for (const v of vals) {
+    let x = v.score;
+    if (a.normalize && mode !== "sum") {
+      if (!v.max || v.max <= 0) continue;
+      x = v.score / v.max;
+    }
+    xs.push({ v: x, w: a.weights?.[v.stage] ?? 0 });
+  }
+  if (!xs.length) return null;
+  if (mode === "mean") return xs.reduce((s, x) => s + x.v, 0) / xs.length;
+  if (mode === "weighted") return xs.reduce((s, x) => s + x.v * x.w, 0);
+  return xs.reduce((s, x) => s + x.v, 0);
+}
+
+export function replicaTotals(r: ReplicaEntry, agg: Aggregate = { stages: "ratio" }): ReplicaTotals {
   const stages = r.stages ?? [];
-  let passed = 0;
-  let total = 0;
+  let sum = 0;
+  let max = 0;
   let complete = stages.length > 0;
   let wall: number | null = 0;
   let cost: number | null = 0;
   let usage = ZERO;
+  const vals: { stage: string; score: number; max: number | null }[] = [];
   for (const s of stages) {
-    if (isScored(s)) {
-      passed += s.score!.passed;
-      total += s.score!.total;
+    const sc = readScore(s.score);
+    if (sc && sc.status === "scored") {
+      sum += sc.score ?? 0;
+      max += sc.max ?? 0;
+      vals.push({ stage: s.stage, score: sc.score ?? 0, max: sc.max });
     } else complete = false;
     wall = wall !== null && typeof s.wall_s === "number" ? wall + s.wall_s : null;
     cost = cost !== null && typeof s.cost_usd === "number" ? cost + s.cost_usd : null;
@@ -101,9 +205,9 @@ export function replicaTotals(r: ReplicaEntry): ReplicaTotals {
   }
   return {
     replica: r.replica,
-    score: complete && total > 0 ? passed / total : null,
-    passed,
-    total,
+    score: complete ? combineStages(vals, agg) : null,
+    sum,
+    max,
     wall_s: stages.length ? wall : null,
     usage,
     cost_usd: stages.length ? cost : null,
@@ -127,9 +231,13 @@ export function fmtPct(x: number | null | undefined, digits = 1): string {
   return typeof x === "number" && Number.isFinite(x) ? `${(x * 100).toFixed(digits)}%` : "—";
 }
 
-/** total_score from GET /evals: a 0–1 fraction (values above 1 are taken as percent). */
-export function fmtScore(x: number | null | undefined): string {
+/**
+ * total_score from GET /evals, by its display (the manifest's snapshot).
+ * Without one it is an old 0–1 ratio (values above 1 are taken as percent).
+ */
+export function fmtScore(x: number | null | undefined, display?: ScoreFormat | null): string {
   if (typeof x !== "number" || !Number.isFinite(x)) return "—";
+  if (display) return fmtValue(display, x);
   return x > 1 ? `${x.toFixed(1)}%` : fmtPct(x);
 }
 
@@ -212,17 +320,11 @@ export function statusLabel(status: string | null | undefined): { text: string; 
   }
 }
 
-export function scoreStatusLabel(st: string | undefined): string {
-  switch (st) {
-    case "passed":
-      return "全部通过";
-    case "failed":
-      return "部分未通过";
-    case "system_error":
-      return "平台错误（不计分）";
-    case "rejected":
-      return "被拒绝";
-    default:
-      return "未打分";
-  }
+/** Outcome of a stage. A scored stage below the maximum is not a failure. */
+export function scoreStatusLabel(sc: StageScore | null | undefined): string {
+  const r = readScore(sc);
+  if (!r) return "未打分";
+  if (r.status === "error") return r.error === "rejected" ? "被拒绝" : "平台错误（不计分）";
+  if (r.passed === true) return "通过";
+  return "已计分";
 }

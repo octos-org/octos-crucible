@@ -135,7 +135,7 @@ fn report_over_run_dir() {
     assert!(out.status.success(), "{out:?}");
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["n_ok"], 2);
-    assert_eq!(v["total"]["passed"]["mean"], 15.0);
+    assert_eq!(v["total"]["score"]["mean"], 15.0);
 }
 
 #[test]

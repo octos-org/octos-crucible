@@ -10,7 +10,7 @@ name: score-tests
 # tests and checkpoints of the stages to score, re-sealed to a one-run key
 # that opens nothing else. That key arrives as a workflow_call secret so
 # GitHub masks it, and `crucible score` removes it from the scorer's
-# environment. Only score.json (status / passed / total) leaves the job.
+# environment. Only score.json (result v2: score, max, fixed-name items) leaves the job.
 #
 # The scorer adds its own walls (docs/scorer-contract.md §5, §7): test
 # container non-root, cap-drop ALL, no-new-privileges, no environment, on an

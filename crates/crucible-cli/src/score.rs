@@ -12,24 +12,26 @@
 //! fresh one-run key; `score` then runs elsewhere with only that key, read
 //! from `TestsFrom::Dir`, and the scorer process never sees it. The scorer (`scorers/<name>/score.sh`, see
 //! docs/scorer-contract.md) runs with `--visibility hidden`, so its
-//! result.json holds only status / passed / total and a fixed detail text:
+//! result.json holds only the score, fixed-name items and a fixed detail text:
 //! nothing of the tests leaves this job.
 //!
-//! Output: `<out>/<replica>/<stage>/score.json` (a `ScoreResult`), already
-//! normalised for the manifest:
-//! - scored with no test results (build failed, app never ready): total =
-//!   the taskset's `expected_total`, passed = 0;
-//! - a total that differs from `expected_total`: `system_error` (flagged,
-//!   not summed);
-//! - `system_error` / `rejected`: 0 / 0, so they never count.
+//! Output: `<out>/<replica>/<stage>/score.json`, always result v2 (an old
+//! format result is converted), normalised for the manifest:
+//! - only items: score / max from them (the taskset's `aggregate.items`);
+//! - no score, or out of bounds: `error` (system);
+//! - a counted stage (`expected_total`) scored with no test results (build
+//!   failed, app never ready): score 0, max = `expected_total`;
+//! - a test count that differs from `expected_total`: `error` (flagged,
+//!   not summed).
 
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
-use crucible_core::taskset::Stage;
-use crucible_core::{ScoreResult, ScoreStatus, TaskSet};
+use crucible_core::score::ErrorKind;
+use crucible_core::taskset::{Aggregate, Stage};
+use crucible_core::{ScoreResult, TaskSet};
 use crucible_crypto::PrivateKey;
 
 use crate::keys::Store;
@@ -63,47 +65,49 @@ pub struct ScoreOpts<'a> {
     pub scrub_env: &'a [String],
 }
 
-/// Normalise a scorer result against the stage's declared total.
-pub fn normalise(mut r: ScoreResult, expected_total: Option<u32>) -> ScoreResult {
-    r.tests = None;
+/// Normalise a scorer result for the manifest: [`ScoreResult::finish`]
+/// (score from items, bounds), then the stage's declared test count.
+pub fn normalise(r: ScoreResult, expected_total: Option<u32>, agg: &Aggregate) -> ScoreResult {
+    let mut r = r.finish(agg);
     if !r.status.is_scored() {
-        r.passed = 0;
-        r.total = 0;
         return r;
     }
-    match expected_total {
-        Some(e) if r.total == 0 => {
-            r.passed = 0;
-            r.total = e;
+    if let Some(e) = expected_total {
+        let e = f64::from(e);
+        match r.max {
+            None | Some(0.0) => {
+                r.score = Some(0.0);
+                r.max = Some(e);
+            }
+            Some(m) if m != e => {
+                return ScoreResult {
+                    visibility: r.visibility,
+                    task_id: r.task_id,
+                    submission_id: r.submission_id,
+                    ..ScoreResult::error(
+                        ErrorKind::System,
+                        format!("scorer reported {m} tests, the taskset expects {e}"),
+                    )
+                };
+            }
+            _ => {}
         }
-        Some(e) if r.total != e => {
-            r.detail = format!("scorer reported {} tests, the taskset expects {e}", r.total);
-            r.status = ScoreStatus::SystemError;
-            r.passed = 0;
-            r.total = 0;
-        }
-        _ => {}
     }
     r
 }
 
 fn system_error(detail: impl Into<String>) -> ScoreResult {
     ScoreResult {
-        submission_id: None,
-        task_id: None,
         visibility: Some("hidden".into()),
-        status: ScoreStatus::SystemError,
-        passed: 0,
-        total: 0,
-        detail: detail.into(),
-        tests: None,
+        ..ScoreResult::error(ErrorKind::System, detail)
     }
 }
 
-fn failed(detail: impl Into<String>) -> ScoreResult {
+/// Scored 0: the agent produced nothing to score.
+fn zero(detail: impl Into<String>) -> ScoreResult {
     ScoreResult {
-        status: ScoreStatus::Failed,
-        ..system_error(detail)
+        visibility: Some("hidden".into()),
+        ..ScoreResult::scored(0.0, None, detail)
     }
 }
 
@@ -208,9 +212,9 @@ pub async fn score(o: &ScoreOpts<'_>) -> Result<Vec<(u32, String, ScoreResult)>>
                 run_scorer(o.scorer, app.path(), tests.path(), stage, o.scrub_env)
             } else {
                 // The stage ran (it left logs) but produced nothing to score.
-                failed("the stage left no checkpoint")
+                zero("the stage left no checkpoint")
             };
-            let result = normalise(result, stage.expected_total);
+            let result = normalise(result, stage.expected_total, &o.taskset.aggregate);
             let dir = o.out.join(r.to_string()).join(&stage.id);
             std::fs::create_dir_all(&dir)?;
             std::fs::write(
@@ -218,8 +222,8 @@ pub async fn score(o: &ScoreOpts<'_>) -> Result<Vec<(u32, String, ScoreResult)>>
                 serde_json::to_string_pretty(&result)? + "\n",
             )?;
             eprintln!(
-                "r{r} {}: {:?} {}/{}",
-                stage.id, result.status, result.passed, result.total
+                "r{r} {}: {:?} {:?}/{:?}",
+                stage.id, result.status, result.score, result.max
             );
             done.push((r, stage.id.clone(), result));
         }
@@ -300,33 +304,59 @@ pub fn read_score(scores: &Path, replica: u32, stage: &str) -> Result<Option<Sco
 mod tests {
     use super::*;
 
-    fn r(status: ScoreStatus, passed: u32, total: u32) -> ScoreResult {
-        ScoreResult {
-            status,
-            passed,
-            total,
-            ..system_error("")
-        }
+    fn old(raw: &str) -> ScoreResult {
+        serde_json::from_str(raw).unwrap()
     }
 
     #[test]
     fn normalise_against_expected_total() {
-        let n = normalise(r(ScoreStatus::Failed, 27, 30), Some(30));
-        assert_eq!((n.status, n.passed, n.total), (ScoreStatus::Failed, 27, 30));
-        // Build failed: no test ran, the stage still counts out of 30.
-        let n = normalise(r(ScoreStatus::Failed, 0, 0), Some(30));
-        assert_eq!((n.passed, n.total), (0, 30));
-        // A pack that collected a different number of tests is flagged.
-        let n = normalise(r(ScoreStatus::Passed, 29, 29), Some(30));
-        assert_eq!(
-            (n.status, n.passed, n.total),
-            (ScoreStatus::SystemError, 0, 0)
+        use crucible_core::ScoreStatus::{Error, Scored};
+        let agg = Aggregate::default();
+        let n = normalise(
+            old(r#"{"status":"failed","passed":27,"total":30}"#),
+            Some(30),
+            &agg,
         );
+        assert_eq!((n.status, n.score, n.max), (Scored, Some(27.0), Some(30.0)));
+        // Build failed: no test ran, the stage still counts out of 30.
+        let n = normalise(
+            old(r#"{"status":"failed","passed":0,"total":0}"#),
+            Some(30),
+            &agg,
+        );
+        assert_eq!((n.score, n.max), (Some(0.0), Some(30.0)));
+        // A pack that collected a different number of tests is flagged.
+        let n = normalise(
+            old(r#"{"status":"passed","passed":29,"total":29}"#),
+            Some(30),
+            &agg,
+        );
+        assert_eq!((n.status, n.score, n.max), (Error, None, None));
         assert!(n.detail.contains("expects 30"));
-        let n = normalise(r(ScoreStatus::SystemError, 3, 4), Some(30));
-        assert_eq!((n.passed, n.total), (0, 0));
-        let n = normalise(r(ScoreStatus::Passed, 4, 4), None);
-        assert_eq!((n.passed, n.total), (4, 4));
+        let n = normalise(
+            old(r#"{"status":"system_error","passed":3,"total":4}"#),
+            Some(30),
+            &agg,
+        );
+        assert_eq!((n.status, n.score), (Error, None));
+        let n = normalise(
+            old(r#"{"status":"passed","passed":4,"total":4}"#),
+            None,
+            &agg,
+        );
+        assert_eq!(
+            (n.score, n.max, n.passed),
+            (Some(4.0), Some(4.0), Some(true))
+        );
+        // A continuous score, negative, no max; written as v2.
+        let n = normalise(
+            old(r#"{"schema":2,"status":"scored","score":-3.25}"#),
+            None,
+            &agg,
+        );
+        assert_eq!((n.status, n.score, n.max), (Scored, Some(-3.25), None));
+        let json = serde_json::to_string(&n).unwrap();
+        assert!(json.contains(r#""schema":2"#) && !json.contains("total"));
     }
 
     #[tokio::test]
@@ -384,13 +414,13 @@ printf '{"visibility":"hidden","status":"failed","passed":1,"total":2,"detail":"
         assert_eq!(done.len(), 2);
         let s1 = read_score(&out, 1, "stage-1").unwrap().unwrap();
         assert_eq!(
-            (s1.status, s1.passed, s1.total),
-            (ScoreStatus::Failed, 1, 2)
+            (s1.score, s1.max, s1.passed),
+            (Some(1.0), Some(2.0), Some(false))
         );
         let s2 = read_score(&out, 1, "stage-2").unwrap().unwrap();
         assert_eq!(
-            (s2.status, s2.passed, s2.total),
-            (ScoreStatus::Failed, 0, 2)
+            (s2.status.is_scored(), s2.score, s2.max),
+            (true, Some(0.0), Some(2.0))
         );
         assert!(read_score(&out, 2, "stage-1").unwrap().is_none());
 
@@ -442,8 +472,8 @@ printf '{"visibility":"hidden","status":"failed","passed":1,"total":2,"detail":"
         .await
         .unwrap();
         let s1 = read_score(&out2, 1, "stage-1").unwrap().unwrap();
-        assert_eq!((s1.passed, s1.total), (1, 2));
+        assert_eq!((s1.score, s1.max), (Some(1.0), Some(2.0)));
         let s2 = read_score(&out2, 1, "stage-2").unwrap().unwrap();
-        assert_eq!((s2.passed, s2.total), (0, 2));
+        assert_eq!((s2.score, s2.max), (Some(0.0), Some(2.0)));
     }
 }

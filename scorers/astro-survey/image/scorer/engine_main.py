@@ -7,24 +7,18 @@
 run_local.py (unmodified, see /opt/engine/ENGINE_MANIFEST.json) drives the
 agent through bridge.py; its last stdout line is the JSON score summary.
 
-Score mapping (docs/astro-survey.md): ScoreResult only has integer
-passed/total, so the continuous survey score S becomes
-    passed = clamp(round(S * 1000), 0, SCALE_TOTAL), total = SCALE_TOTAL
-(milli-points out of 10,000 points). The exact S is kept in `detail`.
-
-status: `failed` whenever a score was produced but is below the cap (that is
-"scored, agent's result", not "the agent broke"), `passed` only at the cap;
-no score because the agent never started / broke the protocol before the
-first request: `failed` 0/0; the engine itself produced nothing:
-`system_error`. Standard library only.
+Output: result.json v2 (docs/scorer-contract.md §4): `score` = the engine's
+own survey score S (continuous, may be negative, no max), `items` = its five
+components (names fixed by this code, so they are kept under hidden
+visibility). The agent never started / broke the protocol before the first
+request: scored 0; the engine itself produced nothing: `error` (system).
+Standard library only.
 """
 import argparse
 import json
 import subprocess
 import sys
 
-SCALE = 1000
-SCALE_TOTAL = 10_000_000
 COMPONENTS = ("sum_best_scores", "required_penalty", "uniformity_penalty",
               "report_settlement", "observation_request_reward")
 
@@ -56,25 +50,21 @@ def main() -> int:
     with open(f"{a.out}/summary.json", "w", encoding="utf-8") as f:
         json.dump({"exit": proc.returncode, "summary": summary}, f, indent=2, sort_keys=True)
 
-    r = {"visibility": a.visibility, "status": "system_error", "passed": 0, "total": 0,
+    r = {"schema": 2, "visibility": a.visibility, "status": "error", "error": "system",
          "detail": "the survey engine produced no score"}
     if a.task_id:
         r["task_id"] = a.task_id
     if a.submission_id:
         r["submission_id"] = a.submission_id
-    tests = []
     if isinstance(summary, dict) and "total" in summary:
-        score = float(summary["total"])
-        passed = max(0, min(SCALE_TOTAL, round(score * SCALE)))
-        r.update(status="passed" if passed == SCALE_TOTAL else "failed",
-                 passed=passed, total=SCALE_TOTAL,
-                 detail=f"survey score {summary['total']} ({summary.get('termination_reason')})")
-        tests = [{"title": f"{k} = {summary.get(k)}", "ok": True, "error": None, "screenshot": None}
-                 for k in COMPONENTS]
+        r.pop("error")
+        r.update(status="scored", score=float(summary["total"]),
+                 detail=str(summary.get("termination_reason") or "survey finished")[:300],
+                 items=[{"name": k, "score": float(summary[k])} for k in COMPONENTS
+                        if isinstance(summary.get(k), (int, float))])
     elif isinstance(summary, dict):
-        r.update(status="failed", detail="agent failed to start or initialize")
-    if a.visibility == "public":
-        r["tests"] = tests
+        r.pop("error")
+        r.update(status="scored", score=0.0, detail="agent failed to start or initialize")
     with open(f"{a.out}/result.json", "w", encoding="utf-8") as f:
         json.dump(r, f, indent=2)
         f.write("\n")

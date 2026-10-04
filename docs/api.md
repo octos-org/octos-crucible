@@ -68,7 +68,7 @@ GitHub 回调。换取 token、读取用户之后，用户的 GitHub token 立�
 ### `GET /tasksets`（无需登录；带令牌时多返回用户上传的题目包）
 → `[{"name": "github-full", "version": "1.0", "stages": [{"name": "stage-1", "time_limit_s": 3600, "total": 30}]}]`
 
-数据读自仓库 `EVAL_REF`（默认 main）分支的 `tasksets/*/taskset.json`，在 KV 中缓存 5 分钟。`version` 取文件里的 `version` 字段，没有时用 `git-<blob sha 前 12 位>`。`total` 取 `expected_total`，可能为 `null`。目录名必须等于 `name`，不合规的题目包会被跳过。
+数据读自仓库 `EVAL_REF`（默认 main）分支的 `tasksets/*/taskset.json`，在 KV 中缓存 5 分钟。`version` 取文件里的 `version` 字段，没有时用 `git-<blob sha 前 12 位>`。`total` 取 `expected_total`，可能为 `null`（不按用例计数的题目包）。题目包声明了 `display`（`docs/plugins.md` §9）时原样带上 `display`。目录名必须等于 `name`，不合规的题目包会被跳过。
 
 之后是用户上传的题目包（见下节），按上传时间倒序，最多 50 个：匿名只看到已公开且可用的；带令牌时另有自己上传的（任何状态）；管理员加 `?all=1` 看到全部。令牌无效时按匿名处理。上传的题目包多几个字段：
 `{"name": "u-0123456789abcdef", "version": "upload", "stages": [...], "title": "<source.json 里的 name>", "owner_login": "...", "public": false, "status": "packing|ready|failed", "error"?: "..."}`。`stages` 在 `ready` 之前为空。
@@ -143,11 +143,13 @@ workflow（持私钥，不运行上传的代码）解密 zip、检查、按阶�
 
 ### `GET /evals`
 → 当前用户的评测列表，按创建时间倒序：
-`[{"eval_id", "mode", "taskset", "model", "created_at", "status", "total_score"?}]`
+`[{"eval_id", "mode", "taskset", "model", "created_at", "status", "total_score"?, "display"?}]`
 
 管理员可以用 `?all=1` 查看全部评测。列表里的状态在两次 `GET /evals/:id` 之间可能稍有滞后，以详情为准。
 
-`total_score` 是 0–1 之间的小数：所有副本、所有已打分阶段的 Σpassed / Σtotal，保留 4 位小数；没有分数时不出现该字段。
+`total_score` 按该评测 manifest 里的 `scoring` 快照计算（与 `crucible manifest` 同一个函数 `crucible-core` `Manifest::compute_total_score`），保留 4 位小数；没有分数时不出现该字段。`aggregate.stages` 为 `ratio`（旧评测没有快照时也按它）时是 0–1 之间的 Σscore / Σmax（即旧的 Σpassed / Σtotal）；`sum` / `mean` / `weighted` 时是各遍总分的平均，单位与阶段分相同，可为负。`display` 是快照里总分的展示方式（`name`、`unit`、`direction`、`decimals`、`format` 等），旧评测没有此字段，按百分比显示。
+
+manifest（`schema: 2`）的阶段分数 `replicas[].stages[].score` 是 result v2 去掉文本字段：`{status: "scored"|"error", error?, score?, max?, passed?, items?}`；旧 manifest（`schema: 1`）里是 `{status: passed|failed|system_error|rejected, passed, total}`，读取方按 `docs/scorer-contract.md` §4 的换算表读，数据不改写。新 manifest 另有 `scoring`：`{aggregate, display: {stage, total}, plugins: [{kind, name, version}]}`，是 publish 时从题目包取的快照，题目包以后改了展示方式，旧评测不受影响。
 
 ### `GET /evals/:id`（仅 owner 或管理员，否则 403）
 ```json

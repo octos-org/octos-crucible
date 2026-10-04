@@ -61,6 +61,13 @@ function TasksetCard({ t, admin, onChange }: { t: TaskSet; admin: boolean; onCha
     <Card title={uploaded ? `${t.title ?? t.name}（${t.name}）` : t.name} aside={aside}>
       {t.status === "failed" && <p class="notice bad">未通过检查：{t.error}</p>}
       {t.status === "packing" && <p class="muted small">正在解密、检查并封存，通常几分钟；刷新页面查看结果。</p>}
+      {t.display?.stage?.name && (
+        <p class="muted small">
+          计分：{t.display.stage.name}
+          {t.display.stage.unit ? `（${t.display.stage.unit}）` : ""}，{t.display.stage.direction === "lower" ? "越低越好" : "越高越好"}
+          {t.display.total?.name ? `；总分：${t.display.total.name}` : ""}
+        </p>
+      )}
       {t.stages.length > 0 && (
         <div class="table-wrap">
           <table>
@@ -78,7 +85,7 @@ function TasksetCard({ t, admin, onChange }: { t: TaskSet; admin: boolean; onCha
                   <td class="num">{i + 1}</td>
                   <th scope="row">{s.name}</th>
                   <td class="num">{fmtDuration(s.time_limit_s)}</td>
-                  <td class="num">{s.total}</td>
+                  <td class="num">{s.total ?? "—"}</td>
                 </tr>
               ))}
             </tbody>

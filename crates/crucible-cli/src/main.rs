@@ -735,7 +735,7 @@ async fn run(cmd: Cmd) -> Result<()> {
                         .replicas
                         .iter()
                         .flat_map(|r| &r.stages)
-                        .any(|s| s.score.is_some_and(|s| s.status.is_scored()));
+                        .any(|s| s.score.as_ref().is_some_and(|s| s.status.is_scored()));
                     let status = match status.as_deref() {
                         None => if scored { "done" } else { "failed" }.to_owned(),
                         Some(s @ ("done" | "failed")) => s.to_owned(),

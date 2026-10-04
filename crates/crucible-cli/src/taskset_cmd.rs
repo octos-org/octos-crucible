@@ -14,7 +14,9 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use crucible_core::BlobRef;
 use crucible_core::TaskSet;
-use crucible_core::taskset::{Aggregate, MAX_TOTAL_TIME_S, OutputKind, ScorerRef, Stage};
+use crucible_core::taskset::{
+    Aggregate, Display, MAX_TOTAL_TIME_S, ModelDecl, OutputKind, ScorerRef, Stage,
+};
 use crucible_crypto::{PrivateKey, PublicKey};
 use serde::Deserialize;
 
@@ -32,6 +34,10 @@ pub struct PackSource {
     pub scorer: ScorerRef,
     #[serde(default)]
     pub aggregate: Aggregate,
+    #[serde(default)]
+    pub display: Display,
+    #[serde(default)]
+    pub model: Option<ModelDecl>,
     pub total_time_limit_s: u64,
     pub stages: Vec<PackStage>,
 }
@@ -112,7 +118,9 @@ impl Prepared {
             title: None,
             description: src.description.clone(),
             scorer: src.scorer.clone(),
-            aggregate: src.aggregate,
+            aggregate: src.aggregate.clone(),
+            display: src.display.clone(),
+            model: src.model.clone(),
             total_time_limit_s: src.total_time_limit_s,
             stages: src
                 .stages

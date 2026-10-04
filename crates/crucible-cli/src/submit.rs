@@ -543,6 +543,17 @@ pub fn render(d: &Value) -> String {
     }
     let empty = vec![];
     let replicas = d["manifest"]["replicas"].as_array().unwrap_or(&empty);
+    // Typed, the old score format reads as the new one; the display comes
+    // from the manifest's own snapshot (old manifests: test counts, %).
+    let display =
+        serde_json::from_value::<crucible_core::taskset::Scoring>(d["manifest"]["scoring"].clone())
+            .ok()
+            .map(|s| s.display)
+            .unwrap_or_else(crucible_core::taskset::legacy_display);
+    let (stage_fmt, total_fmt) = (
+        display.stage.clone().unwrap_or_default(),
+        display.total.clone().unwrap_or_default(),
+    );
     if !replicas.is_empty() {
         out += &format!(
             "\n{:<4} {:<16} {:>12} {:>10} {:>12} {:>12} {:>10} {:>10}\n",
@@ -553,12 +564,13 @@ pub fn render(d: &Value) -> String {
     for r in replicas {
         let n = r["replica"].as_u64().unwrap_or(0);
         for s in r["stages"].as_array().unwrap_or(&empty) {
-            let score = match (s["score"]["passed"].as_u64(), s["score"]["total"].as_u64()) {
-                (Some(p), Some(t)) if t > 0 => {
-                    format!("{p}/{t} {:.0}%", 100.0 * p as f64 / t as f64)
-                }
-                (Some(p), Some(t)) => format!("{p}/{t}"),
-                _ => s["score"]["status"].as_str().unwrap_or("—").to_owned(),
+            let sc = serde_json::from_value::<crucible_core::StageScore>(s["score"].clone()).ok();
+            let score = match sc {
+                None => "—".to_owned(),
+                Some(sc) => match sc.value() {
+                    Some((v, m)) => stage_fmt.fmt(v, m),
+                    None => "error".to_owned(),
+                },
             };
             let time = s["wall_s"].as_f64().map(fmt_secs).unwrap_or("—".into());
             let u = &s["usage"];
@@ -602,7 +614,7 @@ pub fn render(d: &Value) -> String {
         );
     }
     match d["total_score"].as_f64() {
-        Some(t) => out += &format!("total  {:.1}%\n", t * 100.0),
+        Some(t) => out += &format!("total  {}\n", total_fmt.fmt(t, None)),
         None => out += "total  —\n",
     }
     out
@@ -711,7 +723,23 @@ mod tests {
             ]}]}
         });
         let s = render(&d);
-        assert!(s.contains("25/30 83%") && s.contains("12m03s") && s.contains("$0.12"));
+        assert!(s.contains("25/30") && s.contains("12m03s") && s.contains("$0.12"));
         assert!(s.contains("total  77.5%") && s.contains("tokens 1050"));
+
+        // Result v2 with a display snapshot (astro-practice).
+        let d = json!({
+            "eval_id": "e", "status": "done", "total_score": 4458.556,
+            "manifest": {"schema": 2, "eval_id": "e", "created_at": "t", "taskset": "astro-practice",
+              "agent": {"name": "a", "version": "1"}, "model": "m",
+              "scoring": {"aggregate": {"stages": "sum"},
+                "display": {"stage": {"name": "观测得分", "decimals": 2}, "total": {"name": "四卡总分", "decimals": 2}},
+                "plugins": [{"kind": "scorer", "name": "astro-survey", "version": "2"}]},
+              "replicas": [{"replica": 1, "stages": [
+                {"stage": "l1", "score": {"status": "scored", "score": 4458.556},
+                 "usage": {"requests": 0, "prompt_tokens": 0, "cached_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0}}
+            ]}]}
+        });
+        let s = render(&d);
+        assert!(s.contains("4458.56") && s.contains("total  4458.56"), "{s}");
     }
 }

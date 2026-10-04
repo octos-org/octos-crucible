@@ -1,6 +1,6 @@
 # 插件接口规范
 
-本文是插件化设计的接口细节，总览与原则见 `docs/DESIGN.md`。本文描述的是目标形态，按 §13 的三个阶段（P1–P3）落地；某一部分落地之前，现行行为以 `docs/scorer-contract.md`、`docs/agent-contract.md` 为准，落地时这两份文档同步改写。
+本文是插件化设计的接口细节，总览与原则见 `docs/DESIGN.md`。P1（§7–§9 的结果格式、汇总与展示）已落地。本文描述的是目标形态，按 §13 的三个阶段（P1–P3）落地；某一部分落地之前，现行行为以 `docs/scorer-contract.md`、`docs/agent-contract.md` 为准，落地时这两份文档同步改写。
 
 ## 1. 核心与插件的分工
 
