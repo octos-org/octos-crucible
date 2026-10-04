@@ -45,7 +45,7 @@ pub struct StageInfo {
     pub total: Option<u32>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TasksetInfo {
     pub name: String,
     pub version: String,
@@ -62,6 +62,9 @@ pub struct TasksetInfo {
     pub status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The taskset's `display` (docs/plugins.md §9), when it declares one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<crucible_core::taskset::Display>,
 }
 
 pub struct GitHub<'a, B: Backend> {
@@ -406,6 +409,8 @@ struct TasksetFile {
     #[serde(default)]
     version: Option<Value>,
     stages: Vec<StageFile>,
+    #[serde(default)]
+    display: Option<crucible_core::taskset::Display>,
 }
 
 #[derive(Deserialize)]
@@ -456,6 +461,7 @@ pub fn parse_taskset_file(dir: &str, file: &Value) -> Option<TasksetInfo> {
                 total: s.expected_total,
             })
             .collect(),
+        display: ts.display.filter(|d| !d.is_empty()),
         ..Default::default()
     })
 }

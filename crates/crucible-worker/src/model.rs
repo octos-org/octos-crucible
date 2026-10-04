@@ -516,12 +516,19 @@ pub struct EvalSummary {
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_score: Option<f64>,
+    /// How to show `total_score`: the manifest's `scoring` snapshot; absent
+    /// for manifests that predate it (a 0–1 ratio, shown as a percentage).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<crucible_core::taskset::ScoreFormat>,
 }
 
 impl EvalRecord {
+    fn parsed_manifest(&self) -> Option<Manifest> {
+        serde_json::from_value::<Manifest>(self.manifest.clone()?).ok()
+    }
+
     pub fn total_score(&self) -> Option<f64> {
-        let m = self.manifest.as_ref()?;
-        total_score(&serde_json::from_value::<Manifest>(m.clone()).ok()?)
+        total_score(&self.parsed_manifest()?)
     }
 
     pub fn summary(&self) -> EvalSummary {
@@ -533,12 +540,15 @@ impl EvalRecord {
             created_at: self.created_at.clone(),
             status: self.status.clone(),
             total_score: self.total_score(),
+            display: self
+                .parsed_manifest()
+                .and_then(|m| m.scoring?.display.total),
         }
     }
 }
 
-/// 0–1: Σpassed / Σtotal over every scored stage of every replica, rounded
-/// to 4 decimals. `None` when nothing was scored.
+/// The manifest's total by its own `scoring` snapshot (old manifests: the
+/// 0–1 ratio Σpassed / Σtotal): the same function `crucible manifest` uses.
 pub fn total_score(m: &Manifest) -> Option<f64> {
     m.compute_total_score()
 }
@@ -813,6 +823,20 @@ mod tests {
         let man: Manifest = serde_json::from_value(r.manifest).unwrap();
         // (27 + 20 + 30) / (30 + 29 + 30) = 77 / 89
         assert_eq!(total_score(&man), Some(0.8652));
+
+        // A v2 manifest with a `sum` snapshot: the total by that rule.
+        let mut v2 = manifest();
+        v2["schema"] = 2.into();
+        v2["replicas"][0]["stages"][0]["score"] =
+            serde_json::json!({"status": "scored", "score": 4458.556});
+        v2["replicas"][0]["stages"][1]["score"] =
+            serde_json::json!({"status": "scored", "score": -8.5, "items": [{"name": "x", "score": -8.5}]});
+        v2["replicas"][1]["stages"][0]["score"] = serde_json::json!({"status": "error", "error": "system"});
+        v2["scoring"] = serde_json::json!({"aggregate": {"stages": "sum"},
+            "display": {"stage": {"name": "观测得分"}, "total": {"name": "总分", "decimals": 2}},
+            "plugins": [{"kind": "scorer", "name": "astro-survey", "version": "2"}]});
+        let man: Manifest = serde_json::from_value(v2).unwrap();
+        assert_eq!(total_score(&man), Some(4450.056));
 
         assert!(parse_results(&body, "3f2b8c1e-9a4d-4c7e-8b1a-000000000000").is_err());
         assert!(parse_results(b"{\"eval_id\":1}", EID).is_err());
