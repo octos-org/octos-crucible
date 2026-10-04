@@ -428,6 +428,18 @@ async fn run_eval(a: LocalArgs, mut backend: Backend, exe: PathBuf) -> Result<()
         std::fs::copy(root.join("config").join(f), sroot.join("config").join(f))?;
     }
     std::fs::copy(keys_dir.join("keys.json"), sroot.join("config/keys.json"))?;
+    // generate's root: agents and config only. Locally the plugin
+    // directories are links it does not follow; on a volume they would be
+    // copies, and a scorer's own test fixtures would count as test
+    // material on the generation machine.
+    let gen_root = if k8s {
+        let g = dir.join("root-gen");
+        copy_dir(&sroot.join("agents"), &g.join("agents"))?;
+        copy_dir(&sroot.join("config"), &g.join("config"))?;
+        g
+    } else {
+        sroot.clone()
+    };
     let ts = pack_taskset(&root, &a.taskset, &sroot.join("config/keys.json"), &store).await?;
     let ts_dir = sroot.join("tasksets").join(&ts.name);
     std::fs::create_dir_all(&ts_dir)?;
@@ -510,7 +522,7 @@ async fn run_eval(a: LocalArgs, mut backend: Backend, exe: PathBuf) -> Result<()
                         &[(Secret::PlatformKey, pk), (Secret::DevModelCred, c)],
                         &[
                             "--root".into(),
-                            s(&sroot),
+                            s(&gen_root),
                             "--taskset".into(),
                             ts_s.clone(),
                             "--agent-source".into(),
