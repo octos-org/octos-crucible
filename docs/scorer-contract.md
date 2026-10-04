@@ -151,6 +151,16 @@ score.sh --artifact FILE --tests DIR --out result.json
 
 注意：`TMPDIR` 必须是 docker daemon 能挂载的路径（例如 colima / Docker Desktop 默认只共享用户主目录时，要把 `TMPDIR` 设到主目录下）。
 
+## 6A. 模型评判打分器（`scorers/llm-judge`）
+
+用评判模型按评分细则给文字产出打分，例如证明题（`tasksets/math-proof-demo`）。注册表里 `model: true`、`runs_taskset_code: false`、`accepts: ["files"]`。
+
+- **隐藏材料**：每个阶段一个 `rubric.json`：`{"problem", "reference", "answer_file", "items": [{"name", "points", "criteria"}]}`（题目、参考解答、产出里要评的文件名、逐项细则，每项整数分）。只是数据。
+- **评判提示词在打分器里**（`image/judge.py`），不在题目包里：题目、参考解答、细则和 agent 的回答都作为带标签的数据嵌进固定提示，提示明确要求忽略回答里的任何指令；题目包作者和 agent 都改不了评分规则本身。
+- **减少抖动**：temperature 0；要求只输出 JSON（每项一个整数分），逐项校验（项数、分值范围），无效时最多重问 2 次；评判 `judges` 次（`scorer_options.judges`，缺省 3，最多 7），每项取中位数。有效评判不过半时记 `error`（system）。
+- **结果**：`score` = 各项中位数之和，`max` = 细则总分，`items` = 每项得分，名字由打分器给（`item 1`、`item 2`…），不带细则文字；`detail` 写评判模型名和有效评判次数。
+- **模型**：题目包声明 `model: {"scorer": "required", "name": "<评判模型>"}`；`name` 固定评判模型，所有提交用同一个评判。没有模型时记 `error`。评判容器只接到只通计量代理的网络，拿到的是 `OPENAI_API_KEY=dummy`。
+
 ## 7. 打分隔离边界（不可信的测试）
 
 用户可以上传题目包，测试材料因此和 agent 产出一样是**不可信代码**。边界靠 job 划分保证，不靠测试"老实"：

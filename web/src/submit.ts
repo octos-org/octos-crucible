@@ -80,14 +80,15 @@ export async function submitEval(
     score_public: f.scorePublic,
     consent: true,
   };
-  if (f.mode === "app") {
-    body.stages = Number(f.stage);
-  } else {
-    onStep("credential");
-    body.model = f.model.trim();
+  if (f.mode === "app") body.stages = Number(f.stage);
+  else {
     body.replicas = Number(f.replicas);
     const budget = budgetOf(f);
     if (budget) body.budget = budget;
+  }
+  if (f.mode === "agent" || f.needsModel) {
+    onStep("credential");
+    body.model = f.model.trim();
     body.cred_envelope = await sealCredential(key, {
       api_key: f.apiKey.trim(),
       endpoint: f.endpoint.trim(),

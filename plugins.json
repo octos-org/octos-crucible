@@ -11,6 +11,8 @@
     {"kind": "scorer", "name": "arcbench-official", "version": "1", "impl": "scorers/arcbench-official",
      "runs_taskset_code": true, "model": false, "accepts": ["web-app"]},
     {"kind": "scorer", "name": "astro-survey", "version": "2", "impl": "scorers/astro-survey",
-     "user": true, "runs_taskset_code": false, "model": false, "accepts": ["files"]}
+     "user": true, "runs_taskset_code": false, "model": false, "accepts": ["files"]},
+    {"kind": "scorer", "name": "llm-judge", "version": "1", "impl": "scorers/llm-judge",
+     "user": true, "runs_taskset_code": false, "model": true, "accepts": ["files"]}
   ]
 }

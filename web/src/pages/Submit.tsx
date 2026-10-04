@@ -72,11 +72,15 @@ export function Submit() {
   };
 
   const ts: TaskSet | undefined = tasksets.data?.find((t) => t.name === form.taskset);
+  // App mode on a taskset scored with a model (e.g. a judge) also needs the credential.
+  const needsModel = mode === "app" && !!ts?.model_required;
+  const withCred = mode === "agent" || needsModel;
 
   const onSubmit = async (e: Event) => {
     e.preventDefault();
     setTried(true);
-    const errs = validate(form);
+    const f = { ...form, needsModel };
+    const errs = validate(f);
     setErrors(errs);
     if (Object.keys(errs).length || !fileObj) {
       const first = document.querySelector<HTMLElement>(".has-error input, .has-error select");
@@ -86,7 +90,7 @@ export function Submit() {
     setFailure(null);
     try {
       const bytes = new Uint8Array(await fileObj.arrayBuffer());
-      const res = await submitEval(api(), form, bytes, setStep);
+      const res = await submitEval(api(), f, bytes, setStep);
       // Drop secrets from memory as soon as they are sealed.
       setForm((f) => ({ ...f, apiKey: "", password: "", password2: "" }));
       setDone(res);
@@ -244,9 +248,10 @@ export function Submit() {
         </Field>
       </fieldset>
 
-      {mode === "agent" && (
+      {withCred && (
         <fieldset class="card" disabled={busy}>
           <legend>模型</legend>
+          {needsModel && <p class="hint">这个题目包用模型打分（例如评判模型），评判用你的 key，经平台计量代理调用。</p>}
           <Field id="f-model" label="模型名" error={err("model")} hint="原样传给接口，如 glm-5.3。">
             <input
               id="f-model"
@@ -345,7 +350,7 @@ export function Submit() {
         </fieldset>
       )}
 
-      {mode === "agent" && (
+      {withCred && (
         <fieldset class="card" disabled={busy}>
           <legend>取回产出</legend>
           <Field

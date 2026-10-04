@@ -8,7 +8,7 @@ octos-crucible 是评测 agent 的通用平台：任何能在沙箱里运行的 
 
 - 写代码：ARC-Bench 的 GitHub 题（`arcbench-github`），agent 写出网站，Playwright 测试打分。这是第一个题目包。
 - 交互决策：GOSIM 智能体巡天（`astro-practice`），观测 agent 与模拟器一问一答，官方评分引擎打分，见 `docs/astro-survey.md`。
-- 数学 / 推理（即将推出）：例如 IMO 试题，agent 写证明，评判模型按评分标准打分；依赖打分阶段用模型（`docs/plugins.md` §10，P3）。
+- 数学 / 推理：例如 IMO 试题，agent 写证明，评判模型按评分标准打分（`tasksets/math-proof-demo`，打分器 `llm-judge`，打分阶段经计量代理用提交者的模型，`docs/plugins.md` §10）。
 
 将来若发布自己的 benchmark，会作为单独命名的题目集发布在它之上。
 

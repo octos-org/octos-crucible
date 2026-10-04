@@ -112,6 +112,19 @@ pub struct AppArgs {
     /// Stage to score (1-based).
     #[arg(long)]
     pub stage: u32,
+    /// For task sets scored with a model (e.g. a judge model): the model.
+    /// With --endpoint, --api-key-env and --download-password-env.
+    #[arg(long, requires_all = ["endpoint", "api_key_env", "download_password_env"])]
+    pub model: Option<String>,
+    /// OpenAI-compatible base URL (https) for --model.
+    #[arg(long)]
+    pub endpoint: Option<String>,
+    /// Environment variable holding the model API key.
+    #[arg(long, requires = "model")]
+    pub api_key_env: Option<String>,
+    /// Environment variable holding the download password (≥ 12 characters).
+    #[arg(long, requires = "model")]
+    pub download_password_env: Option<String>,
 }
 
 #[derive(clap::Args)]
@@ -351,13 +364,32 @@ pub async fn submit(cmd: SubmitCmd) -> Result<()> {
     let eval_id = new_eval_id()?;
 
     // Validate and read everything local before touching the network.
-    let mut secrets: Option<(String, String)> = None;
+    // (api key, download password, endpoint) for the credential envelope.
+    let mut secrets: Option<(String, String, String)> = None;
     let (mode, zip, mut body) = match &cmd {
         SubmitCmd::App(a) => {
             if a.stage == 0 {
                 bail!("--stage is 1-based");
             }
-            ("app", read_zip(&a.zip)?, json!({"stages": a.stage}))
+            let mut b = json!({"stages": a.stage});
+            if let (Some(model), Some(endpoint), Some(key_env), Some(pw_env)) = (
+                &a.model,
+                &a.endpoint,
+                &a.api_key_env,
+                &a.download_password_env,
+            ) {
+                if model.trim().is_empty() {
+                    bail!("--model is empty");
+                }
+                validate_endpoint(endpoint, false).map_err(|e| anyhow!("--endpoint: {e}"))?;
+                let password = env_secret(pw_env)?;
+                if password.chars().count() < MIN_PASSWORD {
+                    bail!("the download password must have at least {MIN_PASSWORD} characters");
+                }
+                secrets = Some((env_secret(key_env)?, password, endpoint.clone()));
+                b["model"] = json!(model.trim());
+            }
+            ("app", read_zip(&a.zip)?, b)
         }
         SubmitCmd::Agent(a) => {
             if a.model.trim().is_empty() {
@@ -375,7 +407,7 @@ pub async fn submit(cmd: SubmitCmd) -> Result<()> {
             if password.chars().count() < MIN_PASSWORD {
                 bail!("the download password must have at least {MIN_PASSWORD} characters");
             }
-            secrets = Some((api_key, password));
+            secrets = Some((api_key, password, a.endpoint.clone()));
             let zip = match (&a.agent_dir, &a.agent_zip) {
                 (Some(d), _) => zip_agent_dir(d)?,
                 (None, Some(z)) => read_zip(z)?,
@@ -435,13 +467,9 @@ pub async fn submit(cmd: SubmitCmd) -> Result<()> {
         .ok_or_else(|| anyhow!("POST /uploads: no hash in the answer"))?
         .to_owned();
 
-    if let (SubmitCmd::Agent(a), Some((api_key, password))) = (&cmd, &secrets) {
+    if let Some((api_key, password, endpoint)) = &secrets {
         body["cred_envelope"] = json!(seal_credential(
-            &key,
-            api_key,
-            &a.endpoint,
-            password,
-            &eval_id
+            &key, api_key, endpoint, password, &eval_id
         )?);
     }
     let o = body.as_object_mut().expect("object");

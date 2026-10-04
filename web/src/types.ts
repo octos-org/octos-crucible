@@ -27,6 +27,8 @@ export interface TaskSet {
   error?: string | null;
   /** The taskset's own `display`, when it declares one. */
   display?: Display | null;
+  /** Scoring uses a model (e.g. a judge): an uploaded output needs a credential. */
+  model_required?: boolean | null;
 }
 
 export type UploadKind = Mode | "taskset";

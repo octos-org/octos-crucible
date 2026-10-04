@@ -1,0 +1,83 @@
+{
+  "schema": 2,
+  "name": "math-proof-demo",
+  "description": "Demo of model-judged proofs: two classic International Mathematical Olympiad problems (IMO 1959 Problem 1, IMO 1964 Problem 1), one per stage. The agent writes a complete proof to answer.md; the llm-judge scorer grades it against a hidden reference solution and marking scheme (7 points per problem) with a fixed judge model, median of 3 judgements. Problem statements: the public IMO problem archive (https://www.imo-official.org/problems.aspx). Reference solutions and marking schemes written for this platform.",
+  "scorer": {
+    "name": "llm-judge"
+  },
+  "aggregate": {
+    "items": "sum",
+    "stages": "sum"
+  },
+  "display": {
+    "stage": {
+      "name": "证明得分",
+      "unit": "分",
+      "direction": "higher",
+      "min": 0.0,
+      "max": 7.0,
+      "decimals": 1,
+      "format": "number"
+    },
+    "total": {
+      "name": "总分",
+      "unit": "分",
+      "direction": "higher",
+      "min": 0.0,
+      "max": 14.0,
+      "decimals": 1,
+      "format": "number"
+    }
+  },
+  "model": {
+    "interactive": "none",
+    "scorer": "required",
+    "name": "glm-5.3",
+    "max_requests": 20
+  },
+  "total_time_limit_s": 1200,
+  "stages": [
+    {
+      "id": "p1",
+      "inputs_blob": {
+        "sha256": "0c170a9e557165ba241f2ecf54f8a8d5467a0bbc69321353d33516848e3ac8b4",
+        "key_id": "1ffa702796eb5ee8"
+      },
+      "tests_blob": {
+        "sha256": "38cc610250e7ead62934a378b0f5efcb21d32ac3a187d22a0947845166c1784d",
+        "key_id": "1ffa702796eb5ee8"
+      },
+      "packager": "files",
+      "packager_options": {
+        "require": [
+          "answer.md"
+        ]
+      },
+      "scorer_options": {
+        "judges": 3
+      },
+      "time_limit_s": 600
+    },
+    {
+      "id": "p2",
+      "inputs_blob": {
+        "sha256": "88c01751239dc75726b08b7c1b9326c5a1184e21895eb8afbdbfa8a417b117df",
+        "key_id": "1ffa702796eb5ee8"
+      },
+      "tests_blob": {
+        "sha256": "f3bb1621725a219a7de48c48247748a12c394bcdf41472a5f153eeda12c250a7",
+        "key_id": "1ffa702796eb5ee8"
+      },
+      "packager": "files",
+      "packager_options": {
+        "require": [
+          "answer.md"
+        ]
+      },
+      "scorer_options": {
+        "judges": 3
+      },
+      "time_limit_s": 600
+    }
+  ]
+}

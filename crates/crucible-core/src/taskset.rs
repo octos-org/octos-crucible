@@ -956,6 +956,7 @@ mod tests {
         for raw in [
             include_str!("../../../tasksets/arcbench-github/taskset.json"),
             include_str!("../../../tasksets/arcbench-github-official/taskset.json"),
+            include_str!("../../../tasksets/math-proof-demo/taskset.json"),
         ] {
             let t: TaskSet = serde_json::from_str(raw).unwrap();
             t.validate(MAX_TOTAL_TIME_S).unwrap();
