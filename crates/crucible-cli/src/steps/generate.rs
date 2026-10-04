@@ -17,7 +17,6 @@ use crate::agentpkg;
 use crate::build;
 use crate::cred::{self, CredSource};
 use crate::executor::Executor;
-use crate::executor::docker::DockerExecutor;
 use crate::runners;
 
 #[derive(clap::Args)]
@@ -94,7 +93,7 @@ pub async fn run(a: Args, s: &Secrets) -> Result<()> {
     let rdir = work.join("run").join(a.replica.to_string());
     std::fs::create_dir_all(&rdir)?;
     let label = run_label(&a);
-    let exec = DockerExecutor;
+    let exec = crate::executor::backend()?;
     // Scoped: only what carries this run's label.
     exec.cleanup(&label);
     let result = generate(&a, s, &work, &rdir, &label).await;
@@ -222,7 +221,7 @@ async fn generate(a: &Args, s: &Secrets, work: &Path, rdir: &Path, label: &str) 
         bail!("test material in the stage inputs");
     }
 
-    let exec = DockerExecutor;
+    let exec = crate::executor::backend()?;
     super::check_caps(super::spec("generate"), exec.caps())?;
     let net = exec.sandbox(&[8787, 3128], label)?;
 

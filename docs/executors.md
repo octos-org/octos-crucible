@@ -241,7 +241,9 @@ pub struct Caps {
 
 接口里刻意没有"特权模式""挂宿主机目录""宿主机网络"之类的选项：步骤和插件**表达不出**这些需求，后端也就不用防。
 
-**打分器怎么接上执行后端。** 打分器是 `score.sh` 脚本，今天直接调 `docker`。为了不重写三个打分器的逻辑（构建、等就绪、重试一次这些顺序控制写在脚本里很自然），给 `crucible` 加一组对应的子命令 `crucible ctr build | net | run | wait | logs | rm | cp`，参数一一对应上面的接口；脚本把 `docker ...` 换成 `"$CRUCIBLE" ctr ...`，`sudo iptables` 那段删掉（防火墙变成 `net` 的一部分，由后端负责）。脚本因此不再关心底下是 Docker 还是 Kubernetes。这件事只在需要"原生 Kubernetes"时才必须做（第 5.3 节），自托管运行器、单机、Nomad 都继续用 Docker，`score.sh` 可以原样不动。
+**打分器怎么接上执行后端。** 打分器是 `score.sh` 脚本，今天直接调 `docker`。为了不重写三个打分器的逻辑（构建、等就绪、重试一次这些顺序控制写在脚本里很自然），给 `crucible` 加一组对应的子命令 `crucible ctr build | net | run | wait | logs | rm | cp`，参数一一对应上面的接口；脚本把 `docker ...` 换成 `"$CRUCIBLE" ctr ...`，`sudo iptables` 那段删掉（防火墙变成 `net` 的一部分，由后端负责）。脚本因此不再关心底下是 Docker 还是 Kubernetes。
+
+**已实现。** `crucible ctr run | build | logs | inspect | rm | image exists/pull/rm | net create/connect/rm | volume create/rm | prune-build-cache`，`run`/`build` 接受 docker 参数的一个固定子集（`crates/crucible-cli/src/ctr.rs`），解析成与后端无关的 `ContainerSpec` / `BuildSpec`，不在子集里的（`--privileged`、`--network host`、其他 `--security-opt`、设备、`-e NAME` 从本进程取值等）直接拒绝。后端由 `CRUCIBLE_EXECUTOR` 选（默认 `docker`）。Docker 后端把 `run`、`build`、`logs` 渲染回同样的 docker 参数后 `exec` 成 `docker` 进程，所以 `timeout ... crucible ctr run` 的信号、输出、退出码与原来的 `timeout ... docker run` 完全相同（单元测试逐条比对脚本里每种调用渲染出的参数）；`CRUCIBLE_SCORER_FIREWALL=1` 时内部网络的 iptables 规则由 `ctr net create/rm` 负责。四个插件脚本（三个打分器 + 巡天交互运行器）都已改为 `"$CRUCIBLE" ctr ...`，`crucible score` 运行脚本时把自己的路径放进 `CRUCIBLE`、把步骤的运行标签放进 `CRUCIBLE_RUN_LABEL`（脚本起的容器都带上它，步骤结束的按标签清理也能清掉被杀脚本的残留）。
 
 ### 2.4 现有代码怎样迁移
 

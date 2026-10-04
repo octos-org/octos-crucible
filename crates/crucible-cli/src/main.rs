@@ -12,6 +12,7 @@ use crucible_metering::{Price, Pricing};
 mod agentpkg;
 mod build;
 mod cred;
+mod ctr;
 mod executor;
 mod keys;
 mod local;
@@ -236,6 +237,13 @@ enum Cmd {
     Keys {
         #[command(subcommand)]
         cmd: local::KeysCmd,
+    },
+    /// Container commands for plugin scripts, run by the step's execution
+    /// backend (docs/executors.md §2.3): run, build, logs, inspect, rm,
+    /// image, net, volume, prune-build-cache.
+    Ctr {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
     /// The steps of an evaluation (docs/executors.md): each declares its
     /// inputs, output, secrets and needs (`crucible step list`).
@@ -466,6 +474,7 @@ fn write_output(path: &str, data: &[u8]) -> Result<()> {
 async fn run(cmd: Cmd, secrets: Option<steps::Secrets>) -> Result<()> {
     match cmd {
         Cmd::Step { cmd } => steps::run(*cmd, secrets).await,
+        Cmd::Ctr { .. } => unreachable!("handled in main"),
         Cmd::Eval {
             cmd: local::EvalCmd::Local(a),
         } => local::eval_local(*a).await,
@@ -751,6 +760,7 @@ async fn run(cmd: Cmd, secrets: Option<steps::Secrets>) -> Result<()> {
                 scrub_env: &a.identity_env,
                 replica: a.replica,
                 model: model.as_ref(),
+                run_label: None,
             })
             .await?;
             eprintln!("scored {} stage checkpoints", done.len());
@@ -1410,6 +1420,16 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if let Cmd::Ctr { args } = &cli.cmd {
+        return match rt.block_on(ctr::run(args)) {
+            Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
+            Err(e) => {
+                eprintln!("crucible ctr: {e:#}");
+                // docker's status for "the command itself failed".
+                ExitCode::from(125)
+            }
+        };
+    }
     match rt.block_on(run(cli.cmd, secrets)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

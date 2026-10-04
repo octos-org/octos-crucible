@@ -140,11 +140,7 @@ pub fn agent_container(c: &ContainerSpec) -> crate::executor::ContainerSpec {
     let meter = format!("http://{}:{}/v1", c.agent_host, c.meter_port);
     let egress = format!("http://{}:{}", c.agent_host, c.egress_port);
     let no_proxy = format!("{},localhost,127.0.0.1", c.agent_host);
-    let mount = |src: &Path, dst: &str, read_only: bool| crate::executor::Mount {
-        src: src.to_path_buf(),
-        dst: dst.into(),
-        read_only,
-    };
+    let mount = crate::executor::Mount::host;
     let env = [
         ("REQ_DIR", "/req".to_string()),
         ("WORK_DIR", "/work".to_string()),
@@ -165,13 +161,17 @@ pub fn agent_container(c: &ContainerSpec) -> crate::executor::ContainerSpec {
         image: c.image.clone(),
         entrypoint: c.entrypoint.clone(),
         env: env.into_iter().map(|(k, v)| (k.to_owned(), v)).collect(),
-        user: c.user.clone(),
+        user: Some(c.user.clone()),
         limits: crate::executor::Limits {
-            memory: "2g".into(),
-            cpus: "1".into(),
-            pids: 1024,
+            memory: Some("2g".into()),
+            memory_swap: Some("2g".into()),
+            cpus: Some("1".into()),
+            pids: Some(1024),
         },
-        network: c.network.clone(),
+        network: crate::executor::Network::Named {
+            name: c.network.clone(),
+            aliases: vec![],
+        },
         dns: Some("127.0.0.1".into()),
         mounts: vec![
             mount(&c.req, "/req", true),
@@ -179,7 +179,11 @@ pub fn agent_container(c: &ContainerSpec) -> crate::executor::ContainerSpec {
             mount(&c.home, CONTAINER_HOME, false),
         ],
         workdir: Some("/work".into()),
-        label: c.label.clone(),
+        labels: vec![(crate::executor::RUN_LABEL.into(), c.label.clone())],
+        init: true,
+        cap_drop: vec!["ALL".into()],
+        no_new_privileges: true,
+        ..Default::default()
     }
 }
 

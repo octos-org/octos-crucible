@@ -12,7 +12,7 @@
 #
 # Exit status: 0 = result.json written, 2 = usage error, 1 = no result.json.
 # Environment (optional): CRUCIBLE_SCORER_IMAGE (prebuilt image; default:
-# build ./image).
+# build ./image). Containers: `crucible ctr` (`$CRUCIBLE`, default on PATH).
 set -uo pipefail
 
 main() {
@@ -40,7 +40,9 @@ case "$VISIBILITY" in public|hidden) ;; *) die_usage "--visibility must be publi
 for v in "$TASK_ID" "$SUBMISSION_ID"; do
   case "$v" in *[!A-Za-z0-9._-]*) die_usage "--task-id/--submission-id: only [A-Za-z0-9._-]" ;; esac
 done
-command -v docker >/dev/null || die_usage "needs docker on PATH"
+CRUCIBLE="${CRUCIBLE:-crucible}"
+command -v "$CRUCIBLE" >/dev/null || die_usage "needs crucible on PATH (or \$CRUCIBLE)"
+ctr() { "$CRUCIBLE" ctr "$@"; }
 
 RUN="$(cd "$RUN" && pwd -P)"
 mkdir -p "$(dirname "$OUT")" || exit 1
@@ -59,9 +61,9 @@ if [ -n "${CRUCIBLE_SCORER_IMAGE:-}" ]; then
   IMAGE="$CRUCIBLE_SCORER_IMAGE"
 else
   IMAGE="crucible-scorer-astro-survey:local"
-  docker build -q -t "$IMAGE" "$HERE/image" >/dev/null 2>&1 || fail "scorer image failed to build"
+  ctr build -q -t "$IMAGE" "$HERE/image" >/dev/null 2>&1 || fail "scorer image failed to build"
 fi
-docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
+ctr run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
   --memory 256m --pids-limit 64 --user "$RUN_AS" \
   -v "$RUN:/record:ro" -v "$WORK:/out" --entrypoint python3 "$IMAGE" /opt/scorer/score_main.py \
   --run /record --out /out/result.json --visibility "$VISIBILITY" \

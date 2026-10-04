@@ -9,7 +9,7 @@
 #
 # CARD_DIR = config/ + public/ + truth/ of one card. The agent and the
 # engine run in two containers (read-only roots, cap-drop ALL) joined only
-# by two FIFOs on a private docker volume; the agent never sees the card.
+# by two FIFOs on a private volume; the agent never sees the card.
 # The engine container has no network. The agent container has none either,
 # unless the platform gives it a model: then it joins --agent-network (built
 # and firewalled by the platform: its only reachable address is the meter)
@@ -20,7 +20,8 @@
 # summary.json (read by the astro-survey scorer). docs/astro-survey.md.
 #
 # Exit status: 0 = run.json written, 2 = usage error, 1 = no run.json.
-# Host requirements: bash, docker, timeout (coreutils).
+# Host requirements: bash, crucible (`$CRUCIBLE`, default on PATH; containers
+# are started with `crucible ctr` by the step's backend), timeout (coreutils).
 # Environment (optional): CRUCIBLE_RUNNER_IMAGE (prebuilt image; default:
 # build ./image).
 set -uo pipefail
@@ -59,7 +60,9 @@ case "$MODEL" in *[!A-Za-z0-9._:/-]*) die_usage "--model: bad name" ;; esac
 [ -z "$OPTIONS" ] || [ -f "$OPTIONS" ] || die_usage "--options: no such file"
 TIMEOUT_BIN="$(command -v timeout || command -v gtimeout || true)"
 [ -n "$TIMEOUT_BIN" ] || die_usage "needs \`timeout\` (GNU coreutils) on PATH"
-command -v docker >/dev/null || die_usage "needs docker on PATH"
+CRUCIBLE="${CRUCIBLE:-crucible}"
+command -v "$CRUCIBLE" >/dev/null || die_usage "needs crucible on PATH (or \$CRUCIBLE)"
+ctr() { "$CRUCIBLE" ctr "$@"; }
 
 abspath() { (cd "$(dirname "$1")" && printf '%s/%s\n' "$(pwd -P)" "$(basename "$1")"); }
 AGENT="$(abspath "$AGENT")"
@@ -81,8 +84,8 @@ mkdir -p "$WORK/out"
 
 # shellcheck disable=SC2317,SC2329 # invoked via trap
 cleanup() {
-  docker rm -f "$AGENT_CTR" "$ENGINE_CTR" >/dev/null 2>&1 || true
-  docker volume rm -f "$PIPES" >/dev/null 2>&1 || true
+  ctr rm -f "$AGENT_CTR" "$ENGINE_CTR" >/dev/null 2>&1 || true
+  ctr volume rm -f "$PIPES" >/dev/null 2>&1 || true
   rm -rf "$WORK" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -92,11 +95,11 @@ log() { echo "[astro-v4] $*" >&2; }
 STATUS="" DETAIL=""
 if [ -n "${CRUCIBLE_RUNNER_IMAGE:-}" ]; then
   IMAGE="$CRUCIBLE_RUNNER_IMAGE"
-  docker image inspect "$IMAGE" >/dev/null 2>&1 || docker pull -q "$IMAGE" >/dev/null 2>&1 \
+  ctr image exists "$IMAGE" >/dev/null 2>&1 || ctr image pull -q "$IMAGE" >/dev/null 2>&1 \
     || { STATUS=error; DETAIL="runner image unavailable: $IMAGE"; }
 else
   IMAGE="crucible-runner-astro-v4:local"
-  docker build -q -t "$IMAGE" "$HERE/image" >"$WORK/build.log" 2>&1 \
+  ctr build -q -t "$IMAGE" "$HERE/image" >"$WORK/build.log" 2>&1 \
     || { STATUS=error; DETAIL="runner image failed to build"; }
 fi
 
@@ -111,15 +114,15 @@ fi
 
 if [ -z "$STATUS" ]; then
   # Private volume with the two FIFOs, owned by the run uid.
-  docker volume create --label "$LABEL" "$PIPES" >/dev/null \
-    && docker run --rm --network none --label "$LABEL" -v "$PIPES:/pipes" --entrypoint sh "$IMAGE" -c \
+  ctr volume create --label "$LABEL" "$PIPES" >/dev/null \
+    && ctr run --rm --network none --label "$LABEL" -v "$PIPES:/pipes" --entrypoint sh "$IMAGE" -c \
       "mkfifo -m 600 /pipes/to_agent /pipes/from_agent && chown -R $RUN_AS /pipes && chmod 700 /pipes" \
     || { STATUS=error; DETAIL="could not set up the agent pipes"; }
 fi
 
 if [ -z "$STATUS" ]; then
   # Agent: sees only its zip and the pipes (and, with a model, the meter).
-  docker run -d --name "$AGENT_CTR" "${LOCKDOWN[@]}" "${AGENT_NET[@]}" \
+  ctr run -d --name "$AGENT_CTR" "${LOCKDOWN[@]}" "${AGENT_NET[@]}" \
     --tmpfs /work:rw,exec,size=512m,uid="${RUN_AS%%:*}",gid="${RUN_AS##*:}" \
     -v "$AGENT:/in/agent.zip:ro" -v "$PIPES:/pipes" \
     --entrypoint python3 "$IMAGE" /opt/runner/agent_entry.py /in/agent.zip >/dev/null \
@@ -130,14 +133,14 @@ if [ -z "$STATUS" ]; then
   # Engine: sees the card (read-only) and the pipes; the wall clock is the
   # card's own (<= 900 s), --time-limit is only a backstop.
   log "running the survey (wall clock <= 900 s)"
-  "$TIMEOUT_BIN" -k 10 "$TIME_LIMIT_S" docker run --rm --name "$ENGINE_CTR" "${LOCKDOWN[@]}" --network none \
+  "$TIMEOUT_BIN" -k 10 "$TIME_LIMIT_S" "$CRUCIBLE" ctr run --rm --name "$ENGINE_CTR" "${LOCKDOWN[@]}" --network none \
     --tmpfs /tmp:rw,size=256m -v "$MATERIAL:/card:ro" -v "$WORK/out:/out" -v "$PIPES:/pipes" \
     --entrypoint python3 "$IMAGE" /opt/runner/engine_main.py --card /card --out /out \
     >"$WORK/engine.log" 2>&1
   rc=$?
   [ "$rc" -eq 0 ] || log "engine container exited $rc"
-  agent_rc="$(docker inspect -f '{{.State.ExitCode}}' "$AGENT_CTR" 2>/dev/null || echo "")"
-  docker rm -f "$AGENT_CTR" >/dev/null 2>&1 || true
+  agent_rc="$(ctr inspect -f exit-code "$AGENT_CTR" 2>/dev/null || echo "")"
+  ctr rm -f "$AGENT_CTR" >/dev/null 2>&1 || true
   if [ ! -s "$WORK/out/summary.json" ]; then
     if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
       STATUS=agent_failed; DETAIL="survey run exceeded ${TIME_LIMIT_S}s"
