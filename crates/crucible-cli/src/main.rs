@@ -15,6 +15,7 @@ mod cred;
 mod executor;
 mod keys;
 mod local;
+mod nomad;
 mod packagers;
 mod plan;
 mod publish;
@@ -225,7 +226,8 @@ enum Cmd {
     },
     /// Show (or wait for) an evaluation's status and scores.
     Status(submit::StatusArgs),
-    /// Run a whole evaluation without GitHub (`local`: on this machine).
+    /// Run a whole evaluation without GitHub (`local`: on this machine;
+    /// `nomad`: each step a Nomad job).
     Eval {
         #[command(subcommand)]
         cmd: local::EvalCmd,
@@ -467,6 +469,9 @@ async fn run(cmd: Cmd, secrets: Option<steps::Secrets>) -> Result<()> {
         Cmd::Eval {
             cmd: local::EvalCmd::Local(a),
         } => local::eval_local(*a).await,
+        Cmd::Eval {
+            cmd: local::EvalCmd::Nomad(a),
+        } => local::eval_nomad(*a).await,
         Cmd::Keys {
             cmd: local::KeysCmd::Gen { out },
         } => local::keys_gen(&out),

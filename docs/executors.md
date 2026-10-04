@@ -4,7 +4,7 @@
 
 插件化（`docs/plugins.md`，P2 的 `plugins.json`、产出运行器 `workdir`、打包器、打分器）是本文的前提：插件决定"一步里做什么"，本文只决定"这一步在哪、用什么起容器、密钥怎么送到"。插件接口不因执行层而改变。
 
-第 5 节给出实施顺序，每一步单独上线。**已实现**：步骤层（`crucible step <名字>`，`crucible step list` 输出全部声明）、执行后端接口与 Docker 实现（沙箱按槽位分配，一台机器可同时跑多个评测）、单机运行 `crucible eval local`（用法见 §5.2 末尾）。Nomad、Kubernetes 尚未开始。
+第 5 节给出实施顺序，每一步单独上线。**已实现**：步骤层（`crucible step <名字>`，`crucible step list` 输出全部声明）、执行后端接口与 Docker 实现（沙箱按槽位分配，一台机器可同时跑多个评测）、单机运行 `crucible eval local`（用法见 §5.2 末尾）、Nomad 后端 `crucible eval nomad`（整步托管，用法见 `docs/nomad.md`）。Kubernetes 尚未开始。
 
 ---
 
@@ -470,6 +470,8 @@ crucible eval local --root <仓库> --taskset hello-world --agent builtin:octos 
 **工作量：** 约 1 周（调度实现 3 天，job 模板、Variables、节点准备文档 2 天）。
 
 **验证：** magicbook 上 `nomad agent -dev`（客户端配置里启用 `raw_exec`），跑 hello-world 两阶段和巡天 L1。
+
+**已实现（`crucible eval nomad`，`docs/nomad.md`）。** 与上面的差别：包搬运不走 blob 存储，而是评测目录与 `dir:` 存储放在各节点同一路径的共享盘上（单节点就是本机硬盘）；节点池默认都是 `default`，多节点时用 `--trusted-pool` / `--sandbox-pool` 分开；沙箱槽位已支持并发，所以不再要求"一个节点同时只跑一个沙箱步骤"。密钥按 §4.3：每个 job 一个自己的 Variable，`template` 渲染到 `secrets/`，job 规格按步骤清单生成。
 
 ### 5.5 完全离开 GitHub 还差什么
 
