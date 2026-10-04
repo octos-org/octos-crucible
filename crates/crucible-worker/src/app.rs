@@ -193,6 +193,15 @@ impl<'a, B: Backend> App<'a, B> {
 
     fn storage_err(&self, e: String) -> ApiError {
         self.b.log(&format!("KV error: {e}"));
+        if e.contains("limit exceeded") {
+            // Workers KV daily quota (free plan: 1000 writes/day, reset at
+            // 00:00 UTC). Not a bug in the request; say so.
+            return ApiError::new(
+                503,
+                "storage_quota",
+                "storage write quota exhausted for today (resets 00:00 UTC)",
+            );
+        }
         ApiError::internal("storage error")
     }
 
@@ -692,23 +701,28 @@ impl<'a, B: Backend> App<'a, B> {
         }
         let hash = sha256_hex(&req.body);
         let record_key = format!("upload/{hash}");
+        let tag = release_tag(&hash).expect("sha256 hex");
+        let gh = self.gh();
+        // The KV record is the claim and is written before the bytes reach
+        // GitHub, so a request cut short after its GitHub upload can be
+        // retried: the owner's retry finds its record and accepts the asset
+        // already there once its bytes check out. Bytes in the store without
+        // a record are someone else's (e.g. workflow outputs) and stay
+        // unclaimable.
         if let Some(rec) = self.kv_json::<UploadRecord>(&record_key).await? {
             if rec.owner_id != p.github_id {
                 return Err(ApiError::conflict("this blob belongs to another user"));
             }
+            let release = gh.release(&tag).await?;
+            if gh.upload_asset(&release, &hash, req.body.clone()).await?
+                == UploadOutcome::AlreadyExists
+                && !gh.asset_matches(&tag, &hash).await?
+            {
+                return Err(ApiError::upstream("stored asset does not match its name"));
+            }
             return Ok(Resp::json(200, &json!({"hash": hash})));
         }
-        let tag = release_tag(&hash).expect("sha256 hex");
-        let gh = self.gh();
         let release = gh.release(&tag).await?;
-        if gh.upload_asset(&release, &hash, req.body.clone()).await? == UploadOutcome::AlreadyExists
-        {
-            // Stored earlier but not through this user's upload: refuse, so
-            // nobody can claim someone else's sealed blob.
-            return Err(ApiError::conflict(
-                "a blob with these bytes already exists; encrypt again and re-upload",
-            ));
-        }
         let rec = UploadRecord {
             owner_id: p.github_id,
             kind,
@@ -721,6 +735,16 @@ impl<'a, B: Backend> App<'a, B> {
             PutOptions::default(),
         )
         .await?;
+        if gh.upload_asset(&release, &hash, req.body.clone()).await? == UploadOutcome::AlreadyExists
+        {
+            // Stored earlier but not through this user's upload: withdraw
+            // the claim and refuse, so nobody can claim someone else's
+            // sealed blob.
+            let _ = self.b.kv_delete(&record_key).await;
+            return Err(ApiError::conflict(
+                "a blob with these bytes already exists; encrypt again and re-upload",
+            ));
+        }
         Ok(Resp::json(201, &json!({"hash": hash})))
     }
 
@@ -1052,27 +1076,43 @@ impl<'a, B: Backend> App<'a, B> {
         let mut rec = self.load_record(id).await?;
         let results = parse_results(&req.body, id)?;
         let prev = self.load_results(id).await?;
-        let stored = StoredResults {
+        let mut stored = StoredResults {
             manifest: results.manifest,
             download_sha256: results
                 .download
-                .or_else(|| prev.and_then(|p| p.download_sha256)),
+                .or_else(|| prev.as_ref().and_then(|p| p.download_sha256.clone())),
             status: results.status,
             updated_at: rfc3339(self.b.now_s()),
         };
-        // The results key is the source of truth and is written first; the
-        // record write below only mirrors the status for the list.
-        self.kv_put(
-            &format!("results/{id}"),
-            &serde_json::to_vec(&stored).expect("json"),
-            PutOptions::default(),
-        )
-        .await?;
-        if is_terminal(&stored.status) {
-            rec.status.clone_from(&stored.status);
+        // A repeated delivery (the poster retries when an answer is lost)
+        // keeps what is stored and writes only what is still missing.
+        let repeat = prev.filter(|p| {
+            p.manifest == stored.manifest
+                && p.download_sha256 == stored.download_sha256
+                && p.status == stored.status
+        });
+        if let Some(p) = repeat {
+            stored.updated_at = p.updated_at;
+        } else {
+            // The results key is the source of truth and is written first;
+            // the record write below only mirrors the status for the list.
+            self.kv_put(
+                &format!("results/{id}"),
+                &serde_json::to_vec(&stored).expect("json"),
+                PutOptions::default(),
+            )
+            .await?;
         }
-        rec.updated_at.clone_from(&stored.updated_at);
-        self.save_record(&rec, Some(&stored)).await?;
+        let mirrored = if is_terminal(&stored.status) {
+            stored.status.clone()
+        } else {
+            rec.status.clone()
+        };
+        if rec.status != mirrored || rec.updated_at < stored.updated_at {
+            rec.status = mirrored;
+            rec.updated_at.clone_from(&stored.updated_at);
+            self.save_record(&rec, Some(&stored)).await?;
+        }
         if is_terminal(&stored.status) {
             let _ = self.b.kv_delete(&format!("cred/{id}")).await;
         }
@@ -1104,6 +1144,10 @@ impl<'a, B: Backend> App<'a, B> {
         let shown = rec.clone().with_results(results.as_ref()).status;
         if is_terminal(&shown) {
             return Err(ApiError::conflict(format!("eval is already {shown}")));
+        }
+        if rec.status == body.status {
+            // A repeated report: nothing to write.
+            return Ok(Resp::json(200, &json!({"ok": true, "status": rec.status})));
         }
         rec.status = body.status;
         rec.updated_at = rfc3339(self.b.now_s());

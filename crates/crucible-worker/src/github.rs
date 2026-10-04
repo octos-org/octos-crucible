@@ -263,6 +263,21 @@ impl<'a, B: Backend> GitHub<'a, B> {
         }
     }
 
+    /// Whether the stored asset `hash` holds exactly these bytes (it is
+    /// downloaded and hashed). Network errors and non-200 answers are
+    /// upstream errors, so a caller retries rather than trusting it.
+    pub async fn asset_matches(&self, tag: &str, hash: &str) -> Result<bool, ApiError> {
+        let mut r = self.req("GET", self.asset_download_url(tag, hash), None);
+        r.headers.retain(|(k, _)| k == "user-agent");
+        r.headers
+            .push(("accept".into(), "application/octet-stream".into()));
+        let resp = self.send("download asset", r).await?;
+        if resp.status != 200 {
+            return Err(upstream("download asset", resp.status));
+        }
+        Ok(crate::shard::sha256_hex(&resp.body) == hash)
+    }
+
     /// Public download URL of a blob (assets of a public repo's releases
     /// need no token; blobs are sealed or password-protected anyway).
     pub fn asset_download_url(&self, tag: &str, hash: &str) -> String {

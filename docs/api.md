@@ -26,6 +26,7 @@ Worker 只经手密文：上传文件和模型凭据都是浏览器用平台公�
 | `payload_too_large` | 413 | |
 | `upstream_error` | 502 | GitHub 调用失败 |
 | `internal` | 500 | 存储错误或配置错误 |
+| `storage_quota` | 503 | KV 当天的写入额度已用完（免费版每天 1000 次，UTC 0 点重置）；稍后重试 |
 
 - **评测状态**（`status`）只有这几种取值：`queued` | `building` | `running:<阶段名>` | `scoring` | `done` | `failed`。`done` 和 `failed` 是终态。状态只会前进，不会倒退。
 - **eval_id**：前端生成的小写 UUID v4。
@@ -102,6 +103,7 @@ workflow（持私钥，不运行上传的代码）解密 zip、检查、按阶�
 - 计算 SHA-256 后存为 GitHub Release asset：预发布 release `blobs-NN`，NN = 哈希第一个字节 >> 3（00…31），asset 名为完整的十六进制哈希。release 不存在时会创建为 prerelease。（规则与 crucible-store 一致。）
 - → 新上传返回 `201 {"hash": "<sha256>"}`；同一用户重复上传同样的字节返回 `200`，结果相同。
 - 上传记录写入 KV `upload/<hash>`（owner、kind）。如果这些字节已经存在于存储里但不是本人上传的，返回 409；提交评测时也只能引用自己上传的块。这样任何人都不能拿别人的密文块让平台去解密。
+- 顺序：先写 KV 记录（认领），再传 GitHub。所以请求在传完 GitHub 后中断（应答丢失、超时），同一用户重试同样的字节时会找到自己的记录；GitHub 报 asset 已存在时，Worker 下载该 asset 核对 SHA-256，一致即返回 `200`。没有记录却已存在的字节（别人的、或工作流产出）仍返回 409，并撤回这次认领。KV 写不进去时（`storage_quota` / `internal`）不会上传到 GitHub。
 
 ## 评测
 
@@ -184,10 +186,10 @@ workflow 通过 `/internal/status` 上报的精确状态优先。估计值只能
 |---|---|
 | `GET /internal/cred/:id` | → `200 application/octet-stream`：KV 中原样保存的 envelope 字节（即 `cred_envelope` 经 base64 解码后的内容）。不存在或已过期返回 404。`crucible cred open` 同时接受原始字节和 base64。 |
 | `DELETE /internal/cred/:id` | → 204（幂等）。 |
-| `POST /internal/status/:id` | `{"status": "building" \| "running:<阶段名>" \| "scoring" \| "failed"}` → `200 {"ok":true,"status"}`。评测已结束时返回 409。 |
+| `POST /internal/status/:id` | `{"status": "building" \| "running:<阶段名>" \| "scoring" \| "failed"}` → `200 {"ok":true,"status"}`。评测已结束时返回 409；与当前状态相同时不写入，直接返回 200。 |
 | `GET /internal/tasksets/:id?github_id=N` | `:id` 为 `u-<16 hex>`。→ 该题目包的 `taskset.json`；未就绪 409；该用户既不是上传者、题目包也未公开时 403。 |
 | `POST /internal/tasksets/:id` | taskset-pack 的结果：`{"status": "ready", "taskset": {...}}`（`name` 必须等于 id，打分器必须是用户可用的，校验通过）或 `{"status": "failed", "error": "<≤500 字符>"}`。只接受一次（之后 409）。 |
-| `POST /internal/results/:id` | 请求体是一个 crucible-core `Manifest`（`eval_id` 必须与 URL 一致；`download` 就是 Manifest 自带的字段，由 `crucible download-zip` 写入），外加两个可选的顶层字段：`download: {"sha256": "<密码 zip 的哈希>"}`，以及 `status`（默认 `done`；如果只是回传部分结果、run 还在继续，可填 `running:<阶段>` 或 `scoring`）。不超过 2 MiB。Worker 把 manifest（去掉这两个字段）存进 `results/<eval_id>`，更新状态；进入终态时删除凭据。→ `200 {"ok":true,"status"}` |
+| `POST /internal/results/:id` | 请求体是一个 crucible-core `Manifest`（`eval_id` 必须与 URL 一致；`download` 就是 Manifest 自带的字段，由 `crucible download-zip` 写入），外加两个可选的顶层字段：`download: {"sha256": "<密码 zip 的哈希>"}`，以及 `status`（默认 `done`；如果只是回传部分结果、run 还在继续，可填 `running:<阶段>` 或 `scoring`）。不超过 2 MiB。Worker 把 manifest（去掉这两个字段）存进 `results/<eval_id>`，更新状态；进入终态时删除凭据。→ `200 {"ok":true,"status"}`。幂等：再次回传相同内容时不重写已存的结果，只补上上次没写成的记录，都写好了就什么也不写，照样返回 200。 |
 
 ## 触发参数（workflow_dispatch）
 
