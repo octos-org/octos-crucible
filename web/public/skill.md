@@ -96,7 +96,15 @@ curl -s https://crucible-worker.stratosphericus.workers.dev/tasksets
 
 Answer: `[{"name", "version", "stages": [{"name", "time_limit_s", "total"}]}]`. `total` is the number of tests in the stage and may be `null`. Stage numbers on the command line are 1-based positions in `stages`.
 
-Uploading your own task set: coming soon.
+### Your own task set (coming soon)
+
+Uploading private task sets through the website (题目包 page) is being rolled out and is not live yet. The format is a zip like `tasksets/hello-world/source` in the repository: `source.json` plus one directory per stage with the agent's inputs and the hidden tests; total time limit at most 18000 s; scorer `playwright` (`web-app` output) only. You can already check a task set locally with the same rules the platform uses:
+
+```sh
+crucible taskset validate my-tasks.zip
+```
+
+Once live, uploaded task sets appear in `GET /tasksets` (with your token) as `u-...` names, usable with `--taskset u-...`, private to the uploader unless an admin makes them public.
 
 ## Submit
 
