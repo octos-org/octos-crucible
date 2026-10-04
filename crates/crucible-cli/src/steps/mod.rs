@@ -27,6 +27,7 @@ use crate::keys::Store;
 pub mod generate;
 pub mod handoff;
 pub mod pack;
+pub mod plugin;
 pub mod publish;
 pub mod score_tests;
 
@@ -158,6 +159,35 @@ pub const STEPS: &[StepSpec] = &[
             Secret::StoreRead,
             Secret::StoreWrite,
         ],
+        needs: TRUSTED,
+        retry: true,
+    },
+    StepSpec {
+        name: "plugin-open",
+        inputs: &[],
+        output: "plugin-build",
+        secrets: &[Secret::PlatformKey, Secret::WorkerToken, Secret::StoreRead],
+        needs: TRUSTED,
+        retry: true,
+    },
+    StepSpec {
+        name: "plugin-build",
+        inputs: &["plugin-build"],
+        output: "plugin-outcome",
+        secrets: &[Secret::RunKey],
+        needs: Needs {
+            containers: true,
+            sandbox_net: false,
+            internet: true,
+            pool: Pool::Sandbox,
+        },
+        retry: true,
+    },
+    StepSpec {
+        name: "plugin-report",
+        inputs: &["plugin-outcome"],
+        output: "none",
+        secrets: &[Secret::WorkerToken],
         needs: TRUSTED,
         retry: true,
     },
@@ -366,6 +396,12 @@ pub enum StepCmd {
     List,
     /// Register an uploaded taskset (taskset-pack.yml).
     Pack(Box<pack::Args>),
+    /// Uploaded plugin, 1/3: open and check the package, re-seal it for the build.
+    PluginOpen(Box<plugin::OpenArgs>),
+    /// Uploaded plugin, 2/3: build its image and self-test it; holds only the one-run key.
+    PluginBuild(Box<plugin::BuildArgs>),
+    /// Uploaded plugin, 3/3: deliver the outcome to the Worker.
+    PluginReport(Box<plugin::ReportArgs>),
     /// Validate the eval.yml inputs (IN_* env); write job outputs.
     Plan {
         #[command(flatten)]
@@ -396,6 +432,9 @@ impl StepCmd {
         let (name, c) = match self {
             StepCmd::List => return None,
             StepCmd::Pack(a) => ("pack", &a.common),
+            StepCmd::PluginOpen(a) => ("plugin-open", &a.common),
+            StepCmd::PluginBuild(a) => ("plugin-build", &a.common),
+            StepCmd::PluginReport(a) => ("plugin-report", &a.common),
             StepCmd::Plan { common, .. } => ("plan", common),
             StepCmd::PlanScore { common, .. } => ("plan-score", common),
             StepCmd::Generate(a) => ("generate", &a.common),
@@ -419,6 +458,9 @@ pub async fn run(cmd: StepCmd, secrets: Option<Secrets>) -> Result<()> {
     match cmd {
         StepCmd::List => unreachable!(),
         StepCmd::Pack(a) => pack::run(a, &secrets).await,
+        StepCmd::PluginOpen(a) => plugin::open(a, &secrets).await,
+        StepCmd::PluginBuild(a) => plugin::build(*a, &secrets).await,
+        StepCmd::PluginReport(a) => plugin::report(*a, &secrets).await,
         StepCmd::Plan { args, .. } => {
             let crate::PlanArgs {
                 inputs,
@@ -565,7 +607,12 @@ mod tests {
             .filter(|s| s.secrets.contains(&Secret::PlatformKey))
             .map(|s| s.name)
             .collect();
-        assert_eq!(holders, ["pack", "generate", "handoff", "publish"]);
+        assert_eq!(
+            holders,
+            ["pack", "plugin-open", "generate", "handoff", "publish"]
+        );
+        // An uploaded plugin is built where no platform secret is.
+        assert_eq!(spec("plugin-build").secrets, &[Secret::RunKey]);
     }
 
     #[test]

@@ -154,20 +154,30 @@ pub struct ContainerPlugin {
     pub run_label: Option<String>,
 }
 
-/// Resolve a container plugin of the registry under `root`.
+/// The generic shell that runs an uploaded scorer's image
+/// (docs/plugins.md §14), relative to the plugins root.
+pub const USER_SCORER_SHELL: &str = "scorers/_user/score.sh";
+
+/// Resolve a container plugin of the taskset (registry, or uploaded)
+/// under `root`.
 pub async fn container_plugin(
     root: &Path,
+    ts: &TaskSet,
     kind: Kind,
     reference: &str,
     entry: &str,
 ) -> Result<ContainerPlugin> {
-    let p = crucible_core::plugins::registry()
-        .resolve(kind, reference)
+    let p = ts
+        .plugin(kind, reference)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     if p.is_builtin() {
         bail!("{} {} is not a container plugin", kind.as_str(), p.name);
     }
-    let entry = root.join(&p.implementation).join(entry);
+    let entry = if p.is_user() {
+        root.join(USER_SCORER_SHELL)
+    } else {
+        root.join(&p.implementation).join(entry)
+    };
     if !entry.is_file() {
         bail!(
             "{} {} not found at {}",
@@ -176,13 +186,21 @@ pub async fn container_plugin(
             entry.display()
         );
     }
-    // Built by `step score-tests` (else the script builds its own).
+    // Built by `step score-tests` (else the script builds its own; an
+    // uploaded plugin has no script of its own and must be built there).
     let tag = format!("crucible-{}-{}:run", kind.as_str(), p.name);
     let exec = crate::executor::backend()?;
     let image = exec
         .image_exists(&exec.image_ref(&tag))
         .await
         .then(|| exec.image_ref(&tag));
+    if p.is_user() && image.is_none() {
+        bail!(
+            "{} {}: its image {tag} was not built (crucible step score-tests builds it)",
+            kind.as_str(),
+            p.name
+        );
+    }
     Ok(ContainerPlugin {
         entry,
         image,
@@ -663,6 +681,7 @@ pub async fn score(o: &ScoreOpts<'_>) -> Result<Vec<(u32, String, ScoreResult)>>
         let label = o.run_label.map(str::to_owned);
         let mut scorer = container_plugin(
             o.plugins_root,
+            o.taskset,
             Kind::Scorer,
             &crucible_core::taskset::scorer_spec(stage.scorer_ref(o.taskset)),
             "score.sh",
@@ -672,7 +691,8 @@ pub async fn score(o: &ScoreOpts<'_>) -> Result<Vec<(u32, String, ScoreResult)>>
         let runner = match &stage.interactive {
             Some(i) => {
                 let mut r =
-                    container_plugin(o.plugins_root, Kind::Runner, &i.name, "run.sh").await?;
+                    container_plugin(o.plugins_root, o.taskset, Kind::Runner, &i.name, "run.sh")
+                        .await?;
                 r.run_label = label.clone();
                 Some(r)
             }
@@ -746,8 +766,9 @@ pub async fn score(o: &ScoreOpts<'_>) -> Result<Vec<(u32, String, ScoreResult)>>
 /// Re-seal what the scoring machine needs to a fresh one-run key:
 /// `<out>/tests/<stage>.sealed` (the stage's tests zip) and
 /// `<out>/results/<replica>/<stage>/checkpoint.sealed` (an empty directory
-/// when the stage ran but left no checkpoint). Nothing else of `results`
-/// (logs, agent facts) is copied. Returns the one-run key.
+/// when the stage ran but left no checkpoint), and `<out>/plugins/<id>.sealed`
+/// (each uploaded plugin's package). Nothing else of `results` (logs,
+/// agent facts) is copied.
 pub async fn handoff(
     ts: &TaskSet,
     stages: &[usize],
@@ -759,6 +780,17 @@ pub async fn handoff(
 ) -> Result<()> {
     let reps = replicas(results)?;
     std::fs::create_dir_all(out.join("tests"))?;
+    // Uploaded plugins: their packages, built into images on the scoring
+    // machine (the package may be private to its uploader).
+    for u in &ts.user_plugins {
+        let plain = store.get_sealed(&u.blob, keys).await?;
+        let d = out.join("plugins");
+        std::fs::create_dir_all(&d)?;
+        std::fs::write(
+            d.join(format!("{}.sealed", u.name)),
+            crucible_crypto::seal(to, &plain)?,
+        )?;
+    }
     for &i in stages {
         let stage = &ts.stages[i];
         let todo: Vec<u32> = reps

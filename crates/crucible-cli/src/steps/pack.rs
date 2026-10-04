@@ -57,7 +57,7 @@ pub async fn run(a: Box<Args>, s: &Secrets) -> Result<()> {
             Some(s.worker(&origin)?)
         }
     };
-    let packed = pack(&a, id, hash, s).await;
+    let packed = pack(&a, id, hash, s, worker.as_ref()).await;
     let Some(w) = worker else {
         return match packed {
             Ok(_) => Ok(()),
@@ -88,18 +88,44 @@ pub async fn run(a: Box<Args>, s: &Secrets) -> Result<()> {
     }
 }
 
-async fn pack(a: &Args, id: &str, hash: &str, s: &Secrets) -> Result<crucible_core::TaskSet> {
+async fn pack(
+    a: &Args,
+    id: &str,
+    hash: &str,
+    s: &Secrets,
+    worker: Option<&crate::worker::Worker>,
+) -> Result<crucible_core::TaskSet> {
     let keys = s.keys(Secret::PlatformKey)?;
     let zip = crucible_crypto::open(&keys, &s.store(&a.store, false)?.get(hash).await?)?;
     drop(keys);
     let key = crate::keys::current_public_key(&a.keys)?;
     let tmp = tempfile::tempdir()?;
     let root = crate::taskset_cmd::unpack_source_zip(&zip, tmp.path())?;
+    // Uploaded plugins its scorers name: the Worker says whether this
+    // taskset's owner may use them (their own, or public) and pins them.
+    let mut user_plugins = Vec::new();
+    for pid in crate::taskset_cmd::PackSource::read(&root.join("source.json"))
+        .map_err(|e| {
+            anyhow!(
+                "{}",
+                format!("{e:#}").replace(&format!("{}/", root.display()), "")
+            )
+        })?
+        .user_plugin_refs()
+    {
+        let w = worker.ok_or_else(|| anyhow!("uploaded plugins need the Worker (results_url)"))?;
+        user_plugins.push(
+            w.get_user_plugin(&pid, id)
+                .await
+                .map_err(|e| anyhow!("scorer {pid}: not a ready plugin you may use ({e:#})"))?,
+        );
+    }
     // Errors name files relative to the upload, not this machine.
-    let mut ts = crate::taskset_cmd::pack(
+    let mut ts = crate::taskset_cmd::pack_with(
         &root.join("source.json"),
         &root,
         true,
+        &user_plugins,
         &key,
         &s.store(&a.store, true)?,
         false,

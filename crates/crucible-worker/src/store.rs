@@ -11,8 +11,8 @@ use serde_json::Value;
 use crate::http::{Backend, Row, SqlArg, Stmt};
 use crate::leaderboard::{BoardInfo, Candidate};
 use crate::model::{
-    Budget, EvalRecord, EvalSummary, Mode, StoredResults, UploadKind, UploadRecord, UserTaskset,
-    score_of, shown_status,
+    Budget, EvalRecord, EvalSummary, Mode, StoredResults, UploadKind, UploadRecord,
+    UserPluginRecord, UserTaskset, score_of, shown_status,
 };
 use crate::tokens::{TokenRecord, TokenSummary};
 use crucible_core::taskset::ScoreFormat;
@@ -157,6 +157,24 @@ fn taskset_of(r: &Row) -> R<UserTaskset> {
         public: int(r, "public") == Some(1),
         title: text(r, "title"),
         taskset: json_col(r, "taskset"),
+        created_at: text(r, "created_at").unwrap_or_default(),
+        updated_at: text(r, "updated_at").unwrap_or_default(),
+    })
+}
+
+fn plugin_of(r: &Row) -> R<UserPluginRecord> {
+    let t = "user_plugins";
+    Ok(UserPluginRecord {
+        id: need(text(r, "id"), t, "id")?,
+        owner_id: need(uint(r, "owner_id"), t, "owner_id")?,
+        owner_login: need(text(r, "owner_login"), t, "owner_login")?,
+        upload_hash: need(text(r, "upload_hash"), t, "upload_hash")?,
+        status: need(text(r, "status"), t, "status")?,
+        error: text(r, "error"),
+        public: int(r, "public") == Some(1),
+        title: text(r, "title"),
+        plugin: json_col(r, "plugin"),
+        info: json_col(r, "info"),
         created_at: text(r, "created_at").unwrap_or_default(),
         updated_at: text(r, "updated_at").unwrap_or_default(),
     })
@@ -546,6 +564,109 @@ impl<B: Backend> Db<'_, B> {
             }
         };
         rows.iter().map(taskset_of).collect()
+    }
+
+    // ---- user plugins ---------------------------------------------------
+
+    pub async fn plugin(&self, id: &str) -> R<Option<UserPluginRecord>> {
+        self.first("SELECT * FROM user_plugins WHERE id = ?1", args![id])
+            .await?
+            .map(|r| plugin_of(&r))
+            .transpose()
+    }
+
+    /// False if the id is taken.
+    pub async fn add_plugin(&self, u: &UserPluginRecord) -> R<bool> {
+        Ok(self
+            .run(Stmt {
+                sql: "INSERT INTO user_plugins (id, owner_id, owner_login, upload_hash, status, \
+                      error, public, title, plugin, info, created_at, updated_at) \
+                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
+                      ON CONFLICT (id) DO NOTHING",
+                args: args![
+                    &u.id,
+                    u.owner_id,
+                    &u.owner_login,
+                    &u.upload_hash,
+                    &u.status,
+                    u.error.as_ref(),
+                    u.public,
+                    u.title.as_ref(),
+                    u.plugin.as_ref().map(json_text),
+                    u.info.as_ref().map(json_text),
+                    &u.created_at,
+                    &u.updated_at,
+                ],
+            })
+            .await?
+            == 1)
+    }
+
+    /// Records the build outcome; false unless it was still `building`.
+    pub async fn finish_plugin(&self, u: &UserPluginRecord) -> R<bool> {
+        Ok(self
+            .exec(
+                "UPDATE user_plugins SET status = ?2, error = ?3, title = ?4, plugin = ?5, \
+                 info = ?6, updated_at = ?7 WHERE id = ?1 AND status = 'building'",
+                args![
+                    &u.id,
+                    &u.status,
+                    u.error.as_ref(),
+                    u.title.as_ref(),
+                    u.plugin.as_ref().map(json_text),
+                    u.info.as_ref().map(json_text),
+                    &u.updated_at,
+                ],
+            )
+            .await?
+            == 1)
+    }
+
+    pub async fn set_plugin_public(&self, id: &str, public: bool, at: &str) -> R<()> {
+        self.exec(
+            "UPDATE user_plugins SET public = ?2, updated_at = ?3 WHERE id = ?1",
+            args![id, public, at],
+        )
+        .await
+        .map(drop)
+    }
+
+    /// Newest first: every upload (`all`), or the viewer's own plus the
+    /// public ready ones.
+    pub async fn list_plugins(
+        &self,
+        viewer: Option<u64>,
+        all: bool,
+        limit: usize,
+    ) -> R<Vec<UserPluginRecord>> {
+        let limit = limit as u64;
+        let rows = match (all, viewer) {
+            (true, _) => {
+                self.rows(
+                    "SELECT * FROM user_plugins ORDER BY created_at DESC, id LIMIT ?1",
+                    args![limit],
+                )
+                .await?
+            }
+            (false, Some(gid)) => {
+                self.rows(
+                    "SELECT * FROM user_plugins \
+                     WHERE owner_id = ?1 OR (public = 1 AND status = 'ready') \
+                     ORDER BY created_at DESC, id LIMIT ?2",
+                    args![gid, limit],
+                )
+                .await?
+            }
+            (false, None) => {
+                self.rows(
+                    "SELECT * FROM user_plugins WHERE public = 1 AND status = 'ready' \
+                     ORDER BY created_at DESC, id LIMIT ?1",
+                    args![limit],
+                )
+                .await?
+            }
+        };
+        rows.iter().map(plugin_of).collect()
     }
 
     // ---- evals ----------------------------------------------------------

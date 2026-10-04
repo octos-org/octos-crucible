@@ -547,6 +547,205 @@ pub async fn status_cmd(a: StatusArgs) -> Result<()> {
     Ok(())
 }
 
+// ---- uploaded tasksets and plugins ------------------------------------------
+
+/// What `crucible plugin` / `crucible taskset upload` registers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Registered {
+    Plugin,
+    Taskset,
+}
+
+impl Registered {
+    fn kind(self) -> &'static str {
+        match self {
+            Registered::Plugin => "plugin",
+            Registered::Taskset => "taskset",
+        }
+    }
+    fn path(self) -> &'static str {
+        match self {
+            Registered::Plugin => "/plugins",
+            Registered::Taskset => "/tasksets",
+        }
+    }
+    /// Still being checked (`building` / `packing`).
+    fn pending(self, status: &str) -> bool {
+        matches!(status, "building" | "packing")
+    }
+}
+
+#[derive(clap::Subcommand)]
+pub enum PluginCmd {
+    /// Upload a plugin package (a directory or zip with plugin.json and a
+    /// Dockerfile at its root): sealed here, registered, built and
+    /// self-tested on the platform. Prints its id (`u-<16 hex>`).
+    Upload {
+        #[command(flatten)]
+        api: ApiArgs,
+        path: PathBuf,
+        /// Wait until it is ready or refused.
+        #[arg(long)]
+        wait: bool,
+    },
+    /// Your plugins and the public ones.
+    List {
+        #[command(flatten)]
+        api: ApiArgs,
+    },
+    /// One plugin.
+    Status {
+        #[command(flatten)]
+        api: ApiArgs,
+        id: String,
+        #[arg(long)]
+        wait: bool,
+    },
+}
+
+/// Zip a directory as is (symlinks and `.git` left out), or read a zip.
+fn zip_path(path: &Path) -> Result<Vec<u8>> {
+    if !path.is_dir() {
+        return read_zip(path);
+    }
+    let mut entries = Vec::new();
+    let mut stats = zipdir::ZipStats::default();
+    let skip = |rel: &str| rel == ".git" || rel.starts_with(".git/");
+    zipdir::collect(path, "", &skip, &mut entries, &mut stats)?;
+    if stats.bytes as usize > MAX_PLAIN {
+        bail!("{} holds more than 25 MB", path.display());
+    }
+    if stats.dropped_links > 0 {
+        eprintln!("note: {} symlink(s) left out", stats.dropped_links);
+    }
+    Ok(zipdir::write_zip(Cursor::new(Vec::new()), &entries, &[])?.into_inner())
+}
+
+/// Seal, `POST /uploads`, `POST /plugins|/tasksets`; then optionally wait.
+pub async fn upload_registered(
+    what: Registered,
+    a: &ApiArgs,
+    path: &Path,
+    wait: bool,
+) -> Result<()> {
+    let zip = zip_path(path)?;
+    check_zip(&zip)?;
+    if what == Registered::Plugin {
+        // The same checks as the platform's, before uploading.
+        let d = tempfile::tempdir()?;
+        let (_, m) = crate::user_plugin::unpack(&zip, d.path())?;
+        eprintln!(
+            "plugin {} {} ({}): package ok",
+            m.name,
+            m.version,
+            m.kind.as_str()
+        );
+    }
+    let api = Api::new(a)?;
+    let remote = api
+        .ok_json(Method::GET, "/pubkey", &[], None)
+        .await
+        .ok()
+        .and_then(|v| {
+            Some((
+                v["key_id"].as_str()?.to_owned(),
+                v["public_key"].as_str()?.to_owned(),
+            ))
+        });
+    let sealed = seal_upload(&pick_key(remote)?, &zip)?;
+    drop(zip);
+    eprintln!("uploading {} sealed bytes…", sealed.len());
+    let up = api
+        .ok_json(
+            Method::POST,
+            "/uploads",
+            &[
+                ("content-type", "application/octet-stream"),
+                ("x-upload-kind", what.kind()),
+            ],
+            Some(sealed),
+        )
+        .await?;
+    let hash = up["hash"]
+        .as_str()
+        .ok_or_else(|| anyhow!("POST /uploads: no hash in the answer"))?;
+    let r = api
+        .ok_json(
+            Method::POST,
+            what.path(),
+            &[("content-type", "application/json")],
+            Some(serde_json::to_vec(&json!({"upload_hash": hash}))?),
+        )
+        .await?;
+    let id = r["id"]
+        .as_str()
+        .ok_or_else(|| anyhow!("POST {}: no id in the answer", what.path()))?
+        .to_owned();
+    eprintln!(
+        "registered as {id} ({})",
+        r["status"].as_str().unwrap_or("")
+    );
+    println!("{id}");
+    if wait {
+        registered_status(what, a, &id, true).await?;
+    }
+    Ok(())
+}
+
+/// `GET /plugins/:id` (or `/tasksets/:id`), optionally until settled.
+pub async fn registered_status(what: Registered, a: &ApiArgs, id: &str, wait: bool) -> Result<()> {
+    let api = Api::new(a)?;
+    let path = format!("{}/{}", what.path(), id.trim());
+    let d = loop {
+        let d = api.ok_json(Method::GET, &path, &[], None).await?;
+        if !wait || !what.pending(d["status"].as_str().unwrap_or("")) {
+            break d;
+        }
+        eprintln!("status: {}", d["status"].as_str().unwrap_or(""));
+        tokio::time::sleep(Duration::from_secs(20)).await;
+    };
+    println!("{}", serde_json::to_string_pretty(&d)?);
+    if d["status"] == "failed" {
+        bail!(
+            "{} {id} was refused: {}",
+            what.kind(),
+            d["error"].as_str().unwrap_or("")
+        );
+    }
+    Ok(())
+}
+
+pub async fn plugin_cmd(cmd: PluginCmd) -> Result<()> {
+    match cmd {
+        PluginCmd::Upload { api, path, wait } => {
+            upload_registered(Registered::Plugin, &api, &path, wait).await
+        }
+        PluginCmd::Status { api, id, wait } => {
+            registered_status(Registered::Plugin, &api, &id, wait).await
+        }
+        PluginCmd::List { api } => {
+            let a = Api::new(&api)?;
+            let list = a.ok_json(Method::GET, "/plugins", &[], None).await?;
+            for p in list.as_array().into_iter().flatten() {
+                println!(
+                    "{}  {} {}  {}  {}  {}",
+                    p["id"].as_str().unwrap_or(""),
+                    p["title"].as_str().unwrap_or(""),
+                    p["version"].as_str().unwrap_or(""),
+                    p["status"].as_str().unwrap_or(""),
+                    if p["public"] == true {
+                        "public"
+                    } else {
+                        "private"
+                    },
+                    p["owner_login"].as_str().unwrap_or(""),
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
 // ---- output -----------------------------------------------------------------
 
 fn fmt_secs(s: f64) -> String {

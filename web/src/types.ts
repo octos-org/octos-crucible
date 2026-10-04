@@ -31,7 +31,28 @@ export interface TaskSet {
   model_required?: boolean | null;
 }
 
-export type UploadKind = Mode | "taskset";
+export type UploadKind = Mode | "taskset" | "plugin";
+
+/** GET /plugins, GET /plugins/:id: an uploaded plugin (docs/plugins.md §14). */
+export interface UserPlugin {
+  /** `u-<16 hex>`: what a taskset's `scorer.name` refers to. */
+  id: string;
+  /** The name from its plugin.json. */
+  title?: string | null;
+  owner_login: string;
+  public: boolean;
+  status: "building" | "ready" | "failed";
+  error?: string | null;
+  kind?: string;
+  version?: string;
+  description?: string;
+  runs_taskset_code?: boolean;
+  model?: boolean;
+  accepts?: string[];
+  selftest?: { status: string; score?: number | null; max?: number | null; detail?: string } | null;
+  created_at: string;
+  updated_at: string;
+}
 
 export type Mode = "agent" | "app";
 

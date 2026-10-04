@@ -101,7 +101,7 @@ GitHub 回调。换取 token、读取用户之后，用户的 GitHub token 立�
 
 ## 用户上传的题目包
 
-zip 的格式同 `tasksets/hello-world/source`（`source.json` + 各阶段目录），检查规则即 `crucible taskset validate`：格式（未知字段拒绝）、阶段 id、每阶段的输入与测试都存在且不重叠、无符号链接、各阶段限时之和 ≤ 总限时 ≤ 18000 s、打分器只能是 `playwright`（产出 `web-app`）。
+zip 的格式同 `tasksets/hello-world/source`（`source.json` + 各阶段目录），检查规则即 `crucible taskset validate`：格式（未知字段拒绝）、阶段 id、每阶段的输入与测试都存在且不重叠、无符号链接、各阶段限时之和 ≤ 总限时 ≤ 18000 s、插件只能是注册表里 `user: true` 的，或上传者能用的上传插件（`u-...`，见下节）。命令行：`crucible taskset upload <zip 或目录> --wait`。
 
 ### `POST /tasksets`
 `{"upload_hash": "<POST /uploads 返回的 hash，X-Upload-Kind: taskset>"}` → `201 {"id": "u-<16 hex>", "status": "packing"}`
@@ -119,10 +119,32 @@ workflow（持私钥，不运行上传的代码）解密 zip、检查、按阶�
 ### 使用
 `POST /evals` 的 `taskset` 可以填 `u-...`：必须 `ready`，且是本人上传或已公开，否则 400 `unknown taskset`。workflow（eval.yml / score.yml 的 plan 步骤）用 `GET /internal/tasksets/:id?github_id=<owner>` 取 `taskset.json`，Worker 按同样规则再查一次提交者是否有权使用。
 
+## 用户上传的插件
+
+插件包格式、镜像约定和登记流程见 `docs/plugins.md` §14：zip 里有 `plugin.json`（目前只能是 `kind: scorer`）和 `Dockerfile`。
+
+### `POST /plugins`
+`{"upload_hash": "<POST /uploads 返回的 hash，X-Upload-Kind: plugin>"}` → `201 {"id": "u-<16 hex>", "status": "building"}`
+
+`upload_hash` 必须是本人以 `plugin` 类型上传的。Worker 写入 D1 表 `user_plugins`（`building`，私有），并触发 `PLUGIN_WORKFLOW`（默认 `plugin-pack.yml`），参数：`plugin_id`、`source` = `blob:<upload_hash>`、`results_url` = `<worker>/internal/plugins/<id>`。触发失败时记为 `failed`，接口返回 502。
+
+### `GET /plugins`（无需登录；带令牌时多返回自己上传的）
+按上传时间倒序，最多 50 个：匿名只看到已公开且可用的；带令牌时另有自己上传的（任何状态）；管理员加 `?all=1` 看到全部。每项：
+`{"id": "u-...", "title": "<plugin.json 的 name>", "owner_login", "public", "status": "building|ready|failed", "error"?, "kind"?, "version"?, "description"?, "runs_taskset_code"?, "model"?, "accepts"?, "selftest"?: {"status", "score", "max", "detail"}, "created_at", "updated_at"}`。`kind` 之后的字段在 `ready` 之后才有。
+
+### `GET /plugins/:id`
+仅上传者、管理员，或已公开的插件可见，否则 404。→ 同上面列表里的一项。
+
+### `POST /plugins/:id/public`（仅管理员）
+`{"public": true|false}` → `{"id", "public"}`。只有 `ready` 的插件能设为公开（否则 409）。
+
+### 使用
+用户题目包的 `scorer.name` 写 `u-...`。`taskset-pack` 用 `GET /internal/plugins/:id?taskset=<题目包 id>` 取插件的固定形式（插件 `ready`，且题目包上传者是插件上传者或插件已公开，否则 403），写进 `taskset.json` 的 `user_plugins`；`POST /internal/tasksets/:id` 时 Worker 按 D1 再核对一次（不符返回 400）。
+
 ## 上传
 
 ### `POST /uploads`
-- 请求头：`Authorization`，`X-Upload-Kind: agent|app|taskset`，`Content-Type: application/octet-stream`
+- 请求头：`Authorization`，`X-Upload-Kind: agent|app|taskset|plugin`，`Content-Type: application/octet-stream`
 - 请求体：浏览器封好的 envelope 字节，不超过 25 × 1024 × 1024 字节。
 - Worker 只检查：内容是 crucible envelope 头、`key_id` 是当前公钥、头后面有密文。
 - 计算 SHA-256 后存为 GitHub Release asset：预发布 release `blobs-NN`，NN = 哈希第一个字节 >> 3（00…31），asset 名为完整的十六进制哈希。release 不存在时会创建为 prerelease。（规则与 crucible-store 一致。）
@@ -216,6 +238,8 @@ workflow 通过 `/internal/status` 上报的精确状态优先。估计值只能
 | `POST /internal/status/:id` | `{"status": "building" \| "running:<阶段名>" \| "scoring" \| "failed"}` → `200 {"ok":true,"status"}`。评测已结束时返回 409；与当前状态相同时不写入，直接返回 200。`building` 不写库（查询时按 GitHub 估计得到的也是 `building`），返回当前状态。其他状态每次更新一行；第一次写入时顺带记下 run（查 GitHub 一次）。 |
 | `GET /internal/tasksets/:id?github_id=N` | `:id` 为 `u-<16 hex>`。→ 该题目包的 `taskset.json`；未就绪 409；该用户既不是上传者、题目包也未公开时 403。 |
 | `POST /internal/tasksets/:id` | taskset-pack 的结果：`{"status": "ready", "taskset": {...}}`（`name` 必须等于 id，打分器必须是用户可用的，校验通过）或 `{"status": "failed", "error": "<≤500 字符>"}`。只接受一次（之后 409）。 |
+| `GET /internal/plugins/:id?taskset=T` | `:id`、`T` 都是 `u-<16 hex>`。→ 插件的固定形式 `{"kind", "name", "version", "blob", "runs_taskset_code", "model", "accepts"}`；插件未就绪 409；题目包 `T` 的上传者既不是插件上传者、插件也未公开时 403。 |
+| `POST /internal/plugins/:id` | plugin-pack 的结果：`{"status": "ready", "plugin": {...}, "title", "description", "selftest"}`（`plugin.name` 必须等于 id，`plugin.blob.sha256` 必须是上传的 hash）或 `{"status": "failed", "error": "<≤500 字符>"}`。只接受一次（之后 409）。 |
 | `POST /internal/results/:id` | 请求体是一个 crucible-core `Manifest`（`eval_id` 必须与 URL 一致；`download` 就是 Manifest 自带的字段，由 `crucible download-zip` 写入），外加两个可选的顶层字段：`download: {"sha256": "<密码 zip 的哈希>"}`，以及 `status`（默认 `done`；如果只是回传部分结果、run 还在继续，可填 `running:<阶段>` 或 `scoring`）。不超过 1,900,000 字节（D1 单行上限 2 MB）。Worker 把 manifest（去掉这两个字段）存进 `results` 表（只写这一行）；进入终态时删除凭据。终态结果只会被新的终态结果替换，之后到达的部分结果会被忽略。→ `200 {"ok":true,"status"}`。幂等：再次回传相同内容时什么也不写，照样返回 200。 |
 | `POST /internal/migrate-kv` | 一次性把旧 KV 中的记录复制到 D1：请求体 `{"cursor"?: "..."}`，每次处理最多 20 个 key，→ `200 {"prefix", "copied", "skipped", "next"}`；`next` 为 null 表示完成，否则带上它再调。依次处理 `upload/`、`evals/`（连同 `results/`，旧记录内嵌的 manifest 也转成结果行）、`tasksets/`、`token/`、`ban/`。D1 中已有的行保持不变（`ON CONFLICT DO NOTHING`），可重复执行；KV 只读不写。由 `worker.yml` 的 `migrate-kv` job 调用。 |
 
@@ -248,7 +272,7 @@ workflow 通过 `/internal/status` 上报的精确状态优先。估计值只能
 
 ### D1（绑定名 `CRUCIBLE_DB`，数据库 `octos-crucible`）
 
-表结构见 `crates/crucible-worker/migrations/`（`0001_init.sql`、`0002_leaderboard.sql`，`wrangler d1 migrations apply` 按序执行）。
+表结构见 `crates/crucible-worker/migrations/`（`0001_init.sql`、`0002_leaderboard.sql`、`0003_user_plugins.sql`，`wrangler d1 migrations apply` 按序执行）。
 
 | 表 | 内容 | 索引 |
 |---|---|---|
@@ -256,6 +280,7 @@ workflow 通过 `/internal/status` 上报的精确状态优先。估计值只能
 | `evals` | 主键 `eval_id`；提交参数、`status`、`run_id`、`run_url`、`run_completed_s`、时间 | `(owner_id, created_s DESC)`（本人列表）、`(created_s DESC)`（管理员 `?all=1`）、`(taskset, created_s DESC) WHERE score_public = 1`（排行榜） |
 | `results` | 主键 `eval_id`；`manifest`（JSON）、`download_sha256`、`status`、`total_score`、`display`、`updated_at` | 主键（列表 JOIN） |
 | `user_tasksets` | 主键 `id`；用户题目包 | `(owner_id)`、`(public, status)` |
+| `user_plugins` | 主键 `id`；用户插件：`status`、`public`、`title`、`plugin`（固定形式 JSON）、`info`（说明与自检结果） | `(owner_id)`、`(public, status)` |
 | `tokens` | 主键 `id`；`owner_id, login, name, hash, created_at`（hash = SHA-256(令牌)） | `(owner_id)` |
 | `bans` | 主键 `github_id`；`by_id, at, reason` | 主键 |
 | `cache` | 主键 `key`；`tasksets`、`leaderboard`、`leaderboard/<题目包>`（5 分钟）、`release/<tag>`（不过期） | 主键 |
@@ -294,7 +319,7 @@ workflow 通过 `/internal/status` 上报的精确状态优先。估计值只能
 | `GITHUB_REPO` | var | `octos-org/octos-crucible` |
 | `ADMIN_GITHUB_IDS` | var | 逗号分隔的 GitHub 数字 id |
 | `WORKER_URL` | var，可选 | `results_url` 的前缀，默认取请求的 origin |
-| `EVAL_WORKFLOW` / `SCORE_WORKFLOW` / `TASKSET_WORKFLOW` / `EVAL_REF` | var，可选 | 默认分别为 `eval.yml` / `score.yml` / `taskset-pack.yml` / `main` |
+| `EVAL_WORKFLOW` / `SCORE_WORKFLOW` / `TASKSET_WORKFLOW` / `PLUGIN_WORKFLOW` / `EVAL_REF` | var，可选 | 默认分别为 `eval.yml` / `score.yml` / `taskset-pack.yml` / `plugin-pack.yml` / `main` |
 | `GITHUB_CLIENT_ID`、`GITHUB_CLIENT_SECRET` | secret | GitHub OAuth App |
 | `GITHUB_TOKEN` | secret | 细粒度 token，只授权本仓库 |
 | `SESSION_HMAC_KEY` | secret | ≥ 32 字节随机值 |

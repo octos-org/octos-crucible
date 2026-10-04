@@ -131,7 +131,7 @@ function UploadTaskset({ onDone }: { onDone: () => void }) {
       <form class="stack" onSubmit={submit}>
         <p class="muted small">
           zip，格式同仓库 <code>tasksets/hello-world/source</code>：根目录（或唯一的顶层文件夹）放 <code>source.json</code>，每个阶段一个目录，内含给 agent 的需求文件和只给打分器的
-          <code>tests/</code>。总限时不超过 18000 秒，上传的题目包目前只能用 <code>playwright</code> 打分器（更多打分器即将开放）。可先在本地运行 <code>crucible taskset validate 题目包.zip</code>{" "}
+          <code>tests/</code>。总限时不超过 18000 秒。打分器可以是平台开放给用户的（如 <code>playwright</code>、<code>llm-judge</code>），也可以是你在<a href="#/plugins" class="link">“插件”页</a>上传的打分器（<code>"scorer": {"{"}"name": "u-…"{"}"}</code>）。可先在本地运行 <code>crucible taskset validate 题目包.zip</code>{" "}
           检查。文件在浏览器里加密后上传；默认私有，只有你能看到和使用，管理员可设为公开。
         </p>
         <input

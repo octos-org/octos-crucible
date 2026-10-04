@@ -26,6 +26,7 @@ mod score;
 mod steps;
 mod submit;
 mod taskset_cmd;
+mod user_plugin;
 mod worker;
 mod zipdir;
 
@@ -221,6 +222,11 @@ enum Cmd {
     /// and recorded as `download` in the manifest. Skipped (exit 0) when the
     /// credential has no download password.
     DownloadZip(Box<DownloadZipArgs>),
+    /// Upload and inspect your own plugins (token from CRUCIBLE_TOKEN).
+    Plugin {
+        #[command(subcommand)]
+        cmd: submit::PluginCmd,
+    },
     /// Submit an evaluation, like the website (token from CRUCIBLE_TOKEN).
     Submit {
         #[command(subcommand)]
@@ -773,12 +779,9 @@ async fn run(cmd: Cmd, secrets: Option<steps::Secrets>) -> Result<()> {
         Cmd::Plugins { taskset } => {
             let ts = taskset_cmd::load(&taskset)?;
             ts.validate(crucible_core::taskset::MAX_TOTAL_TIME_S)?;
-            let reg = crucible_core::plugins::registry();
             for v in ts.plugin_versions() {
-                let p = reg
-                    .plugins
-                    .iter()
-                    .find(|p| p.kind.as_str() == v.kind && p.name == v.name)
+                let p = ts
+                    .plugins_of_kind(&v.kind, &v.name)
                     .ok_or_else(|| anyhow!("{} {} is not registered", v.kind, v.name))?;
                 if !p.is_builtin() {
                     println!("{} {} {}", v.kind, p.name, p.implementation);
@@ -833,6 +836,7 @@ async fn run(cmd: Cmd, secrets: Option<steps::Secrets>) -> Result<()> {
             .await
         }
         Cmd::Submit { cmd } => submit::submit(cmd).await,
+        Cmd::Plugin { cmd } => submit::plugin_cmd(cmd).await,
         Cmd::Status(a) => submit::status_cmd(a).await,
         Cmd::Worker {
             worker_url,
@@ -966,6 +970,17 @@ enum TasksetCmd {
         /// instead of with the rules for uploaded tasksets.
         #[arg(long)]
         builtin: bool,
+    },
+    /// Upload your own taskset (a zip or directory in the
+    /// tasksets/hello-world/source layout; token from CRUCIBLE_TOKEN):
+    /// sealed here, registered on the platform. Prints its id.
+    Upload {
+        #[command(flatten)]
+        api: submit::ApiArgs,
+        path: PathBuf,
+        /// Wait until it is ready or refused.
+        #[arg(long)]
+        wait: bool,
     },
     /// Report a `taskset-pack` outcome to the Worker (token from
     /// CRUCIBLE_WORKER_TOKEN): the packed taskset.json, or a failure.
@@ -1120,6 +1135,9 @@ async fn taskset(cmd: TasksetCmd) -> Result<()> {
             eprintln!("wrote {}", out.display());
             Ok(())
         }
+        TasksetCmd::Upload { api, path, wait } => {
+            submit::upload_registered(submit::Registered::Taskset, &api, &path, wait).await
+        }
         TasksetCmd::Validate {
             path,
             max_total_s,
@@ -1156,7 +1174,31 @@ async fn taskset(cmd: TasksetCmd) -> Result<()> {
                 } else {
                     root.clone()
                 };
-            let p = taskset_cmd::prepare(&root.join("source.json"), &src_dir, !builtin)?;
+            // Uploaded plugins (u-...) are looked up when the taskset is
+            // registered; here they stand in with the loosest traits.
+            let source = root.join("source.json");
+            let stand_ins: Vec<_> = taskset_cmd::PackSource::read(&source)?
+                .user_plugin_refs()
+                .into_iter()
+                .map(|id| {
+                    eprintln!(
+                        "note: uploaded plugin {id} is checked when the taskset is registered"
+                    );
+                    crucible_core::plugins::UserPlugin {
+                        kind: crucible_core::plugins::Kind::Scorer,
+                        name: id,
+                        version: "0".into(),
+                        blob: crucible_core::BlobRef {
+                            sha256: "0".repeat(64),
+                            key_id: "0".repeat(16),
+                        },
+                        runs_taskset_code: false,
+                        model: true,
+                        accepts: vec![],
+                    }
+                })
+                .collect();
+            let p = taskset_cmd::prepare_with(&source, &src_dir, !builtin, &stand_ins)?;
             for (s, (_, _, ni, nt)) in p.src.stages.iter().zip(&p.zips) {
                 println!(
                     "  {}: {ni} input files, {nt} test files, {}s",

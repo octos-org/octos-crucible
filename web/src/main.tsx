@@ -6,6 +6,7 @@ import { Submit } from "./pages/Submit";
 import { EvalList } from "./pages/EvalList";
 import { EvalDetailPage } from "./pages/EvalDetail";
 import { Tasksets } from "./pages/Tasksets";
+import { Plugins } from "./pages/Plugins";
 import { ComparePage } from "./pages/Compare";
 import { LeaderboardPage } from "./pages/Leaderboard";
 import { parseIds } from "./compare";
@@ -18,6 +19,7 @@ type Route =
   | { page: "evals" }
   | { page: "eval"; id: string }
   | { page: "tasksets" }
+  | { page: "plugins" }
   | { page: "leaderboard"; taskset: string | null }
   | { page: "compare"; ids: string[] };
 
@@ -31,6 +33,7 @@ function parseRoute(hash: string): Route {
   if (l) return { page: "leaderboard", taskset: l[1] ?? null };
   if (path === "/submit") return { page: "submit" };
   if (path === "/tasksets") return { page: "tasksets" };
+  if (path === "/plugins") return { page: "plugins" };
   return { page: "evals" };
 }
 
@@ -102,7 +105,7 @@ function Shell() {
   }, [token]);
 
   // Task sets and leaderboards are public; everything else needs a session.
-  if (!token && route.page !== "tasksets" && route.page !== "leaderboard") return <Login />;
+  if (!token && route.page !== "tasksets" && route.page !== "plugins" && route.page !== "leaderboard") return <Login />;
 
   const nav = (href: string, label: string, active: boolean) => (
     <a href={href} class={active ? "active" : ""} aria-current={active ? "page" : undefined}>
@@ -121,6 +124,7 @@ function Shell() {
           {token && nav("#/evals", "我的评测", route.page === "evals" || route.page === "eval" || route.page === "compare")}
           {nav("#/leaderboard", "排行榜", route.page === "leaderboard")}
           {nav("#/tasksets", "题目包", route.page === "tasksets")}
+          {nav("#/plugins", "插件", route.page === "plugins")}
         </nav>
         <div class="who">
           {me && <span class="muted small">{me.login}</span>}
@@ -148,6 +152,7 @@ function Shell() {
         {route.page === "evals" && <EvalList />}
         {route.page === "eval" && <EvalDetailPage id={route.id} />}
         {route.page === "tasksets" && <Tasksets />}
+        {route.page === "plugins" && <Plugins />}
         {route.page === "compare" && <ComparePage ids={route.ids} />}
         {route.page === "leaderboard" && <LeaderboardPage taskset={route.taskset} />}
       </main>

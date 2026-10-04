@@ -55,7 +55,8 @@ type KvEntry = (Vec<u8>, Option<u64>);
 
 const SCHEMA: &str = concat!(
     include_str!("../migrations/0001_init.sql"),
-    include_str!("../migrations/0002_leaderboard.sql")
+    include_str!("../migrations/0002_leaderboard.sql"),
+    include_str!("../migrations/0003_user_plugins.sql")
 );
 
 struct Mock {
@@ -241,10 +242,14 @@ impl Mock {
                     body: vec![],
                 }
             }
-            ("POST", "actions/workflows/taskset-pack.yml/dispatches") => {
+            (
+                "POST",
+                p @ ("actions/workflows/taskset-pack.yml/dispatches"
+                | "actions/workflows/plugin-pack.yml/dispatches"),
+            ) => {
                 let body: Value = serde_json::from_slice(r.body.as_ref().unwrap()).unwrap();
                 let mut inputs = body["inputs"].clone();
-                inputs["_workflow"] = json!("taskset-pack.yml");
+                inputs["_workflow"] = json!(p.split('/').nth(2).unwrap());
                 gh.dispatches.push(inputs);
                 HttpResponse {
                     status: 204,
@@ -2128,5 +2133,193 @@ fn leaderboard() {
     assert_eq!(
         json_of(&t.call("GET", "/leaderboard/nothing-here", &[], b""))["entries"],
         json!([])
+    );
+}
+
+#[test]
+fn user_plugins() {
+    let t = T::new();
+    let alice = token(42, "octocat");
+    let bob = token(43, "bob");
+    let admin = token(1, "admin");
+    let internal = format!("Bearer {WORKER_TOKEN}");
+    let up = |tok: &str, kind: &str, body: &[u8]| {
+        let r = t.call(
+            "POST",
+            "/uploads",
+            &[
+                ("Authorization", &format!("Bearer {tok}")),
+                ("X-Upload-Kind", kind),
+            ],
+            body,
+        );
+        assert!(r.status < 300, "{}", String::from_utf8_lossy(&r.body));
+        json_of(&r)["hash"].as_str().unwrap().to_string()
+    };
+    let register = |path: &str, tok: &str, hash: &str| {
+        let body = serde_json::to_vec(&json!({"upload_hash": hash})).unwrap();
+        let r = t.as_user("POST", path, tok, &body);
+        assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+        json_of(&r)["id"].as_str().unwrap().to_string()
+    };
+    let ipost = |path: String, body: Value| {
+        t.call(
+            "POST",
+            &path,
+            &[("Authorization", &internal)],
+            &serde_json::to_vec(&body).unwrap(),
+        )
+    };
+    let iget = |path: String| t.call("GET", &path, &[("Authorization", &internal)], b"");
+
+    // Alice uploads a plugin; only a plugin upload registers.
+    let pkg = up(&alice, "plugin", &sealed(b"plugin zip"));
+    let other = up(&alice, "taskset", &sealed(b"a taskset"));
+    let r = t.as_user(
+        "POST",
+        "/plugins",
+        &alice,
+        &serde_json::to_vec(&json!({"upload_hash": other})).unwrap(),
+    );
+    assert_eq!(err_code(&r), "bad_request");
+    let pid = register("/plugins", &alice, &pkg);
+    assert!(crucible_core::plugins::is_user_plugin_id(&pid));
+    let d = t.mock.gh.borrow().dispatches.last().unwrap().clone();
+    assert_eq!(
+        d,
+        json!({"_workflow": "plugin-pack.yml", "plugin_id": pid, "source": format!("blob:{pkg}"),
+               "results_url": format!("https://crucible.example.workers.dev/internal/plugins/{pid}")})
+    );
+    assert_eq!(
+        json_of(&t.as_user("GET", &format!("/plugins/{pid}"), &alice, b""))["status"],
+        "building"
+    );
+    assert_eq!(
+        t.as_user("GET", &format!("/plugins/{pid}"), &bob, b"")
+            .status,
+        404
+    );
+
+    // The workflow reports it built.
+    let pinned = json!({"kind": "scorer", "name": pid, "version": "0.1",
+        "blob": {"sha256": pkg, "key_id": "1ffa702796eb5ee8"},
+        "runs_taskset_code": false, "model": false, "accepts": ["files"]});
+    let mut wrong = pinned.clone();
+    wrong["blob"]["sha256"] = json!("cd".repeat(32));
+    let ready = |p: &Value| {
+        json!({"status": "ready", "plugin": p, "title": "keyword", "description": "d",
+        "selftest": {"status": "scored", "score": 1.0, "max": 2.0, "detail": "ok"}})
+    };
+    assert_eq!(
+        ipost(format!("/internal/plugins/{pid}"), ready(&wrong)).status,
+        400
+    );
+    assert_eq!(
+        ipost(format!("/internal/plugins/{pid}"), ready(&pinned)).status,
+        200
+    );
+    assert_eq!(
+        ipost(format!("/internal/plugins/{pid}"), ready(&pinned)).status,
+        409
+    );
+    let v = json_of(&t.as_user("GET", &format!("/plugins/{pid}"), &alice, b""));
+    assert_eq!(
+        (
+            v["status"].as_str(),
+            v["title"].as_str(),
+            v["version"].as_str()
+        ),
+        (Some("ready"), Some("keyword"), Some("0.1"))
+    );
+    assert_eq!(v["selftest"]["score"], 1.0);
+    let listed = |tok: &str| -> Vec<String> {
+        json_of(&t.as_user("GET", "/plugins", tok, b""))
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(listed(&alice), vec![pid.clone()]);
+    assert!(listed(&bob).is_empty());
+
+    // Tasksets: Alice's may use her private plugin, Bob's may not.
+    let ts_a = register(
+        "/tasksets",
+        &alice,
+        &up(&alice, "taskset", &sealed(b"ts a")),
+    );
+    let ts_b = register("/tasksets", &bob, &up(&bob, "taskset", &sealed(b"ts b")));
+    let r = iget(format!("/internal/plugins/{pid}?taskset={ts_a}"));
+    assert_eq!(r.status, 200);
+    assert_eq!(json_of(&r), pinned);
+    assert_eq!(
+        iget(format!("/internal/plugins/{pid}?taskset={ts_b}")).status,
+        403
+    );
+    let with_plugin = |id: &str| {
+        let mut ts = packed(id);
+        ts["scorer"] = json!({"name": pid});
+        for s in ts["stages"].as_array_mut().unwrap() {
+            s["output"] = json!("files");
+            s.as_object_mut().unwrap().remove("expected_total");
+        }
+        ts["user_plugins"] = json!([pinned]);
+        json!({"status": "ready", "taskset": ts})
+    };
+    // Bob's taskset naming Alice's private plugin is refused even if the
+    // workflow said ready.
+    assert_eq!(
+        ipost(format!("/internal/tasksets/{ts_b}"), with_plugin(&ts_b)).status,
+        400
+    );
+    assert_eq!(
+        ipost(format!("/internal/tasksets/{ts_a}"), with_plugin(&ts_a)).status,
+        200
+    );
+
+    // Public: anyone's tasksets may use it.
+    let public = |tok: &str| {
+        t.as_user(
+            "POST",
+            &format!("/plugins/{pid}/public"),
+            tok,
+            br#"{"public": true}"#,
+        )
+    };
+    assert_eq!(public(&alice).status, 403);
+    assert_eq!(public(&admin).status, 200);
+    assert_eq!(listed(&bob), vec![pid.clone()]);
+    assert_eq!(
+        iget(format!("/internal/plugins/{pid}?taskset={ts_b}")).status,
+        200
+    );
+    assert_eq!(
+        ipost(format!("/internal/tasksets/{ts_b}"), with_plugin(&ts_b)).status,
+        200
+    );
+
+    // A refused package: the reason goes to its owner.
+    let pid2 = register("/plugins", &alice, &up(&alice, "plugin", &sealed(b"bad")));
+    let r = ipost(
+        format!("/internal/plugins/{pid2}"),
+        json!({"status": "failed", "error": "no Dockerfile"}),
+    );
+    assert_eq!(r.status, 200);
+    let v = json_of(&t.as_user("GET", &format!("/plugins/{pid2}"), &alice, b""));
+    assert_eq!(
+        (v["status"].as_str(), v["error"].as_str()),
+        (Some("failed"), Some("no Dockerfile"))
+    );
+    assert_eq!(public(&admin).status, 200);
+    assert_eq!(
+        t.as_user(
+            "POST",
+            &format!("/plugins/{pid2}/public"),
+            &admin,
+            br#"{"public": true}"#
+        )
+        .status,
+        409
     );
 }

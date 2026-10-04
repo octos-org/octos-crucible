@@ -1,0 +1,15 @@
+{
+  "schema": 2,
+  "name": "keyword-demo",
+  "description": "用上传的 keyword-scorer 插件打分的最小题目包：回答里出现要求的关键字即得分",
+  "scorer": {"name": "u-0000000000000000"},
+  "packager": "files",
+  "packager_options": {"require": ["answer.md"]},
+  "aggregate": {"stages": "sum"},
+  "display": {"stage": {"name": "关键字", "unit": "个", "decimals": 0},
+              "total": {"name": "关键字总数", "unit": "个", "decimals": 0}},
+  "total_time_limit_s": 600,
+  "stages": [
+    {"id": "s1", "dir": "s1", "inputs": ["task.md"], "tests": ["tests"], "time_limit_s": 600}
+  ]
+}

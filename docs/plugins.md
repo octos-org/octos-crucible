@@ -36,7 +36,7 @@ P3 起 `score-tests` 按遍拆成矩阵（每遍一个 job），因为交互运�
 
 ## 3. 插件注册表
 
-注册表是仓库根目录的 `plugins.json`，只有维护者能改（与改代码一样走 PR 评审）。它编译进 `crucible-core`，命令行、Worker、`taskset-pack` job 都只认这张表里的名字。
+注册表是仓库根目录的 `plugins.json`，只有维护者能改（与改代码一样走 PR 评审）。用户自己上传的打分器不进这张表，登记在 Worker 的 D1 里，见 §14。它编译进 `crucible-core`，命令行、Worker、`taskset-pack` job 都只认这张表里的名字。
 
 ```json
 {
@@ -296,7 +296,8 @@ trait Packager {
 | 东西 | 谁能加入 | 形式 | 能接触什么 |
 |---|---|---|---|
 | 运行器、打包器、打分器 | 只有维护者（PR 评审后合入 `main`，登记在 `plugins.json`） | 仓库里的代码和钉死版本的镜像 | 打分器和交互运行器在 `score-tests` 里接触解密后的隐藏材料；打包器在 `generate` 里处理工作目录 |
-| 题目包 | 内置的由维护者加入（`tasksets/<name>/`）；用户上传的经 `taskset-pack` 登记为 `u-<16 hex>` | 数据：`source.json` + 各阶段文件 | 只能引用注册表里的插件，用户题目包只能引用 `user: true` 的插件 |
+| 用户上传的打分器 | 任何登录用户（§14），登记为 `u-<16 hex>`，默认只有上传者的题目包能用，管理员可设为公开 | `plugin.json` + `Dockerfile` 的插件包，镜像在没有平台密钥的机器上构建 | 只在 `score-tests` 的容器里接触本阶段的产出和隐藏材料；声明了模型时只经计量代理 |
+| 题目包 | 内置的由维护者加入（`tasksets/<name>/`）；用户上传的经 `taskset-pack` 登记为 `u-<16 hex>` | 数据：`source.json` + 各阶段文件 | 只能引用注册表里的插件，用户题目包只能引用 `user: true` 的插件，或自己能用的上传插件（§14） |
 | agent | 任何登录用户 | `agent.json` + `Dockerfile`，或运行器约定的格式（如巡天的 observer 项目 zip） | 只在容器里运行，看不到隐藏材料，模型只经 meter |
 
 题目包里的文件对核心来说永远是数据。它们是否会被当成代码执行，取决于所引用插件的 `runs_taskset_code`；凡是 `true` 的插件，只在 `score-tests` 的容器里执行这些文件，且那台机器上没有平台密钥，也没有模型 key。
@@ -398,3 +399,98 @@ trait Packager {
 | `docs/astro-survey.md`、`docs/api.md` | 同步 |
 
 验证：巡天 L1 app 模式不带凭据，分数与 P1 相同（规则路径是确定的）；带一把真实 key 再跑一次，`eval_usage.interactive` 有请求数和 token，`usage` 不变，`score-tests` 日志里没有 key；hello-world 回归一次。
+
+## 14. 用户上传的插件
+
+用户可以上传自己的**打分器**插件，在自己上传的题目包里引用。运行器（产出运行器、交互运行器）暂不开放上传：它们要接 agent 容器、FIFO 或计量网络，接口面比打分器大得多，留到打分器跑稳之后再开。打包器始终只有 `builtin`（§5）。
+
+### 14.1 插件包格式
+
+一个 zip，根目录（或 zip 里唯一的顶层文件夹）放：
+
+| 文件 | 作用 |
+|---|---|
+| `plugin.json` | 声明，见下表；未知字段拒绝 |
+| `Dockerfile` | 打分器镜像；打分逻辑全在镜像里。建议基础镜像钉 digest |
+| 其他文件 | 构建上下文（脚本、模型权重等），解压后不超过 100 MB、2000 个文件，不能有符号链接 |
+| `selftest/artifact`、`selftest/tests/`（可选） | 自检样例：一份产出和一份测试材料。没有时自检用空文件和空目录 |
+
+```json
+{
+  "schema": 1,
+  "kind": "scorer",
+  "name": "keyword-scorer",
+  "version": "1",
+  "description": "按关键字给文本产出打分",
+  "runs_taskset_code": false,
+  "model": false,
+  "accepts": ["files"]
+}
+```
+
+| 字段 | 含义 |
+|---|---|
+| `kind` | 目前只能是 `scorer` |
+| `name` | 上传者起的名字，`[a-z0-9][a-z0-9-]{0,39}`，只用于展示；平台登记的 id 是 `u-<16 hex>` |
+| `version` | `[A-Za-z0-9.]`，1–20 个字符，记入 manifest |
+| `runs_taskset_code` / `model` / `accepts` | 含义同注册表（§3）。缺省 `runs_taskset_code: true`；`model: true` 时 `runs_taskset_code` 必须是 `false`；`accepts` 只能是已有的打包器 |
+
+示例：`examples/plugins/keyword-scorer`（按关键字给文本产出打分），引用它的题目包 `examples/tasksets/keyword-demo`。
+
+### 14.2 镜像的约定
+
+平台不在宿主机上执行插件包里的任何东西，只读 `plugin.json`。打分时由仓库里的通用外壳 `scorers/_user/score.sh`（打分器约定的 `score.sh` 接口，`docs/scorer-contract.md` §3）用 `crucible ctr run` 起插件镜像，所以 Docker、Nomad、Kubernetes 执行后端都一样可用。镜像的 ENTRYPOINT 收到：
+
+```
+--artifact /in/artifact          # 本阶段产出（打包器的格式，如 files 的 zip），只读
+--tests /in/tests                # 本阶段的隐藏材料，只读
+--out /out/result.json           # 写 result.json v2（§7）
+--visibility hidden|public       # 正式评测一律 hidden
+[--run /in/run]                  # 本阶段有交互运行器时的运行记录，只读
+[--options /out/options.json]    # 题目包的 scorer_options
+[--model-base-url URL --model NAME]   # 只在 model: true 且题目包声明 model.scorer、提交者给了凭据时
+```
+
+容器的墙与平台自带打分器相同：只读根、`/tmp` 是 256 MB tmpfs、`--cap-drop ALL`、`no-new-privileges`、2 GB 内存、2 CPU、256 个进程、非 root uid；没有网络（`--network none`），声明了模型时只接到只通计量代理的网络，`OPENAI_BASE_URL` 指向计量代理、`OPENAI_API_KEY=dummy`，模型 key 拿不到；墙钟 1200 秒，超时记 `error`。没写出 `result.json` 也记 `error`（system）。`crucible score` 对结果做与其他打分器相同的收尾（§7，`expected_total` 规则照旧）。
+
+### 14.3 登记流程
+
+和用户题目包一样：
+
+1. 网页“插件”页上传，或 `crucible plugin upload <目录或 zip> --wait`。插件包在浏览器 / 命令行里用平台公钥封好，`POST /uploads`（`X-Upload-Kind: plugin`）后 `POST /plugins`。
+2. Worker 在 D1 表 `user_plugins` 登记 `u-<16 hex>`（`building`，私有），触发 `plugin-pack.yml`：
+   - `open`（持平台私钥，不运行插件包里的任何东西）：解密、检查 `plugin.json`、`Dockerfile`、zip 限制；不通过直接把原因回传 Worker。通过后把插件包重新封给一次性钥匙交给下一个 job。
+   - `build`（只有一次性钥匙，`permissions: {}`，GitHub 托管机）：`crucible step plugin-build` 经执行后端构建镜像，再经通用外壳在 `selftest/` 样例（或空输入）上跑一次，能写出合法的 `result.json` 即自检通过。只把结果（`ready` + 自检分数，或失败原因）作为 job output 交出。
+   - `report`（持 Worker 令牌）：回传 Worker。
+3. 状态变为 `ready`（网页和 `crucible plugin status` 显示自检分数），或 `failed`（原因只给上传者看，不进公开日志）。
+
+插件登记后不可修改；要改就重新上传，得到新的 id。
+
+### 14.4 在题目包里使用
+
+用户题目包的 `source.json` 里写 `"scorer": {"name": "u-<16 hex>"}`（题目包级或阶段级都可以）。`taskset-pack` 登记题目包时向 Worker 查询（`GET /internal/plugins/:id?taskset=<题目包 id>`）：插件必须 `ready`，且是题目包上传者自己的或已公开的，否则题目包登记失败。查到的插件以固定形式写进 `taskset.json` 的 `user_plugins`（id、版本、能力、插件包的块引用），之后的评测都用这一份；Worker 收到登记结果时再按 D1 核对一次。
+
+权限：私有插件只有上传者的题目包能用；管理员 `POST /plugins/:id/public` 设为公开后，任何人的题目包都能用。内置题目包不受影响。本地 `crucible taskset validate` 遇到 `u-...` 时先按最宽松的能力放行，真正的检查在登记时做。
+
+评测时：`score`（交接）job 把插件包和隐藏材料一起重新封给一次性钥匙；`score-tests` 解开后经执行后端构建镜像 `crucible-scorer-<id>:run`，再由通用外壳运行。manifest 的 `scoring.plugins` 记下 `u-...` 的名字和版本。
+
+### 14.5 用户插件能拿到什么
+
+| | 能拿到 | 拿不到 |
+|---|---|---|
+| 构建（`plugin-pack` 的 `build`、`score-tests`） | 自己的插件包、构建时联网 | 平台私钥、Worker 令牌（这两个 job 不持有） |
+| 打分（`score-tests` 的插件容器） | 产出、本阶段隐藏材料、交互运行记录；`model: true` 时计量代理地址 | 平台私钥、Worker 令牌、一次性钥匙、模型 key 本身、网络（除计量代理） |
+
+需要模型时只能经计量代理用提交者的 key，用量记进 `eval_usage.scorer`，计入提交者的预算（§10）。
+
+### 14.6 公开运营前再做的加固
+
+原型阶段只保留已有的沙箱隔离，下面这些记为公开运营前再做：
+
+- 构建：`build` job 构建时可以联网、没有资源和时间上限之外的限制；应改成在隔离的构建器（无出网或只经出网代理白名单）里构建，并限制镜像大小。
+- 镜像可复现：现在每次评测都按插件包重新构建，`Dockerfile` 里没钉死的依赖可能让同一版本打出不同的分；应在登记时构建一次并按 digest 存入镜像仓库，评测时只拉这个 digest。
+- 模型：用户插件 `model: true` 时，插件代码与提交者的计量代理在同一台机器上；容器逃逸即可能拿到提交者的 key。公开运营前应把计量代理与插件容器分到不同机器，或禁止公开插件使用模型。
+- 自检只证明“能写出 result.json”，不检查打分是否合理；公开插件需要人工审核（管理员设公开前看过代码）。
+- 失败原因和自检结果经 job output 交给 `report` job，`build` job 里的代码可以伪造它们（只影响这个插件自己的登记结果）；应改为封给平台公钥的文件。
+- 用户插件的 `detail`、`items` 由插件自己写，hidden 时是否泄露测试内容由插件作者负责；公开题目包引用的插件需要审核这一点。
+- 资源：插件容器的内存、CPU、时间上限是固定值，没有按用户或题目包计配额；上传频率没有限制。

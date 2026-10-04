@@ -53,6 +53,8 @@ pub enum UploadKind {
     App,
     /// A taskset source zip (see `POST /tasksets`).
     Taskset,
+    /// A plugin package zip (see `POST /plugins`).
+    Plugin,
 }
 
 impl UploadKind {
@@ -61,6 +63,7 @@ impl UploadKind {
             UploadKind::Agent => "agent",
             UploadKind::App => "app",
             UploadKind::Taskset => "taskset",
+            UploadKind::Plugin => "plugin",
         }
     }
     pub fn parse(s: &str) -> Option<UploadKind> {
@@ -68,6 +71,7 @@ impl UploadKind {
             "agent" => Some(UploadKind::Agent),
             "app" => Some(UploadKind::App),
             "taskset" => Some(UploadKind::Taskset),
+            "plugin" => Some(UploadKind::Plugin),
             _ => None,
         }
     }
@@ -440,6 +444,149 @@ pub fn parse_pack_result(body: &[u8], id: &str) -> Result<PackResult, ApiError> 
         (TS_FAILED, None, Some(e)) => Ok(PackResult::Failed(e.chars().take(500).collect())),
         _ => Err(ApiError::bad_request(
             "body must be {status: ready, taskset} or {status: failed, error}",
+        )),
+    }
+}
+
+// ---- user plugins ------------------------------------------------------
+
+pub const PL_BUILDING: &str = "building";
+pub const PL_READY: &str = "ready";
+pub const PL_FAILED: &str = "failed";
+
+/// D1 `user_plugins`: a user-uploaded plugin (docs/plugins.md §14).
+/// Private to its owner's tasksets until an admin makes it public.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UserPluginRecord {
+    /// `u-<16 hex>`.
+    pub id: String,
+    pub owner_id: u64,
+    pub owner_login: String,
+    pub upload_hash: String,
+    /// `building | ready | failed`.
+    pub status: String,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub public: bool,
+    /// The name from its plugin.json.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// The pinned form a taskset records (ready only).
+    #[serde(default)]
+    pub plugin: Option<crucible_core::plugins::UserPlugin>,
+    /// `{"description", "selftest"}` (ready only).
+    #[serde(default)]
+    pub info: Option<Value>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl UserPluginRecord {
+    pub fn visible_to(&self, github_id: u64, is_admin: bool) -> bool {
+        is_admin || self.owner_id == github_id || (self.public && self.status == PL_READY)
+    }
+
+    /// Whose tasksets may use it: its owner's, or anyone's once public.
+    pub fn usable_by(&self, github_id: u64) -> bool {
+        self.status == PL_READY
+            && self.plugin.is_some()
+            && (self.public || self.owner_id == github_id)
+    }
+
+    /// How it appears in `GET /plugins` and `GET /plugins/:id`.
+    pub fn view(&self) -> Value {
+        let p = self.plugin.as_ref();
+        let info = self.info.clone().unwrap_or(Value::Null);
+        let mut v = serde_json::json!({
+            "id": self.id,
+            "title": self.title,
+            "owner_login": self.owner_login,
+            "public": self.public,
+            "status": self.status,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        });
+        if let Some(e) = &self.error {
+            v["error"] = e.clone().into();
+        }
+        if let Some(p) = p {
+            v["kind"] = p.kind.as_str().into();
+            v["version"] = p.version.clone().into();
+            v["runs_taskset_code"] = p.runs_taskset_code.into();
+            v["model"] = p.model.into();
+            v["accepts"] = serde_json::json!(p.accepts);
+        }
+        if let Some(d) = info["description"].as_str().filter(|d| !d.is_empty()) {
+            v["description"] = d.into();
+        }
+        if !info["selftest"].is_null() {
+            v["selftest"] = info["selftest"].clone();
+        }
+        v
+    }
+}
+
+/// Body of `POST /internal/plugins/:id` (from the plugin-pack workflow).
+pub enum PluginResult {
+    Ready {
+        plugin: Box<crucible_core::plugins::UserPlugin>,
+        title: String,
+        info: Value,
+    },
+    Failed(String),
+}
+
+pub fn parse_plugin_result(body: &[u8], id: &str) -> Result<PluginResult, ApiError> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Body {
+        status: String,
+        #[serde(default)]
+        plugin: Option<crucible_core::plugins::UserPlugin>,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        selftest: Option<Value>,
+        #[serde(default)]
+        error: Option<String>,
+    }
+    if body.len() > 64 * 1024 {
+        return Err(ApiError::too_large(64 * 1024));
+    }
+    let b: Body = serde_json::from_slice(body)
+        .map_err(|e| ApiError::bad_request(format!("invalid request body: {e}")))?;
+    let text = |s: Option<String>, n: usize| -> String {
+        s.unwrap_or_default()
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(n)
+            .collect()
+    };
+    match (b.status.as_str(), b.plugin, b.error) {
+        (PL_READY, Some(p), None) => {
+            p.check().map_err(ApiError::bad_request)?;
+            if p.name != id {
+                return Err(ApiError::bad_request("plugin.name must be the plugin id"));
+            }
+            let selftest = b.selftest.unwrap_or(Value::Null);
+            if selftest.to_string().len() > 2048 {
+                return Err(ApiError::bad_request("selftest too large"));
+            }
+            Ok(PluginResult::Ready {
+                plugin: Box::new(p),
+                title: text(b.title, 40),
+                info: serde_json::json!({
+                    "description": text(b.description, 300),
+                    "selftest": selftest,
+                }),
+            })
+        }
+        (PL_FAILED, None, Some(e)) => Ok(PluginResult::Failed(e.chars().take(500).collect())),
+        _ => Err(ApiError::bad_request(
+            "body must be {status: ready, plugin, ...} or {status: failed, error}",
         )),
     }
 }
