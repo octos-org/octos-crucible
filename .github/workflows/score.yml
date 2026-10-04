@@ -143,7 +143,7 @@ jobs:
           IN_SANDBOX_RUNNER: ${{ vars.CRUCIBLE_SANDBOX_RUNNER }}
           # Only to fetch a user taskset (u-...) the submitter may use.
           CRUCIBLE_WORKER_TOKEN: ${{ secrets.CRUCIBLE_WORKER_TOKEN }}
-        run: '"$CRUCIBLE" plan-score --root .'
+        run: '"$CRUCIBLE" step plan-score --root .'
 
       - name: Report status (scoring)
         if: steps.plan.outputs.results_url != ''
@@ -153,6 +153,9 @@ jobs:
           EVAL_ID: ${{ steps.plan.outputs.eval_id }}
         run: '"$CRUCIBLE" worker --worker-url "$WORKER_URL" --eval-id "$EVAL_ID" status scoring'
 
+      # `crucible step handoff` (app mode): the sealed upload becomes
+      # replica 1's checkpoint; tests, checkpoint and (when a scoring slot
+      # uses a model) the credential are re-sealed to a one-run key.
       - name: Hand off the stage to score-tests
         id: handoff
         env:
@@ -163,35 +166,16 @@ jobs:
           HASH: ${{ steps.plan.outputs.artifact_hash }}
           TASKSET_PATH: ${{ steps.plan.outputs.taskset_path }}
           STAGE: ${{ steps.plan.outputs.stage }}
-          STAGE_ID: ${{ steps.plan.outputs.stage_id }}
           CRED_SOURCE: ${{ steps.plan.outputs.cred_source }}
           MODEL: ${{ steps.plan.outputs.model }}
           WORKER_URL: ${{ steps.plan.outputs.worker_url }}
           EVAL_ID: ${{ steps.plan.outputs.eval_id }}
         run: |
           set -euo pipefail
-          # Same layout as an agent run: <results>/1/<stage>/checkpoint.sealed.
-          d="$RUNNER_TEMP/results/1/$STAGE_ID"
-          h="$RUNNER_TEMP/handoff"
-          mkdir -p "$d" "$h/bin" "$h/tools"
-          "$CRUCIBLE" get --store "$STORE" "$HASH" --out "$d/checkpoint.sealed"
-          args=(--taskset "$TASKSET_PATH" --stage "$STAGE" --results "$RUNNER_TEMP/results"
-            --store "$STORE" --identity-env CRUCIBLE_AGE_KEY --out "$h" --key-out "$RUNNER_TEMP/run.key")
-          # Scoring with the submitter's model (docs/plugins.md §10): the
-          # opened credential goes through this pipe only.
-          if [ "$CRED_SOURCE" != none ] && jq -e '(.model // {}) | ((.interactive // "none") != "none" or (.scorer // "none") != "none")' "$TASKSET_PATH" >/dev/null; then
-            src=(--source "$CRED_SOURCE")
-            if [ "$CRED_SOURCE" = workers-kv ]; then src+=(--worker-url "$WORKER_URL" --eval-id "$EVAL_ID"); fi
-            "$CRUCIBLE" cred open "${src[@]}" --sealed-env DEV_MODEL_CRED --identity-env CRUCIBLE_AGE_KEY \
-              | env -u DEV_MODEL_CRED -u CRUCIBLE_WORKER_TOKEN "$CRUCIBLE" score-handoff "${args[@]}" \
-                  --cred-stdin --model "$MODEL"
-          else
-            "$CRUCIBLE" score-handoff "${args[@]}"
-          fi
-          cp "$CRUCIBLE" "$h/bin/crucible"
-          cp -R scorers runners "$h/"
-          cp tools/sandbox-net.sh "$h/tools/"
-          cp config/pricing.json "$h/pricing.json"
+          "$CRUCIBLE" step handoff --root . --taskset "$TASKSET_PATH" --stage "$STAGE" \
+            --results "$RUNNER_TEMP/results" --app-blob "$HASH" --store "$STORE" \
+            --key-out "$RUNNER_TEMP/run.key" --cred-source "$CRED_SOURCE" --model "$MODEL" \
+            --eval-id "$EVAL_ID" --worker-url "$WORKER_URL" --out "$RUNNER_TEMP/handoff"
           echo "run_key=$(cat "$RUNNER_TEMP/run.key")" >> "$GITHUB_OUTPUT"
           rm -f "$RUNNER_TEMP/run.key"
 
@@ -273,37 +257,24 @@ jobs:
           merge-multiple: true
           path: ${{ runner.temp }}/files/scores
 
-      - name: Build the manifest
+      # `crucible step publish` (app mode): the manifest, the sealed
+      # archive, the data branch (only if score_public) and the Worker.
+      - name: Publish
         env:
-          GITHUB_TOKEN: ${{ github.token }}
           CRUCIBLE_AGE_KEY: ${{ secrets.CRUCIBLE_AGE_KEY }}
+          CRUCIBLE_WORKER_TOKEN: ${{ secrets.CRUCIBLE_WORKER_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+          RESULTS_URL: ${{ needs.score.outputs.results_url }}
         run: |
           set -euo pipefail
           chmod 0755 "$RUNNER_TEMP/files/bin/crucible"
-          echo "CRUCIBLE=$RUNNER_TEMP/files/bin/crucible" >> "$GITHUB_ENV"
-          CRUCIBLE="$RUNNER_TEMP/files/bin/crucible"
-          d="$RUNNER_TEMP/results/1/$STAGE_ID"
-          mkdir -p "$d" "$RUNNER_TEMP/files/scores"
-          # The upload's blob reference (hash + key id) goes into the manifest.
-          "$CRUCIBLE" get --store "$STORE" "$HASH" --out "$d/checkpoint.sealed"
-          "$CRUCIBLE" manifest --mode app --eval-id "$EVAL_ID" --taskset "$TASKSET_PATH" \
-            --stage "$STAGE" --results "$RUNNER_TEMP/results" --scores "$RUNNER_TEMP/files/scores" \
-            --identity-env CRUCIBLE_AGE_KEY --owner "$OWNER" --score-public "$SCORE_PUBLIC" \
-            --pricing config/pricing.json --out "$RUNNER_TEMP/manifest.json"
-          jq -c '{eval_id, mode, total_score, stages: [.replicas[].stages[] | {stage, score}]}' "$RUNNER_TEMP/manifest.json"
-
-      - name: Archive and publish the manifest
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: tools/publish-manifest.sh "$RUNNER_TEMP/manifest.json"
-
-      - name: Deliver the manifest to the Worker
-        if: needs.score.outputs.results_url != ''
-        env:
-          CRUCIBLE_WORKER_TOKEN: ${{ secrets.CRUCIBLE_WORKER_TOKEN }}
-        run: |
-          "$CRUCIBLE" worker --worker-url "$WORKER_URL" --eval-id "$EVAL_ID" \
-            results --manifest "$RUNNER_TEMP/manifest.json"
+          deliver=()
+          if [ -n "$RESULTS_URL" ]; then deliver=(--deliver "$WORKER_URL"); fi
+          "$RUNNER_TEMP/files/bin/crucible" step publish --root . --mode app --eval-id "$EVAL_ID" \
+            --taskset "$TASKSET_PATH" --stage "$STAGE" --app-blob "$HASH" \
+            --results "$RUNNER_TEMP/results" --scores "$RUNNER_TEMP/files/scores" \
+            --owner "$OWNER" --score-public "$SCORE_PUBLIC" \
+            --store "$STORE" --data-branch "${deliver[@]}" --out "$RUNNER_TEMP/publish"
 
       - name: Report failure to the Worker
         if: failure() && needs.score.outputs.results_url != ''

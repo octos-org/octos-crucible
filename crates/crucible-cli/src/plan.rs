@@ -263,6 +263,7 @@ pub async fn fetch_user_taskset(
     owner: &str,
     results_url: &str,
     worker_fallback: &str,
+    token: Option<String>,
 ) -> Result<()> {
     let id = taskset.trim();
     if !id.starts_with("u-") {
@@ -282,9 +283,11 @@ pub async fn fetch_user_taskset(
     if worker.is_empty() {
         bail!("a user taskset needs a Worker (results_url or CRUCIBLE_WORKER_URL)");
     }
-    let raw = crate::worker::Worker::from_env(&worker)?
-        .get_user_taskset(id, gid)
-        .await?;
+    let w = match token {
+        Some(t) => crate::worker::Worker::new(&worker, t)?,
+        None => crate::worker::Worker::from_env(&worker)?,
+    };
+    let raw = w.get_user_taskset(id, gid).await?;
     let ts: crucible_core::TaskSet =
         serde_json::from_slice(&raw).map_err(|e| anyhow!("taskset {id} from the Worker: {e}"))?;
     if ts.name != id {

@@ -35,6 +35,16 @@ pub async fn run(args: RunArgs) -> Result<()> {
     // The credential first: one line on stdin, then stdin is done.
     let cred = crucible_meter::read_credential(&mut std::io::stdin().lock())
         .map_err(|e| anyhow!("{e}"))?;
+    run_with(&args, &cred, &|_| {}).await
+}
+
+/// Run the stages with an opened credential; `on_stage` is called with
+/// each stage id as it starts (progress reports).
+pub async fn run_with(
+    args: &RunArgs,
+    cred: &crucible_meter::Credential,
+    on_stage: &(dyn Fn(&str) + Sync),
+) -> Result<()> {
     let ts: TaskSet = crate::taskset_cmd::load(&args.taskset)?;
     ts.validate(crucible_core::taskset::MAX_TOTAL_TIME_S)?;
     let agent: AgentSpec = serde_json::from_slice(&std::fs::read(&args.agent_json)?)
@@ -64,8 +74,8 @@ pub async fn run(args: RunArgs) -> Result<()> {
         &args.scratch_dir
     })?;
     let env = Env {
-        args: &args,
-        cred: &cred,
+        args,
+        cred,
         agent: &agent,
         pricing: &pricing,
         user_price,
@@ -81,6 +91,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
     let mut spent = Used::default();
     for stage in ts.stages.iter().take(n) {
         let limits = remaining(&budget, spent);
+        on_stage(&stage.id);
         let (_timing, interrupted) = match stage.runner_name() {
             "workdir" => run_stage(&env, stage, limits).await?,
             other => bail!("runner {other} is not built in"),

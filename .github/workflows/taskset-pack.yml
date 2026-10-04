@@ -70,28 +70,6 @@ jobs:
             crucible-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-
             crucible-${{ runner.os }}-
 
-      - name: Validate inputs
-        env:
-          IN_ID: ${{ inputs.taskset_id }}
-          IN_SOURCE: ${{ inputs.source }}
-          IN_RESULTS_URL: ${{ inputs.results_url }}
-        run: |
-          set -euo pipefail
-          [[ "$IN_ID" =~ ^u-[0-9a-f]{16}$ ]] || { echo "::error::taskset_id must be u-<16 hex>"; exit 1; }
-          [[ "$IN_SOURCE" =~ ^blob:[0-9a-f]{64}$ ]] || { echo "::error::source must be blob:<sha256>"; exit 1; }
-          worker=""
-          if [ -n "$IN_RESULTS_URL" ]; then
-            re='^(https://[A-Za-z0-9.-]+(:[0-9]{1,5})?)/internal/tasksets/(u-[0-9a-f]{16})$'
-            [[ "$IN_RESULTS_URL" =~ $re ]] && [ "${BASH_REMATCH[3]}" = "$IN_ID" ] \
-              || { echo "::error::results_url must be https://<worker>/internal/tasksets/$IN_ID"; exit 1; }
-            worker="${BASH_REMATCH[1]}"
-          fi
-          {
-            echo "ID=$IN_ID"
-            echo "HASH=${IN_SOURCE#blob:}"
-            echo "WORKER_URL=$worker"
-          } >> "$GITHUB_ENV"
-
       - name: Build crucible
         run: |
           set -euo pipefail
@@ -102,40 +80,29 @@ jobs:
           cp target/release/crucible "$RUNNER_TEMP/bin/crucible"
           echo "CRUCIBLE=$RUNNER_TEMP/bin/crucible" >> "$GITHUB_ENV"
 
+      # `crucible step pack`: validates the inputs, opens the upload, checks
+      # and packs it, and reports the taskset.json or the reason it was
+      # refused to the Worker (never to this log).
       - name: Open, validate and pack
         env:
           CRUCIBLE_AGE_KEY: ${{ secrets.CRUCIBLE_AGE_KEY }}
           CRUCIBLE_WORKER_TOKEN: ${{ secrets.CRUCIBLE_WORKER_TOKEN }}
           GITHUB_TOKEN: ${{ github.token }}
+          IN_ID: ${{ inputs.taskset_id }}
+          IN_SOURCE: ${{ inputs.source }}
+          IN_RESULTS_URL: ${{ inputs.results_url }}
         run: |
-          set -euo pipefail
-          t="$RUNNER_TEMP/pack"
-          mkdir -p "$t"
-          "$CRUCIBLE" get --store "$STORE" "$HASH" --out "$t/upload.sealed"
-          "$CRUCIBLE" open --identity-env CRUCIBLE_AGE_KEY --in "$t/upload.sealed" --out "$t/upload.zip"
-          rm -f "$t/upload.sealed"
-          # The log names the uploader's files: kept off the public log.
-          if ! env -u CRUCIBLE_WORKER_TOKEN "$CRUCIBLE" taskset pack --zip "$t/upload.zip" --name "$ID" \
-              --keys config/keys.json --store "$STORE" --out "$t/taskset.json" 2> "$t/pack.log"; then
-            echo "::error::the taskset was refused (the reason goes to the uploader)"
-            if [ -n "$WORKER_URL" ]; then
-              reason=$(grep '^crucible: ' "$t/pack.log" | tail -n1 | sed 's/^crucible: //')
-              "$CRUCIBLE" taskset report --worker-url "$WORKER_URL" --id "$ID" --error "${reason:-packing failed}"
-            fi
-            touch "$t/reported"
-            exit 1
-          fi
-          jq -c '{name, total_time_limit_s, stages: (.stages | length)}' "$t/taskset.json"
-          if [ -n "$WORKER_URL" ]; then
-            "$CRUCIBLE" taskset report --worker-url "$WORKER_URL" --id "$ID" --taskset "$t/taskset.json"
-          fi
-          touch "$t/reported"
+          "$CRUCIBLE" step pack --taskset-id "$IN_ID" --source "$IN_SOURCE" --results-url "$IN_RESULTS_URL" \
+            --keys config/keys.json --store "$STORE" --out "$RUNNER_TEMP/pack"
 
       - name: Report failure to the Worker
-        if: failure() && env.WORKER_URL != ''
+        if: failure() && inputs.results_url != ''
         env:
           CRUCIBLE_WORKER_TOKEN: ${{ secrets.CRUCIBLE_WORKER_TOKEN }}
+          IN_ID: ${{ inputs.taskset_id }}
         run: |
+          # Only to the Worker the step validated, and only if it was not told.
           [ -f "$RUNNER_TEMP/pack/reported" ] && exit 0
-          [ -x "${CRUCIBLE:-}" ] || exit 0
-          "$CRUCIBLE" taskset report --worker-url "$WORKER_URL" --id "$ID" --error "packing failed on the platform side; please retry"
+          [ -f "$RUNNER_TEMP/pack/worker" ] && [ -x "${CRUCIBLE:-}" ] || exit 0
+          "$CRUCIBLE" taskset report --worker-url "$(cat "$RUNNER_TEMP/pack/worker")" --id "$IN_ID" \
+            --error "packing failed on the platform side; please retry"
