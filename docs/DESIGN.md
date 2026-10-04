@@ -45,6 +45,7 @@ octos-crucible 是评测 coding agent 的基础设施：运行 agent、计量、
 |---|---|---|
 | 所有文件（上传的包、产出、日志、题目包） | 加密后按 SHA-256 命名，存于 32 个预发布 Release `blobs-00`…`blobs-31`，分片 = 哈希前 5 位 | 永久 |
 | 题目登记表 | 仓库 `tasksets/<name>/taskset.json` | 永久 |
+| 用户上传的题目包登记 | Workers KV `tasksets/<u-id>`（默认私有，管理员可设为公开；见 `docs/api.md`） | 永久 |
 | 评测清单 | 加密块（总是）；公开分数的评测另在仓库 `data` 分支 `evals/<eval_id>.json` | 永久 |
 | 平台程序 | 正式 Release `vX.Y.Z` | 永久 |
 | 用户模型 key、下载密码 | Workers KV | 评测结束即删 |

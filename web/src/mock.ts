@@ -197,6 +197,16 @@ export const mockBackend: Backend = {
   me: () => delay({ github_id: 1, login: "demo-user", is_admin: false }),
   pubkey: () => delay(currentKey()),
   tasksets: () => delay(TASKSETS),
+  async registerTaskset() {
+    const id = `u-${toHex(crypto.getRandomValues(new Uint8Array(8)))}`;
+    TASKSETS.push({ name: id, version: "upload", stages: [], title: "我的题目包", owner_login: "demo-user", public: false, status: "packing" });
+    return delay({ id, status: "packing" });
+  },
+  async setTasksetPublic(id, on) {
+    const t = TASKSETS.find((x) => x.name === id);
+    if (t) t.public = on;
+    return delay({ id, public: on });
+  },
   async upload(_kind, sealed) {
     const d = await crypto.subtle.digest("SHA-256", sealed as BufferSource);
     return delay({ hash: toHex(new Uint8Array(d)) }, 600);

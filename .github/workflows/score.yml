@@ -66,6 +66,7 @@ jobs:
     outputs:
       eval_id: ${{ steps.plan.outputs.eval_id }}
       artifact_hash: ${{ steps.plan.outputs.artifact_hash }}
+      taskset: ${{ steps.plan.outputs.taskset }}
       taskset_path: ${{ steps.plan.outputs.taskset_path }}
       stage: ${{ steps.plan.outputs.stage }}
       stage_id: ${{ steps.plan.outputs.stage_id }}
@@ -125,6 +126,8 @@ jobs:
           IN_OWNER: ${{ inputs.owner }}
           IN_RESULTS_URL: ${{ inputs.results_url }}
           IN_WORKER_URL: ${{ vars.CRUCIBLE_WORKER_URL }}
+          # Only to fetch a user taskset (u-...) the submitter may use.
+          CRUCIBLE_WORKER_TOKEN: ${{ secrets.CRUCIBLE_WORKER_TOKEN }}
         run: '"$CRUCIBLE" plan-score --root .'
 
       - name: Report status (scoring)
@@ -164,6 +167,13 @@ jobs:
         with:
           name: score-handoff
           path: ${{ runner.temp }}/handoff
+          retention-days: 1
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: taskset
+          path: tasksets/${{ steps.plan.outputs.taskset }}/taskset.json
           retention-days: 1
           if-no-files-found: error
 
@@ -216,6 +226,11 @@ jobs:
         with:
           name: score-files
           path: ${{ runner.temp }}/files/bin
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: taskset
+          path: tasksets/${{ needs.score.outputs.taskset }}
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         if: needs.score-tests.result == 'success'

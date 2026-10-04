@@ -205,6 +205,63 @@ fn eval_id_or_default(id: &str, run_id: &str, run_attempt: &str) -> Result<Strin
     }
 }
 
+/// A user-uploaded taskset (`u-...`) is not in the repository: fetch its
+/// taskset.json from the Worker into `tasksets/<id>/taskset.json`, which
+/// the Worker only hands out if the submitter (`owner`) may use it (the
+/// uploader, or anyone once an admin made it public). Built-in names: no-op.
+pub async fn fetch_user_taskset(
+    root: &Path,
+    taskset: &str,
+    owner: &str,
+    results_url: &str,
+    worker_fallback: &str,
+) -> Result<()> {
+    let id = taskset.trim();
+    if !id.starts_with("u-") {
+        return Ok(());
+    }
+    if !crucible_core::taskset::is_user_taskset_id(id) {
+        bail!("taskset u-... must be u-<16 hex>");
+    }
+    let owner = owner.trim();
+    let gid: u64 = owner
+        .split_once(':')
+        .filter(|_| owner_ok(owner))
+        .and_then(|(g, _)| g.parse().ok())
+        .ok_or_else(|| anyhow!("a user taskset needs owner <github_id>:<login>"))?;
+    check_url("results_url", results_url.trim())?;
+    let worker = worker_url(results_url.trim(), worker_fallback)?;
+    if worker.is_empty() {
+        bail!("a user taskset needs a Worker (results_url or CRUCIBLE_WORKER_URL)");
+    }
+    let raw = crate::worker::Worker::from_env(&worker)?
+        .get_user_taskset(id, gid)
+        .await?;
+    let ts: crucible_core::TaskSet =
+        serde_json::from_slice(&raw).map_err(|e| anyhow!("taskset {id} from the Worker: {e}"))?;
+    if ts.name != id {
+        bail!("taskset {id} from the Worker is named {:?}", ts.name);
+    }
+    ts.validate(MAX_TOTAL_TIME_S)?;
+    let dir = root.join("tasksets").join(id);
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(
+        dir.join("taskset.json"),
+        serde_json::to_string_pretty(&ts)? + "\n",
+    )?;
+    eprintln!("user taskset {id}: {} stages", ts.stages.len());
+    Ok(())
+}
+
+/// `results_url` inside eval.yml's `options` (empty if absent or invalid;
+/// `plan` reports invalid options itself).
+pub fn options_results_url(options: &str) -> String {
+    serde_json::from_str::<Options>(options)
+        .ok()
+        .and_then(|o| o.results_url)
+        .unwrap_or_default()
+}
+
 fn load_taskset(root: &Path, name: &str) -> Result<(String, crucible_core::TaskSet)> {
     if !crucible_core::is_slug(name, 64) {
         bail!("taskset must match [a-z0-9][a-z0-9-]{{0,63}}");

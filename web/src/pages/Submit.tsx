@@ -185,11 +185,13 @@ export function Submit() {
               }}
             >
               <option value="">请选择</option>
-              {tasksets.data!.map((t) => (
-                <option value={t.name}>
-                  {t.name}（v{t.version}，{t.stages.length} 个阶段）
-                </option>
-              ))}
+              {tasksets.data!
+                .filter((t) => !t.status || t.status === "ready")
+                .map((t) => (
+                  <option value={t.name}>
+                    {t.title ? `${t.title}（上传，${t.public ? "公开" : "私有"}` : `${t.name}（v${t.version}`}，{t.stages.length} 个阶段）
+                  </option>
+                ))}
             </select>
           )}
         </Field>

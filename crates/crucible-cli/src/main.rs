@@ -6,6 +6,7 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
+use crucible_core::taskset::USER_SCORERS;
 use crucible_crypto::PublicKey;
 use crucible_metering::{Price, Pricing};
 
@@ -475,6 +476,14 @@ async fn run(cmd: Cmd) -> Result<()> {
                 root,
                 github_output,
             } = *args;
+            plan::fetch_user_taskset(
+                &root,
+                &inputs.taskset,
+                &inputs.owner,
+                &plan::options_results_url(&inputs.options),
+                &inputs.worker_url,
+            )
+            .await?;
             let out = plan::plan(&inputs, &root)?;
             write_plan(&out, github_output.as_deref())
         }
@@ -614,6 +623,15 @@ async fn run(cmd: Cmd) -> Result<()> {
             Ok(())
         }
         Cmd::PlanScore(args) => {
+            let i = &args.inputs;
+            plan::fetch_user_taskset(
+                &args.root,
+                &i.taskset,
+                &i.owner,
+                &i.results_url,
+                &i.worker_url,
+            )
+            .await?;
             let out = plan::plan_score(&args.inputs, &args.root)?;
             write_plan(&out, args.github_output.as_deref())
         }
@@ -784,11 +802,19 @@ enum TasksetCmd {
     /// Seal each stage's inputs and tests, store them, write taskset.json.
     Pack {
         /// source.json: stages, their dirs, which paths are inputs / tests.
-        #[arg(long)]
-        source: PathBuf,
+        #[arg(long, required_unless_present = "zip", requires = "src_dir")]
+        source: Option<PathBuf>,
         /// Root of the unpacked source tree.
         #[arg(long)]
-        src_dir: PathBuf,
+        src_dir: Option<PathBuf>,
+        /// A user's taskset zip (source.json + stage dirs) instead of
+        /// --source/--src-dir; checked with the user rules (`validate`).
+        #[arg(long, conflicts_with_all = ["source", "src_dir"], requires = "name")]
+        zip: Option<PathBuf>,
+        /// Register under this name (`u-<16 hex>` for a user taskset); the
+        /// source's own name becomes the title.
+        #[arg(long)]
+        name: Option<String>,
         /// config/keys.json (the current public key seals the blobs).
         #[arg(long)]
         keys: PathBuf,
@@ -797,11 +823,33 @@ enum TasksetCmd {
         #[arg(long)]
         out: PathBuf,
     },
-    /// Check a taskset.json (total time <= the platform limit).
+    /// Check a taskset. PATH is a taskset.json (format, total time <= the
+    /// platform limit), or a taskset source to upload: a .zip, a directory
+    /// or its source.json (format, every stage's inputs and tests present
+    /// and disjoint, total time <= 18000 s, scorer offered to users).
     Validate {
-        file: PathBuf,
+        path: PathBuf,
         #[arg(long, default_value_t = crucible_core::taskset::MAX_TOTAL_TIME_S)]
         max_total_s: u64,
+        /// Source only: allow this scorer (repeatable; default: the scorers
+        /// offered for uploaded tasksets, i.e. playwright).
+        #[arg(long)]
+        allow_scorer: Vec<String>,
+    },
+    /// Report a `taskset-pack` outcome to the Worker (token from
+    /// CRUCIBLE_WORKER_TOKEN): the packed taskset.json, or a failure.
+    Report {
+        /// The Worker (`https://...`; only its origin is used).
+        #[arg(long)]
+        worker_url: String,
+        /// `u-<16 hex>`.
+        #[arg(long)]
+        id: String,
+        #[arg(long, conflicts_with = "error", required_unless_present = "error")]
+        taskset: Option<PathBuf>,
+        /// Why packing failed (shown to the uploader; at most 500 characters).
+        #[arg(long)]
+        error: Option<String>,
     },
     /// Download and unpack the inputs (never the tests) of the first N stages.
     Inputs {
@@ -902,27 +950,129 @@ async fn taskset(cmd: TasksetCmd) -> Result<()> {
         TasksetCmd::Pack {
             source,
             src_dir,
+            zip,
+            name,
             keys,
             store,
             out,
         } => {
             let key = keys::current_public_key(&keys)?;
-            let ts = taskset_cmd::pack(&source, &src_dir, &key, &Store::parse(&store)?).await?;
+            let store = Store::parse(&store)?;
+            let tmp = tempfile::tempdir()?;
+            let (source, src_dir, rules) = match zip {
+                Some(z) => {
+                    let root = taskset_cmd::unpack_source_zip(&std::fs::read(&z)?, tmp.path())?;
+                    (root.join("source.json"), root, Some(USER_SCORERS))
+                }
+                None => (
+                    source.expect("clap: required"),
+                    src_dir.expect("clap: required"),
+                    None,
+                ),
+            };
+            // Errors name files relative to the upload, not this machine.
+            let mut ts = taskset_cmd::pack(&source, &src_dir, rules, &key, &store)
+                .await
+                .map_err(|e| {
+                    anyhow!(
+                        "{}",
+                        format!("{e:#}").replace(&format!("{}/", src_dir.display()), "")
+                    )
+                })?;
+            if let Some(n) = name {
+                if !crucible_core::is_slug(&n, 64) {
+                    bail!("--name must match [a-z0-9][a-z0-9-]{{0,63}}");
+                }
+                ts.title = Some(std::mem::replace(&mut ts.name, n));
+            }
             std::fs::write(&out, serde_json::to_string_pretty(&ts)? + "\n")?;
             eprintln!("wrote {}", out.display());
             Ok(())
         }
-        TasksetCmd::Validate { file, max_total_s } => {
-            let ts = taskset_cmd::load(&file)?;
-            ts.validate(max_total_s)?;
+        TasksetCmd::Validate {
+            path,
+            max_total_s,
+            allow_scorer,
+        } => {
+            let is_zip = path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("zip"));
+            let is_source = path.file_name().is_some_and(|n| n == "source.json");
+            if !(is_zip || is_source || path.is_dir()) {
+                let ts = taskset_cmd::load(&path)?;
+                ts.validate(max_total_s)?;
+                println!(
+                    "{}: {} stages, stage time {}s, total limit {}s (platform max {max_total_s}s): ok",
+                    ts.name,
+                    ts.stages.len(),
+                    ts.stage_time_s(),
+                    ts.total_time_limit_s
+                );
+                return Ok(());
+            }
+            let tmp = tempfile::tempdir()?;
+            let root = if is_zip {
+                taskset_cmd::unpack_source_zip(&std::fs::read(&path)?, tmp.path())?
+            } else if is_source {
+                path.parent().unwrap_or(Path::new(".")).to_path_buf()
+            } else {
+                taskset_cmd::source_root(&path)?
+            };
+            let allowed: Vec<&str> = if allow_scorer.is_empty() {
+                USER_SCORERS.to_vec()
+            } else {
+                allow_scorer.iter().map(String::as_str).collect()
+            };
+            // A built-in taskset keeps its stage dirs under source/.
+            let src_dir =
+                if !is_zip && root.join("taskset.json").is_file() && root.join("source").is_dir() {
+                    root.join("source")
+                } else {
+                    root.clone()
+                };
+            let p = taskset_cmd::prepare(&root.join("source.json"), &src_dir, Some(&allowed))?;
+            for (s, (_, _, ni, nt)) in p.src.stages.iter().zip(&p.zips) {
+                println!(
+                    "  {}: {ni} input files, {nt} test files, {}s",
+                    s.id, s.time_limit_s
+                );
+            }
             println!(
-                "{}: {} stages, stage time {}s, total limit {}s (platform max {max_total_s}s): ok",
-                ts.name,
-                ts.stages.len(),
-                ts.stage_time_s(),
-                ts.total_time_limit_s
+                "{}: {} stages, scorer {}, total limit {}s (platform max {}s): ok",
+                p.src.name,
+                p.src.stages.len(),
+                p.src.scorer.name,
+                p.src.total_time_limit_s,
+                crucible_core::taskset::MAX_TOTAL_TIME_S
             );
             Ok(())
+        }
+        TasksetCmd::Report {
+            worker_url,
+            id,
+            taskset,
+            error,
+        } => {
+            if !crucible_core::taskset::is_user_taskset_id(&id) {
+                bail!("--id must be u-<16 hex>");
+            }
+            let body = match (taskset, error) {
+                (Some(p), _) => {
+                    let ts = taskset_cmd::load(&p)?;
+                    if ts.name != id {
+                        bail!("{} is named {:?}, not {id}", p.display(), ts.name);
+                    }
+                    serde_json::json!({"status": "ready", "taskset": ts})
+                }
+                (None, Some(e)) => serde_json::json!({
+                    "status": "failed",
+                    "error": e.chars().take(500).collect::<String>(),
+                }),
+                (None, None) => bail!("--taskset or --error"),
+            };
+            worker::Worker::from_env(&worker_url)?
+                .taskset_result(&id, &body)
+                .await
         }
         TasksetCmd::Inputs {
             taskset,

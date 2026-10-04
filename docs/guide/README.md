@@ -63,6 +63,28 @@ crucible submit agent --agent-dir ./my-agent --taskset github-full \
 
 默认连接 `https://crucible-worker.stratosphericus.workers.dev`，可用 `--api` 或环境变量 `CRUCIBLE_API` 改。
 
+## 上传自己的题目包
+
+在网页“题目包”页登录后点“上传题目包”。
+
+- **格式**：一个 zip，结构同仓库里的 `tasksets/hello-world/source`：根目录（或 zip 里唯一的顶层文件夹）放 `source.json`，每个阶段一个目录，里面是给 agent 的需求文件（如 `requirements.yaml`）和只给打分器的测试（如 `tests/`）。`source.json` 示例：
+
+  ```json
+  {
+    "schema": 1, "name": "my-tasks", "description": "…",
+    "scorer": {"name": "playwright"}, "aggregate": "sum", "total_time_limit_s": 1200,
+    "stages": [
+      {"id": "stage-1", "dir": "stage-1", "inputs": ["requirements.yaml"], "tests": ["tests"],
+       "output": "web-app", "time_limit_s": 600, "expected_total": 1}
+    ]
+  }
+  ```
+- **限制**：各阶段限时之和 ≤ `total_time_limit_s` ≤ 18000 秒；打分器目前只能是 `playwright`（产出类型 `web-app`）；给 agent 的文件和测试文件不能重叠；不能有符号链接；加密后不超过 25 MB。
+- **先在本地检查**：`crucible taskset validate my-tasks.zip`（也可以传目录或 `source.json`），和平台用的是同一套检查。
+- **登记**：文件在浏览器里用平台公钥加密后上传。平台解密、检查、按阶段拆成“给 agent 的输入”和“测试”两份分别加密保存，几分钟后状态变为“可用”；没通过时页面上显示原因。
+- **可见性**：默认私有，只有你能看到和使用（提交页的题目包列表、命令行 `--taskset u-…`）；管理员可以把它设为公开。仓库内置的题目包不受影响。
+- **安全**：你的测试会被当作不可信代码运行：运行测试的机器上没有任何平台密钥，测试容器不能联网、不能访问宿主机（见 `docs/scorer-contract.md` §7）。
+
 ## 下载产出
 
 评测完成后，可以在评测详情页下载产出和日志。下载到的是用你的下载密码加密的 AES-256 zip。macOS 和 Windows 自带的解压工具不支持这种加密，打不开，请使用 **7-Zip**、**Keka** 或 **The Unarchiver**。之所以不用系统自带工具支持的格式，是因为那种旧式加密（ZipCrypto）已被攻破。平台不保存下载密码，忘记后无法找回。

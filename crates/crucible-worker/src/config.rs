@@ -21,6 +21,8 @@ pub struct Config {
     pub eval_workflow: String,
     /// App mode (score an uploaded artifact).
     pub score_workflow: String,
+    /// Register a user-uploaded taskset.
+    pub taskset_workflow: String,
     pub eval_ref: String,
     pub github_api: String,
     pub github_web: String,
@@ -107,10 +109,15 @@ impl Config {
                     .all(|b| b.is_ascii_alphanumeric() || b"-_./".contains(&b))
         };
         let score_workflow = opt("SCORE_WORKFLOW").unwrap_or_else(|| "score.yml".into());
+        let taskset_workflow = opt("TASKSET_WORKFLOW").unwrap_or_else(|| "taskset-pack.yml".into());
         let file_ok = |s: &str| safe(s) && !s.contains('/');
-        if !file_ok(&eval_workflow) || !file_ok(&score_workflow) || !safe(&eval_ref) {
+        if !file_ok(&eval_workflow)
+            || !file_ok(&score_workflow)
+            || !file_ok(&taskset_workflow)
+            || !safe(&eval_ref)
+        {
             return Err(
-                "EVAL_WORKFLOW / SCORE_WORKFLOW / EVAL_REF contain unexpected characters".into(),
+                "EVAL_WORKFLOW / SCORE_WORKFLOW / TASKSET_WORKFLOW / EVAL_REF contain unexpected characters".into(),
             );
         }
 
@@ -140,6 +147,7 @@ impl Config {
             worker_url,
             eval_workflow,
             score_workflow,
+            taskset_workflow,
             eval_ref,
             github_api: github_api.trim_end_matches('/').to_owned(),
             github_web: github_web.trim_end_matches('/').to_owned(),

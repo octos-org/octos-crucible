@@ -14,10 +14,19 @@ export interface TaskStage {
 }
 
 export interface TaskSet {
+  /** Built-in: the directory name; uploaded: the id `u-<16 hex>`. */
   name: string;
   version: string;
   stages: TaskStage[];
+  // Uploaded tasksets only.
+  title?: string | null;
+  owner_login?: string | null;
+  public?: boolean | null;
+  status?: "packing" | "ready" | "failed" | null;
+  error?: string | null;
 }
+
+export type UploadKind = Mode | "taskset";
 
 export type Mode = "agent" | "app";
 

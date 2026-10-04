@@ -1,7 +1,8 @@
 //! `crucible taskset pack|validate|inputs`.
 //!
-//! `pack` turns a source directory into sealed blobs plus a public
-//! `taskset.json`. Per stage it builds two zips: inputs (what the agent sees
+//! `pack` turns a source directory (or a user's zip of one) into sealed
+//! blobs plus a public `taskset.json`; `validate` runs the same checks
+//! without storing anything. Per stage it builds two zips: inputs (what the agent sees
 //! in `/req`) and tests (hidden material for the scorer). The two file sets
 //! must be disjoint. `inputs` is what a generation job runs: it downloads
 //! only the inputs blobs, never the tests.
@@ -11,6 +12,7 @@ use std::io::Cursor;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use crucible_core::BlobRef;
 use crucible_core::TaskSet;
 use crucible_core::taskset::{Aggregate, MAX_TOTAL_TIME_S, OutputKind, ScorerRef, Stage};
 use crucible_crypto::{PrivateKey, PublicKey};
@@ -21,6 +23,7 @@ use crate::zipdir::{self, Entry, ExtractLimits, ZipStats};
 
 /// `source.json` next to a taskset: how to cut the source tree into blobs.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PackSource {
     pub schema: u32,
     pub name: String,
@@ -34,6 +37,7 @@ pub struct PackSource {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PackStage {
     pub id: String,
     /// Stage directory, relative to the source root.
@@ -47,6 +51,12 @@ pub struct PackStage {
     #[serde(default)]
     pub expected_total: Option<u32>,
 }
+
+/// Limits for unpacking a user's taskset zip.
+pub const SOURCE_ZIP_LIMITS: ExtractLimits = ExtractLimits {
+    max_files: 10_000,
+    max_bytes: 256 << 20,
+};
 
 /// Limits for unpacking an inputs blob.
 pub const INPUT_LIMITS: ExtractLimits = ExtractLimits {
@@ -86,17 +96,71 @@ pub fn zip_paths(root: &Path, paths: &[String]) -> Result<(Vec<u8>, BTreeSet<Str
     Ok((zip, names))
 }
 
-pub async fn pack(
+/// A checked source: what `pack` would store, before storing it.
+pub struct Prepared {
+    pub src: PackSource,
+    /// Per stage: (inputs zip, tests zip, inputs file count, tests file count).
+    pub zips: Vec<(Vec<u8>, Vec<u8>, usize, usize)>,
+}
+
+impl Prepared {
+    fn taskset(&self, blobs: Vec<(BlobRef, BlobRef)>) -> TaskSet {
+        let src = &self.src;
+        TaskSet {
+            schema: src.schema,
+            name: src.name.clone(),
+            title: None,
+            description: src.description.clone(),
+            scorer: src.scorer.clone(),
+            aggregate: src.aggregate,
+            total_time_limit_s: src.total_time_limit_s,
+            stages: src
+                .stages
+                .iter()
+                .zip(blobs)
+                .map(|(s, (inputs_blob, tests_blob))| Stage {
+                    id: s.id.clone(),
+                    inputs_blob,
+                    tests_blob,
+                    output: s.output,
+                    time_limit_s: s.time_limit_s,
+                    expected_total: s.expected_total,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Parse `source.json`, cut every stage into its inputs and tests zips, and
+/// run the taskset checks (format, stage ids, total time <= the platform
+/// limit). With `allowed_scorers`, the scorer must be one of them, and a
+/// `playwright` taskset may only ask for `web-app` outputs.
+pub fn prepare(
     source: &Path,
     src_dir: &Path,
-    key: &PublicKey,
-    store: &Store,
-) -> Result<TaskSet> {
+    allowed_scorers: Option<&[&str]>,
+) -> Result<Prepared> {
     let raw =
         std::fs::read_to_string(source).with_context(|| format!("reading {}", source.display()))?;
     let src: PackSource =
         serde_json::from_str(&raw).with_context(|| format!("parsing {}", source.display()))?;
-    let mut stages = Vec::new();
+    if let Some(allowed) = allowed_scorers {
+        if !allowed.contains(&src.scorer.name.as_str()) {
+            bail!(
+                "scorer {:?} is not available; use one of {allowed:?}",
+                src.scorer.name
+            );
+        }
+        if src.scorer.name == "playwright"
+            && let Some(s) = src.stages.iter().find(|s| s.output != OutputKind::WebApp)
+        {
+            bail!(
+                "stage {}: the playwright scorer needs output \"web-app\"",
+                s.id
+            );
+        }
+    }
+    let mut zips = Vec::new();
     for s in &src.stages {
         if !rel_ok(&s.dir) {
             bail!("stage {}: dir {:?} must be relative", s.id, s.dir);
@@ -109,36 +173,64 @@ pub async fn pack(
         if let Some(both) = inputs.intersection(&tests).next() {
             bail!("stage {}: {both} is both an input and a test file", s.id);
         }
-        let inputs_blob = store.put_sealed(key, &inputs_zip).await?;
-        let tests_blob = store.put_sealed(key, &tests_zip).await?;
-        eprintln!(
-            "stage {}: inputs {} files -> {}, tests {} files -> {}",
-            s.id,
-            inputs.len(),
-            inputs_blob.sha256,
-            tests.len(),
-            tests_blob.sha256
-        );
-        stages.push(Stage {
-            id: s.id.clone(),
-            inputs_blob,
-            tests_blob,
-            output: s.output,
-            time_limit_s: s.time_limit_s,
-            expected_total: s.expected_total,
-        });
+        zips.push((inputs_zip, tests_zip, inputs.len(), tests.len()));
     }
-    let ts = TaskSet {
-        schema: src.schema,
-        name: src.name,
-        description: src.description,
-        scorer: src.scorer,
-        aggregate: src.aggregate,
-        total_time_limit_s: src.total_time_limit_s,
-        stages,
+    let p = Prepared { src, zips };
+    let placeholder = BlobRef {
+        sha256: "0".repeat(64),
+        key_id: "0".repeat(16),
     };
+    p.taskset(vec![(placeholder.clone(), placeholder); p.zips.len()])
+        .validate(MAX_TOTAL_TIME_S)?;
+    Ok(p)
+}
+
+pub async fn pack(
+    source: &Path,
+    src_dir: &Path,
+    allowed_scorers: Option<&[&str]>,
+    key: &PublicKey,
+    store: &Store,
+) -> Result<TaskSet> {
+    let p = prepare(source, src_dir, allowed_scorers)?;
+    let mut blobs = Vec::new();
+    for (s, (inputs_zip, tests_zip, ni, nt)) in p.src.stages.iter().zip(&p.zips) {
+        let inputs_blob = store.put_sealed(key, inputs_zip).await?;
+        let tests_blob = store.put_sealed(key, tests_zip).await?;
+        eprintln!(
+            "stage {}: inputs {ni} files -> {}, tests {nt} files -> {}",
+            s.id, inputs_blob.sha256, tests_blob.sha256
+        );
+        blobs.push((inputs_blob, tests_blob));
+    }
+    let ts = p.taskset(blobs);
     ts.validate(MAX_TOTAL_TIME_S)?;
     Ok(ts)
+}
+
+/// Unpack a user's taskset zip into `dest` and return the directory that
+/// holds `source.json`: the zip's root, or its only top-level directory
+/// (macOS `__MACOSX` / `.DS_Store` entries are ignored).
+pub fn unpack_source_zip(zip: &[u8], dest: &Path) -> Result<std::path::PathBuf> {
+    zipdir::safe_extract(Cursor::new(zip), dest, SOURCE_ZIP_LIMITS)?;
+    source_root(dest)
+}
+
+pub fn source_root(dir: &Path) -> Result<std::path::PathBuf> {
+    if dir.join("source.json").is_file() {
+        return Ok(dir.to_path_buf());
+    }
+    let entries: Vec<_> = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| !matches!(e.file_name().to_str(), Some("__MACOSX" | ".DS_Store")))
+        .collect();
+    if let [only] = entries.as_slice()
+        && only.file_type()?.is_dir()
+        && only.path().join("source.json").is_file()
+    {
+        return Ok(only.path());
+    }
+    bail!("no source.json at the top of the taskset (or of its only folder)")
 }
 
 pub fn load(path: &Path) -> Result<TaskSet> {
@@ -206,7 +298,7 @@ mod tests {
         std::fs::write(&source, SOURCE).unwrap();
         let store = Store::parse(&format!("dir:{}", work.path().join("store").display())).unwrap();
         let sk = PrivateKey::generate();
-        let ts = pack(&source, src.path(), &sk.public(), &store)
+        let ts = pack(&source, src.path(), None, &sk.public(), &store)
             .await
             .unwrap();
         assert_eq!(ts.stages.len(), 2);
@@ -240,7 +332,105 @@ mod tests {
         ] {
             assert_ne!(bad, SOURCE, "{why}");
             std::fs::write(&source, bad).unwrap();
-            assert!(pack(&source, src.path(), &key, &store).await.is_err(), "{why}");
+            assert!(pack(&source, src.path(), None, &key, &store).await.is_err(), "{why}");
         }
+    }
+
+    #[test]
+    fn validate_refuses_user_mistakes() {
+        let src = tree();
+        let work = tempfile::tempdir().unwrap();
+        let source = work.path().join("source.json");
+        let user = Some(crucible_core::taskset::USER_SCORERS);
+        std::fs::write(&source, SOURCE).unwrap();
+        let p = prepare(&source, src.path(), user).unwrap();
+        assert_eq!(p.zips[0].2, 2); // requirements.yaml + reference/a.png
+        assert_eq!(p.zips[0].3, 2); // tests/a.spec.ts + tests/support/e2e.ts
+        for (bad, why) in [
+            (
+                SOURCE.replace("\"playwright\"", "\"astro-survey\""),
+                "scorer not offered to users",
+            ),
+            (
+                SOURCE.replace("\"playwright\"", "\"my-scorer\""),
+                "unknown scorer",
+            ),
+            (
+                SOURCE.replacen("\"web-app\"", "\"files\"", 1),
+                "playwright needs web-app",
+            ),
+            (
+                SOURCE.replace(
+                    "\"total_time_limit_s\": 7000",
+                    "\"total_time_limit_s\": 18001",
+                ),
+                "total over 18000 s",
+            ),
+            (
+                SOURCE.replace(
+                    "\"total_time_limit_s\": 7000",
+                    "\"total_time_limit_s\": 6999",
+                ),
+                "stages exceed the total",
+            ),
+            (
+                SOURCE.replace("\"id\": \"stage-2\"", "\"id\": \"stage-1\""),
+                "duplicate stage",
+            ),
+            (
+                SOURCE.replace("\"id\": \"stage-2\"", "\"id\": \"Stage 2\""),
+                "bad stage id",
+            ),
+            (
+                SOURCE.replace("\"schema\": 1", "\"schema\": 1, \"extra\": 1"),
+                "unknown field",
+            ),
+            (
+                SOURCE.replace("\"tests\": [\"tests\"]", "\"tests\": [\"/etc\"]"),
+                "absolute path",
+            ),
+            (
+                SOURCE.replace("\"tests\": [\"tests\"]", "\"tests\": [\"nope\"]"),
+                "missing tests",
+            ),
+            ("{".into(), "not JSON"),
+        ] {
+            std::fs::write(&source, &bad).unwrap();
+            assert!(prepare(&source, src.path(), user).is_err(), "{why}");
+        }
+        // Without user rules (built-in tasksets) any scorer name is accepted.
+        std::fs::write(
+            &source,
+            SOURCE.replace("\"playwright\"", "\"astro-survey\""),
+        )
+        .unwrap();
+        assert!(prepare(&source, src.path(), None).is_ok());
+    }
+
+    #[test]
+    fn finds_source_json_in_a_zip() {
+        let src = tree();
+        std::fs::write(src.path().join("source.json"), SOURCE).unwrap();
+        let entries = |prefix: &str| {
+            let mut v = Vec::new();
+            let mut st = ZipStats::default();
+            zipdir::collect(src.path(), "", &|_| false, &mut v, &mut st).unwrap();
+            for e in &mut v {
+                e.name = format!("{prefix}{}", e.name);
+            }
+            v
+        };
+        for prefix in ["", "my-taskset/"] {
+            let zip = zipdir::write_zip(Cursor::new(Vec::new()), &entries(prefix), &[])
+                .unwrap()
+                .into_inner();
+            let d = tempfile::tempdir().unwrap();
+            let root = unpack_source_zip(&zip, d.path()).unwrap();
+            assert!(prepare(&root.join("source.json"), &root, Some(&["playwright"])).is_ok());
+        }
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("a")).unwrap();
+        std::fs::create_dir_all(d.path().join("b")).unwrap();
+        assert!(source_root(d.path()).is_err());
     }
 }

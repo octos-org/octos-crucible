@@ -8,9 +8,9 @@ import type {
   EvalDetail,
   EvalSummary,
   Me,
-  Mode,
   NewApiToken,
   TaskSet,
+  UploadKind,
 } from "./types";
 import type { PublicKeyInfo } from "./crypto";
 import { mockBackend } from "./mock";
@@ -81,8 +81,11 @@ export class ApiError extends Error {
 export interface Backend {
   me(): Promise<Me>;
   pubkey(): Promise<PublicKeyInfo>;
-  tasksets(): Promise<TaskSet[]>;
-  upload(kind: Mode, sealed: Uint8Array): Promise<{ hash: string }>;
+  /** `all`: admins list every uploaded taskset. */
+  tasksets(all?: boolean): Promise<TaskSet[]>;
+  upload(kind: UploadKind, sealed: Uint8Array): Promise<{ hash: string }>;
+  registerTaskset(upload_hash: string): Promise<{ id: string; status: string }>;
+  setTasksetPublic(id: string, on: boolean): Promise<{ id: string; public: boolean }>;
   createEval(body: CreateEval): Promise<{ eval_id: string }>;
   evals(): Promise<EvalSummary[]>;
   evalDetail(id: string): Promise<EvalDetail>;
@@ -132,7 +135,19 @@ const enc = encodeURIComponent;
 export const httpBackend: Backend = {
   me: () => json("/me"),
   pubkey: () => json("/pubkey"),
-  tasksets: () => json("/tasksets"),
+  tasksets: (all) => json(all ? "/tasksets?all=1" : "/tasksets"),
+  registerTaskset: (upload_hash) =>
+    json("/tasksets", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ upload_hash }),
+    }),
+  setTasksetPublic: (id, on) =>
+    json(`/tasksets/${enc(id)}/public`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ public: on }),
+    }),
   upload: (kind, sealed) =>
     json("/uploads", {
       method: "POST",
