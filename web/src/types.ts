@@ -97,6 +97,8 @@ export interface ReplicaEntry {
 }
 
 export interface Manifest {
+  /** Present when a password zip of the outputs exists (agent mode with a download password). */
+  download?: { sha256: string } | null;
   schema: number;
   eval_id: string;
   created_at: string;
