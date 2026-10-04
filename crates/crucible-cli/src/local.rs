@@ -410,11 +410,6 @@ pub async fn eval_local(a: LocalArgs) -> Result<()> {
                         ],
                     )
                     .await?;
-                    let _ = crate::build::docker()
-                        .args(["image", "rm", "-f", &tag])
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .status();
                     let _ = std::fs::remove_dir_all(dir.join(format!("work-r{r}")));
                 }
                 (vec!["--stages".to_string(), o("stages")], a.replicas)
@@ -485,6 +480,8 @@ pub async fn eval_local(a: LocalArgs) -> Result<()> {
                     s(&handoff),
                     "--replica".into(),
                     r.to_string(),
+                    "--run-label".into(),
+                    format!("{eval_id}-score-r{r}"),
                     "--out".into(),
                     s(&scores),
                 ],
