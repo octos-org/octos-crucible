@@ -14,6 +14,7 @@ mod build;
 mod cred;
 mod executor;
 mod keys;
+mod local;
 mod packagers;
 mod plan;
 mod publish;
@@ -224,6 +225,16 @@ enum Cmd {
     },
     /// Show (or wait for) an evaluation's status and scores.
     Status(submit::StatusArgs),
+    /// Run a whole evaluation without GitHub (`local`: on this machine).
+    Eval {
+        #[command(subcommand)]
+        cmd: local::EvalCmd,
+    },
+    /// Local key pairs (`gen`), standing in for the platform key off GitHub.
+    Keys {
+        #[command(subcommand)]
+        cmd: local::KeysCmd,
+    },
     /// The steps of an evaluation (docs/executors.md): each declares its
     /// inputs, output, secrets and needs (`crucible step list`).
     Step {
@@ -429,7 +440,7 @@ impl OutArgs {
     }
 }
 
-fn read_input(path: &str) -> Result<Vec<u8>> {
+pub fn read_input(path: &str) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     if path == "-" {
         std::io::stdin().read_to_end(&mut buf)?;
@@ -453,6 +464,12 @@ fn write_output(path: &str, data: &[u8]) -> Result<()> {
 async fn run(cmd: Cmd, secrets: Option<steps::Secrets>) -> Result<()> {
     match cmd {
         Cmd::Step { cmd } => steps::run(*cmd, secrets).await,
+        Cmd::Eval {
+            cmd: local::EvalCmd::Local(a),
+        } => local::eval_local(*a).await,
+        Cmd::Keys {
+            cmd: local::KeysCmd::Gen { out },
+        } => local::keys_gen(&out),
         Cmd::Meter(args) => crucible_meter::run(args).await.map_err(|e| anyhow!("{e}")),
         Cmd::Egress {
             bind,

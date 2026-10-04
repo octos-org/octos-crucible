@@ -39,6 +39,10 @@ pub struct Manifest {
     /// GitHub Actions run that produced this evaluation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run: Option<RunRef>,
+    /// Where the wall times come from when not from a GitHub run
+    /// (`local`: the machine's own clock, `crucible eval local`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timing_source: Option<String>,
     pub replicas: Vec<ReplicaEntry>,
     /// How this evaluation was scored and is shown, from its taskset at
     /// publish time. Absent in manifests that predate it: those read as
@@ -275,6 +279,7 @@ mod tests {
             score_public: false,
             stages_run: None,
             run: None,
+            timing_source: None,
             scoring: None,
             total_score: Some(0.9),
             download: None,

@@ -4,7 +4,7 @@
 
 插件化（`docs/plugins.md`，P2 的 `plugins.json`、产出运行器 `workdir`、打包器、打分器）是本文的前提：插件决定"一步里做什么"，本文只决定"这一步在哪、用什么起容器、密钥怎么送到"。插件接口不因执行层而改变。
 
-本文只是设计，不改代码。第 5 节给出实施顺序，每一步单独上线。
+第 5 节给出实施顺序，每一步单独上线。**已实现**：步骤层（`crucible step <名字>`，`crucible step list` 输出全部声明）、执行后端接口与 Docker 实现（沙箱按槽位分配，一台机器可同时跑多个评测）、单机运行 `crucible eval local`（用法见 §5.2 末尾）。Nomad、Kubernetes 尚未开始。
 
 ---
 
@@ -425,6 +425,23 @@ Nomad 自己没有 NetworkPolicy 这样的通用网络规则，隔离最终都�
 **工作量：** 步骤层抽出 2–3 天；本地驱动与本地钥匙 1–2 天。
 
 **验证：** 在 magicbook 上用本地钥匙打包 hello-world 和 astro-practice，`crucible eval local` 跑 hello-world 两阶段和巡天 L1，两次都出分。不需要 GitHub 网络以外的任何服务（模型接口除外）。
+
+**用法（已实现）：**
+
+```
+# app 模式：给一个产出 zip 打分（不需要模型）
+crucible eval local --root <仓库> --taskset hello-world --app app.zip --stage 1
+# agent 模式：模型 key 以文件给出，{"api_key": "...", "endpoint": "https://..."}
+crucible eval local --root <仓库> --taskset hello-world --agent builtin:octos \
+    --stages 2 --replicas 1 --model glm-5.3-flash --cred-file ~/model-cred.json
+```
+
+- `--taskset` 是 `tasksets/` 下的名字，或一个含 `source.json` 的目录；每次从公开源用本地钥匙打包（内容寻址，重复打包不占空间）。
+- 本地钥匙默认 `~/.crucible/keys`（缺则自动生成，也可 `crucible keys gen --out <目录>`），存储默认 `dir:~/.crucible/store`，结果在 `--out`（默认 `./crucible-evals`）`/<eval id>/`：`gen/`（封好的产出与日志）、`scores/`、`publish/manifest.json` 与 `manifest.sealed`、`steps.json`（驱动计时）。manifest 记 `timing_source: local`。
+- 模型 key 只在 `--cred-file` 里（`-` 表示从标准输入读），驱动读到后立即用本地公钥封好，之后与 GitHub 上的开发凭据走同一条路：只在需要它的步骤进程里、只在计量代理里解开。app 模式只有题目包的打分槽位用模型时才需要它。
+- 每步是一个子进程，密钥以文件放在 `/dev/shm` 下的新目录、只放该步清单里的、步骤结束即删；一次性钥匙由驱动生成，私钥只交给 `score-tests`。
+- 同时跑多个：直接再开一个 `crucible eval local`。每个用沙箱的步骤自己占一个空闲槽位（`crucible-sbx[-k]`、网桥 `crucible<k>`、`172.31.(250-k).0/24`），agent 镜像按评测打标签，结束时网桥、iptables 规则、容器、镜像都回收。
+- 前提：Linux、Docker（iptables 防火墙后端）、当前用户在 docker 组、`sudo -n iptables` 免密。
 
 ### 5.3 c. Kubernetes 后端
 

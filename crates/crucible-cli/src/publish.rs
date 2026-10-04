@@ -344,6 +344,7 @@ pub fn build_manifest(m: &ManifestInputs) -> Result<Manifest> {
         score_public: m.score_public,
         stages_run: (m.mode == Mode::Agent).then_some(m.stages_run as u32),
         run: m.run.clone(),
+        timing_source: None,
         replicas,
         scoring: Some(m.taskset.scoring()),
         total_score: None,

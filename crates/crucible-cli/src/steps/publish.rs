@@ -67,6 +67,9 @@ pub struct Args {
     /// Pack the download zip (the credential is from this Worker's KV).
     #[arg(long, default_value = "")]
     pub download_zip: String,
+    /// Recorded as the manifest's `timing_source` (e.g. `local`).
+    #[arg(long)]
+    pub timing_source: Option<String>,
     #[arg(long)]
     pub out: PathBuf,
 }
@@ -129,7 +132,7 @@ pub async fn run(a: Args, s: &Secrets) -> Result<()> {
             .map(|p| p.to_string()),
     };
     let manifest_path = a.out.join("manifest.json");
-    let m = crate::build_manifest(
+    let mut m = crate::build_manifest(
         &ManifestArgs {
             eval_id: a.eval_id.clone(),
             taskset: a.taskset.clone(),
@@ -160,6 +163,7 @@ pub async fn run(a: Args, s: &Secrets) -> Result<()> {
         },
         &keys,
     )?;
+    m.timing_source = a.timing_source.clone();
     std::fs::write(&manifest_path, serde_json::to_string_pretty(&m)? + "\n")?;
     print_summary(&m);
 
