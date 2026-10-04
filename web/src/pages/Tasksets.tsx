@@ -16,7 +16,7 @@ export function Tasksets() {
   return (
     <div class="stack">
       <h1>题目包</h1>
-      <p class="muted small">每个题目包分若干阶段，agent 在同一工作目录里依次完成；每阶段结束后单独打分。测试材料不公开。</p>
+      <p class="muted small">题目包定义题目和打分方式：可以是写网站、与模拟器交互等任何能自动打分的任务。每个题目包分若干阶段，agent 依次完成，每阶段结束后单独打分。测试材料不公开。</p>
       {loggedIn && <UploadTaskset onDone={ts.reload} />}
       {admin && (
         <label class="small">
@@ -124,7 +124,7 @@ function UploadTaskset({ onDone }: { onDone: () => void }) {
       <form class="stack" onSubmit={submit}>
         <p class="muted small">
           zip，格式同仓库 <code>tasksets/hello-world/source</code>：根目录（或唯一的顶层文件夹）放 <code>source.json</code>，每个阶段一个目录，内含给 agent 的需求文件和只给打分器的
-          <code>tests/</code>。总限时不超过 18000 秒，打分器只能是 <code>playwright</code>。可先在本地运行 <code>crucible taskset validate 题目包.zip</code>{" "}
+          <code>tests/</code>。总限时不超过 18000 秒，上传的题目包目前只能用 <code>playwright</code> 打分器（更多打分器即将开放）。可先在本地运行 <code>crucible taskset validate 题目包.zip</code>{" "}
           检查。文件在浏览器里加密后上传；默认私有，只有你能看到和使用，管理员可设为公开。
         </p>
         <input

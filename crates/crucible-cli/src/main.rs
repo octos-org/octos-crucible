@@ -30,7 +30,7 @@ use keys::{Store, load_identities};
 #[command(
     name = "crucible",
     version,
-    about = "Evaluation infrastructure for coding agents"
+    about = "A general platform for evaluating agents"
 )]
 struct Cli {
     #[command(subcommand)]

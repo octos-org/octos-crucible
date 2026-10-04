@@ -1,6 +1,12 @@
 # octos-crucible
 
-Evaluation infrastructure for coding agents: run an agent (or score its output) against a taskset, and report scores per stage together with wall time, tokens, cache hit rate and equivalent cost.
+A general platform for evaluating agents: any agent that runs in a sandbox, on any taskset, run stage by stage and scored, with wall time, tokens, cache hit rate and equivalent cost recorded objectively. Writing code is just one kind of task:
+
+- **Coding**: ARC-Bench GitHub tasks (`tasksets/arcbench-github`), the agent builds a website, scored by Playwright tests.
+- **Interactive decision-making**: GOSIM Agentic Observer (`tasksets/astro-practice`), an observing agent answers a simulator turn by turn, scored by the official engine ([docs/astro-survey.md](docs/astro-survey.md)).
+- **Math / reasoning** (coming soon): e.g. IMO problems, the agent writes proofs and a judge model scores them against a rubric; model-based scoring is planned in [docs/plugins.md](docs/plugins.md).
+
+Tasksets, runners, packagers and scorers are pluggable ([docs/plugins.md](docs/plugins.md)).
 
 Design: [docs/DESIGN.md](docs/DESIGN.md) · Agent packages: [docs/agent-contract.md](docs/agent-contract.md)
 
