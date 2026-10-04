@@ -240,11 +240,7 @@ pub fn build_manifest(m: &ManifestInputs) -> Result<Manifest> {
         for st in stages_iter {
             let sdir = rdir.join(&st.id);
             let score = match m.scores {
-                Some(dir) => crate::score::read_score(dir, r, &st.id)?.map(|s| StageScore {
-                    status: s.status,
-                    passed: s.passed,
-                    total: s.total,
-                }),
+                Some(dir) => crate::score::read_score(dir, r, &st.id)?.map(|s| StageScore::from(&s)),
                 None => None,
             };
             let (usage_raw, timing_raw) = stage_numbers(&sdir, m.keys)?;
@@ -297,7 +293,7 @@ pub fn build_manifest(m: &ManifestInputs) -> Result<Manifest> {
         });
     }
     let mut manifest = Manifest {
-        schema: 1,
+        schema: crucible_core::manifest::MANIFEST_SCHEMA,
         eval_id: m.eval_id.into(),
         created_at: m.created_at.clone(),
         taskset: m.taskset.name.clone(),
@@ -309,6 +305,7 @@ pub fn build_manifest(m: &ManifestInputs) -> Result<Manifest> {
         stages_run: (m.mode == Mode::Agent).then_some(m.stages_run as u32),
         run: m.run.clone(),
         replicas,
+        scoring: Some(m.taskset.scoring()),
         total_score: None,
         download: None,
     };
@@ -493,8 +490,10 @@ mod tests {
             ..inputs
         })
         .unwrap();
-        let sc = scored.replicas[0].stages[0].score.unwrap();
-        assert_eq!((sc.passed, sc.total), (2, 3));
+        let sc = scored.replicas[0].stages[0].score.clone().unwrap();
+        assert_eq!((sc.score, sc.max), (Some(2.0), Some(3.0)));
+        let snap = scored.scoring.as_ref().unwrap();
+        assert_eq!(snap.plugins[0].name, ts.scorer.name);
         assert_eq!(scored.total_score, Some(0.6667));
 
         // The download: outputs and logs under a password.

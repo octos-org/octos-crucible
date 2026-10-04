@@ -17,7 +17,7 @@ pub use agent::AgentSpec;
 pub use blob::BlobRef;
 pub use envelope::Envelope;
 pub use manifest::Manifest;
-pub use score::{ScoreResult, ScoreStatus};
+pub use score::{ScoreResult, ScoreStatus, StageScore};
 pub use taskset::TaskSet;
 pub use usage::UsageRecord;
 
