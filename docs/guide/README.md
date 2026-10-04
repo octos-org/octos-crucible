@@ -39,6 +39,30 @@ ENTRYPOINT ["/opt/agent/run.sh"]
 
 `run.sh` 里启动你的程序即可，例如 `exec timeout "$DEADLINE_S" python3 /opt/agent/agent.py`。容器里可用的环境变量有 `MODEL`（模型名）、`DEADLINE_S`（本阶段时限，秒）、`OPENAI_BASE_URL`（平台的计量代理）；`OPENAI_API_KEY` 是 `dummy`，你的真实 key 只在计量代理里，不进容器。运行时容器限 2 GB 内存、1 核、非 root，只能访问计量代理和 npm、PyPI，看不到测试，所以其他依赖要在 `Dockerfile` 里装好。在 `my-agent/` 目录里执行 `zip -r ../my-agent.zip .`，保证 `agent.json` 在 zip 根目录，然后上传。完整规范见 [docs/agent-contract.md](../agent-contract.md)。
 
+## 命令行提交
+
+适合脚本和闭环优化反复提交。行为与网页完全一致：本地打 zip、用平台公钥加密后上传，模型 key 和下载密码同样在本机加密，明文不经过服务器。
+
+1. **安装**：`cargo install --git https://github.com/octos-org/octos-crucible crucible-cli --locked`（得到 `crucible` 命令）。
+2. **令牌**：网页登录 →「我的评测」→「命令行令牌」→「生成命令行令牌」。令牌只显示一次，复制后 `export CRUCIBLE_TOKEN=crt_...`。令牌等同于你的账号（但没有管理员权限，也不能用来再生成令牌），不用时在同一处撤销；每人最多 20 个。
+3. **提交**（`--i-agree` 表示同意下方[同意声明](#同意声明)，必填；命令会打印声明原文）：
+
+```sh
+# 只打分：上传一个阶段的产出 zip
+crucible submit app --zip site.zip --taskset github-full --stage 1 --i-agree
+
+# 完整评测：agent 目录会在本地打包（也可用 --agent-zip my-agent.zip）
+export MY_KEY=sk-...  DL_PW='至少 12 个字符的下载密码'
+crucible submit agent --agent-dir ./my-agent --taskset github-full \
+  --model glm-5.3 --endpoint https://api.example.com/v1 --replicas 3 \
+  --api-key-env MY_KEY --download-password-env DL_PW --i-agree
+```
+
+   可选参数：`--stages N`（只跑前 N 个阶段）、`--max-requests` / `--max-tokens` / `--max-cost-usd`（预算）、`--public`（公开分数）、`--wait`（提交后等结果）。模型 key 和下载密码只通过环境变量传入，不出现在命令行参数里。成功时标准输出只有一行 eval_id，便于脚本使用。
+4. **查结果**：`crucible status <eval_id>`，加 `--wait` 轮询到结束，打印每一遍每个阶段的分数、用时、token、等价花销和总分；`--json` 输出原始 JSON。评测失败时退出码非 0。
+
+默认连接 `https://crucible-worker.stratosphericus.workers.dev`，可用 `--api` 或环境变量 `CRUCIBLE_API` 改。
+
 ## 下载产出
 
 评测完成后，可以在评测详情页下载产出和日志。下载到的是用你的下载密码加密的 AES-256 zip。macOS 和 Windows 自带的解压工具不支持这种加密，打不开，请使用 **7-Zip**、**Keka** 或 **The Unarchiver**。之所以不用系统自带工具支持的格式，是因为那种旧式加密（ZipCrypto）已被攻破。平台不保存下载密码，忘记后无法找回。

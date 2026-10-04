@@ -19,6 +19,7 @@ pub mod keys;
 pub mod model;
 pub mod session;
 pub mod shard;
+pub mod tokens;
 pub mod util;
 
 #[cfg(target_arch = "wasm32")]

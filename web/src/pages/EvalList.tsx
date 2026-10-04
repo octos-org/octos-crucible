@@ -4,6 +4,7 @@ import { MAX_COMPARE } from "../compare";
 import { fmtScore, fmtTime } from "../stats";
 import type { EvalSummary } from "../types";
 import { ErrorBox, Loading, StatusBadge, shortId, useAsync } from "../ui";
+import { CliTokens } from "./Tokens";
 
 export function EvalList() {
   const evals = useAsync(() => api().evals());
@@ -96,6 +97,7 @@ export function EvalList() {
           </ul>
         </>
       )}
+      <CliTokens />
     </div>
   );
 }

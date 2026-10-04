@@ -550,6 +550,7 @@ dependencies = [
  "crucible-metering",
  "crucible-report",
  "crucible-store",
+ "getrandom 0.2.17",
  "hex",
  "humantime",
  "reqwest",

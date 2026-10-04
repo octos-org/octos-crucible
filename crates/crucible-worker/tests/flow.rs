@@ -52,6 +52,7 @@ struct Mock {
     gh: RefCell<FakeGitHub>,
     now: Cell<u64>,
     logs: RefCell<Vec<String>>,
+    rng: Cell<u8>,
 }
 
 impl Mock {
@@ -61,6 +62,7 @@ impl Mock {
             gh: RefCell::default(),
             now: Cell::new(NOW),
             logs: RefCell::default(),
+            rng: Cell::new(7),
         }
     }
 
@@ -267,7 +269,10 @@ impl Backend for Mock {
         self.now.get()
     }
     fn random_bytes(&self, n: usize) -> Vec<u8> {
-        vec![7; n]
+        // Deterministic, but distinct per call.
+        let r = self.rng.get();
+        self.rng.set(r.wrapping_add(1));
+        vec![r; n]
     }
     fn log(&self, line: &str) {
         self.logs.borrow_mut().push(line.to_owned());
@@ -1018,4 +1023,101 @@ fn bans() {
     );
     // util is part of the public surface the tests rely on.
     assert_eq!(util::rfc3339(NOW), "2026-10-03T00:00:00Z");
+}
+
+#[test]
+fn api_tokens() {
+    let t = T::new();
+    let alice = token(42, "octocat");
+    let admin = token(1, "admin");
+
+    // Created with a session; the plaintext is returned once.
+    let r = t.as_user("POST", "/tokens", &alice, br#"{"name":"laptop"}"#);
+    assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+    let created = json_of(&r);
+    let cli = created["token"].as_str().unwrap().to_string();
+    let id = created["id"].as_str().unwrap().to_string();
+    assert!(cli.starts_with("crt_") && cli.contains(&id));
+    assert_eq!(created["name"], "laptop");
+    // KV holds only the hash.
+    let stored: Vec<u8> = t
+        .mock
+        .kv
+        .borrow()
+        .values()
+        .flat_map(|(v, _, _)| v.clone())
+        .collect();
+    assert!(!String::from_utf8_lossy(&stored).contains(&cli[20..]));
+    let r = t.as_user("POST", "/tokens", &alice, b"");
+    assert_eq!((r.status, json_of(&r)["name"].as_str()), (201, Some("cli")));
+    let second = json_of(&r)["id"].as_str().unwrap().to_string();
+    assert_ne!(second, id);
+    let list = json_of(&t.as_user("GET", "/tokens", &alice, b""));
+    assert_eq!(list.as_array().unwrap().len(), 2);
+    assert!(list[0].get("token").is_none() && list[0].get("hash").is_none());
+
+    // The token works on user endpoints as its owner...
+    let me = json_of(&t.as_user("GET", "/me", &cli, b""));
+    assert_eq!(
+        (me["github_id"].as_u64(), me["is_admin"].as_bool()),
+        (Some(42), Some(false))
+    );
+    let r = t.call(
+        "POST",
+        "/uploads",
+        &[
+            ("Authorization", &format!("Bearer {cli}")),
+            ("X-Upload-Kind", "app"),
+        ],
+        &sealed(b"app via token"),
+    );
+    assert_eq!(r.status, 201);
+    assert_eq!(t.as_user("GET", "/evals", &cli, b"").status, 200);
+    // ...but cannot manage tokens, and is never an admin.
+    assert_eq!(t.as_user("POST", "/tokens", &cli, b"").status, 403);
+    assert_eq!(t.as_user("GET", "/tokens", &cli, b"").status, 403);
+    let r = t.as_user("POST", "/tokens", &admin, b"");
+    let admin_cli = json_of(&r)["token"].as_str().unwrap().to_string();
+    let ban = serde_json::to_vec(&json!({"github_id": 42})).unwrap();
+    assert_eq!(
+        t.as_user("POST", "/admin/ban", &admin_cli, &ban).status,
+        403
+    );
+    assert_eq!(
+        t.as_user("GET", "/evals?all=1", &admin_cli, b"").status,
+        403
+    );
+    // Internal endpoints ignore user tokens entirely.
+    assert_eq!(
+        t.as_user("GET", &format!("/internal/cred/{EID}"), &cli, b"")
+            .status,
+        401
+    );
+
+    // Tampered or unknown tokens are rejected.
+    let mut forged = cli.clone();
+    let last = forged.pop().unwrap();
+    forged.push(if last == '0' { '1' } else { '0' });
+    assert_eq!(t.as_user("GET", "/me", &forged, b"").status, 401);
+
+    // Only the owner can revoke; revoked tokens stop working.
+    assert_eq!(
+        t.as_user("DELETE", &format!("/tokens/{id}"), &admin, b"")
+            .status,
+        404
+    );
+    assert_eq!(
+        t.as_user("DELETE", &format!("/tokens/{id}"), &alice, b"")
+            .status,
+        204
+    );
+    assert_eq!(t.as_user("GET", "/me", &cli, b"").status, 401);
+    let list = json_of(&t.as_user("GET", "/tokens", &alice, b""));
+    assert_eq!(list.as_array().unwrap().len(), 1);
+
+    // A banned owner's token is refused too.
+    let r = t.as_user("POST", "/tokens", &alice, b"");
+    let cli2 = json_of(&r)["token"].as_str().unwrap().to_string();
+    assert_eq!(t.as_user("POST", "/admin/ban", &admin, &ban).status, 200);
+    assert_eq!(err_code(&t.as_user("GET", "/me", &cli2, b"")), "banned");
 }
