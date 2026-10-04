@@ -8,7 +8,11 @@ import {
   fmtPct,
   fmtRange,
   fmtTime,
+  fmtStageNumber,
   fmtUsd,
+  fmtValue,
+  formatsOf,
+  readScore,
   replicaTotals,
   scoreStatusLabel,
   stageAcross,
@@ -17,10 +21,11 @@ import {
   summarize,
   totalTokens,
   usageOf,
+  type Formats,
   type ReplicaTotals,
   type Summary,
 } from "../stats";
-import type { EvalDetail, ReplicaEntry, StageEntry } from "../types";
+import type { EvalDetail, ReplicaEntry, StageEntry, StageScoreV2 } from "../types";
 import { Card, ErrorBox, Loading, StatusBadge, useAsync } from "../ui";
 
 const FINAL = new Set(["done", "failed"]);
@@ -44,6 +49,7 @@ export function EvalDetailPage({ id }: { id: string }) {
   const d = detail.data as EvalDetail;
   const m = d.manifest ?? {};
   const replicas: ReplicaEntry[] = Array.isArray(m.replicas) ? m.replicas : [];
+  const f = formatsOf(m);
 
   const download = async () => {
     setDlError(null);
@@ -124,10 +130,10 @@ export function EvalDetailPage({ id }: { id: string }) {
         <p class="muted">{FINAL.has(d.status) ? "没有结果数据。" : "还没有结果，完成第一个阶段后会显示在这里。"}</p>
       ) : (
         <>
-          <Overview replicas={replicas} />
-          <StageTable replicas={replicas} />
+          <Overview replicas={replicas} f={f} />
+          <StageTable replicas={replicas} f={f} />
           {replicas.map((r) => (
-            <ReplicaCard r={r} />
+            <ReplicaCard r={r} f={f} />
           ))}
         </>
       )}
@@ -136,8 +142,8 @@ export function EvalDetailPage({ id }: { id: string }) {
   );
 }
 
-function Overview({ replicas }: { replicas: ReplicaEntry[] }) {
-  const totals: ReplicaTotals[] = replicas.map(replicaTotals);
+function Overview({ replicas, f }: { replicas: ReplicaEntry[]; f: Formats }) {
+  const totals: ReplicaTotals[] = replicas.map((r) => replicaTotals(r, f.aggregate));
   const score = summarize(totals.map((t) => t.score));
   const wall = summarize(totals.map((t) => t.wall_s));
   const tokens = summarize(totals.map((t) => totalTokens(t.usage)));
@@ -151,9 +157,9 @@ function Overview({ replicas }: { replicas: ReplicaEntry[] }) {
     <Card title={n > 1 ? `总览（${n} 遍）` : "总览"}>
       <div class="tiles">
         <Tile
-          label="总分"
+          label={f.total.name || "总分"}
           s={score}
-          fmt={pct}
+          fmt={(x) => fmtValue(f.total, x)}
           note={score && score.n < n ? `${score.n}/${n} 遍完整打分` : undefined}
         />
         <Tile label="用时" s={wall} fmt={fmtDuration} />
@@ -189,12 +195,13 @@ function Tile({
       <div class="tile-value">{text ?? (s && fmt ? fmt(s.mean) : "—")}</div>
       {multi && s.std !== null && <div class="tile-sub">± {fmt(s.std)}</div>}
       {multi && <div class="tile-sub">{fmtRange(s, fmt)}</div>}
-      {note && <div class={`tile-sub ${label === "总分" ? "warn-text" : ""}`}>{note}</div>}
+      {note && <div class="tile-sub warn-text">{note}</div>}
     </div>
   );
 }
 
-function StageTable({ replicas }: { replicas: ReplicaEntry[] }) {
+function StageTable({ replicas, f }: { replicas: ReplicaEntry[]; f: Formats }) {
+  const fmt = (x: number) => fmtStageNumber(f.stage, x);
   const names = stageNames(replicas);
   const multi = replicas.length > 1;
   return (
@@ -204,7 +211,10 @@ function StageTable({ replicas }: { replicas: ReplicaEntry[] }) {
           <thead>
             <tr>
               <th>阶段</th>
-              <th>分数{multi ? "（均值 ± 标准差）" : ""}</th>
+              <th>
+                {f.stage.name || "分数"}
+                {multi ? "（均值 ± 标准差）" : ""}
+              </th>
               {multi && <th>最低–最高</th>}
               <th>用时</th>
               <th>请求</th>
@@ -216,15 +226,15 @@ function StageTable({ replicas }: { replicas: ReplicaEntry[] }) {
           <tbody>
             {names.map((name) => {
               const ss = stageAcross(replicas, name);
-              const score = summarize(ss.map(stageScore));
+              const score = summarize(ss.map((s) => stageScore(s, f.stage)));
               const us = ss.map(usageOf);
               const costs = ss.map((s) => s.cost_usd);
               const costKnown = costs.every((c) => typeof c === "number");
               return (
                 <tr>
                   <th scope="row">{name}</th>
-                  <td class="num">{fmtMeanStd(score, (x) => fmtPct(x))}</td>
-                  {multi && <td class="num">{fmtRange(score, (x) => fmtPct(x))}</td>}
+                  <td class="num">{fmtMeanStd(score, fmt)}</td>
+                  {multi && <td class="num">{fmtRange(score, fmt)}</td>}
                   <td class="num">{fmtMeanStd(summarize(ss.map((s) => s.wall_s)), fmtDuration)}</td>
                   <td class="num">{fmtMeanStd(summarize(us.map((u) => u.requests)), fmtCount)}</td>
                   <td class="num">{fmtMeanStd(summarize(us.map(totalTokens)), fmtCount)}</td>
@@ -240,20 +250,22 @@ function StageTable({ replicas }: { replicas: ReplicaEntry[] }) {
   );
 }
 
-function ReplicaCard({ r }: { r: ReplicaEntry }) {
-  const t = replicaTotals(r);
+function ReplicaCard({ r, f }: { r: ReplicaEntry; f: Formats }) {
+  const t = replicaTotals(r, f.aggregate);
   const stages: StageEntry[] = r.stages ?? [];
+  const counted = f.stage.format === "fraction";
+  const withItems = stages.filter((s) => (s.score as StageScoreV2 | null | undefined)?.items?.length);
   return (
     <Card
       title={`第 ${r.replica} 遍`}
-      aside={<span class="score">{t.score !== null ? fmtPct(t.score) : `${t.passed}/${t.total}`}</span>}
+      aside={<span class="score">{t.score !== null ? fmtValue(f.total, t.score) : counted ? `${t.sum}/${t.max}` : "—"}</span>}
     >
       <div class="table-wrap">
         <table>
           <thead>
             <tr>
               <th>阶段</th>
-              <th>通过</th>
+              <th>{f.stage.name || (counted ? "通过" : "分数")}</th>
               <th>结果</th>
               <th>用时</th>
               <th>请求</th>
@@ -266,11 +278,13 @@ function ReplicaCard({ r }: { r: ReplicaEntry }) {
           <tbody>
             {stages.map((s) => {
               const u = usageOf(s);
+              const sc = readScore(s.score);
+              const shown = sc?.status === "scored" && !(counted && !sc.max) ? fmtValue(f.stage, sc.score, sc.max) : "—";
               return (
                 <tr>
                   <th scope="row">{s.stage}</th>
-                  <td class="num">{s.score && s.score.total > 0 ? `${s.score.passed}/${s.score.total}` : "—"}</td>
-                  <td class={s.score?.status === "system_error" ? "warn-text" : ""}>{scoreStatusLabel(s.score?.status)}</td>
+                  <td class="num">{shown}</td>
+                  <td class={sc?.status === "error" ? "warn-text" : ""}>{scoreStatusLabel(s.score)}</td>
                   <td class="num">{fmtDuration(s.wall_s)}</td>
                   <td class="num">{fmtCount(u.requests)}</td>
                   <td class="num">{fmtCount(u.prompt_tokens)}</td>
@@ -284,7 +298,7 @@ function ReplicaCard({ r }: { r: ReplicaEntry }) {
           <tfoot>
             <tr>
               <th scope="row">合计</th>
-              <td class="num">{t.total ? `${t.passed}/${t.total}` : "—"}</td>
+              <td class="num">{t.score !== null ? fmtValue(f.total, t.score) : counted && t.max ? `${t.sum}/${t.max}` : "—"}</td>
               <td></td>
               <td class="num">{fmtDuration(t.wall_s)}</td>
               <td class="num">{fmtCount(t.usage.requests)}</td>
@@ -296,6 +310,29 @@ function ReplicaCard({ r }: { r: ReplicaEntry }) {
           </tfoot>
         </table>
       </div>
+      {withItems.map((s) => (
+        <div class="table-wrap">
+          <p class="muted small">{s.stage} 分项</p>
+          <table>
+            <tbody>
+              {(s.score as StageScoreV2).items!.map((it) => (
+                <tr>
+                  <th scope="row">{it.name}</th>
+                  <td class="num">
+                    {typeof it.score === "number"
+                      ? fmtValue({ ...f.stage, format: "number" }, it.score)
+                      : it.passed === true
+                        ? "通过"
+                        : it.passed === false
+                          ? "未通过"
+                          : "—"}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ))}
     </Card>
   );
 }

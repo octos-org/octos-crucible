@@ -1,6 +1,17 @@
 import { api } from "../api";
 import { alignStages, delta, evalStats, type Better, type EvalStats } from "../compare";
-import { fmtCount, fmtDuration, fmtMeanStd, fmtPct, fmtTime, fmtUsd, type Summary } from "../stats";
+import {
+  fmtCount,
+  fmtDuration,
+  fmtMeanStd,
+  fmtPct,
+  fmtStageNumber,
+  fmtTime,
+  fmtUsd,
+  fmtValue,
+  type Summary,
+} from "../stats";
+import type { ScoreFormat } from "../types";
 import type { EvalDetail, Manifest } from "../types";
 import { Card, ErrorBox, Loading, shortId, useAsync } from "../ui";
 
@@ -9,26 +20,42 @@ interface Row {
   /** Mean value used for the delta, and the cell text. */
   get: (s: EvalStats) => { value: number | null; text: string };
   better?: Better;
-  /** How to show the difference. */
-  diff?: "pp" | "rel";
+  /** How to show the difference: percentage points, relative %, or in the score's own format. */
+  diff?: "pp" | "rel" | "abs";
+  /** For `abs`: the score's format. */
+  fmt?: ScoreFormat;
 }
 
 const pct = (x: number) => fmtPct(x);
 const ms = (s: Summary | null, fmt: (x: number) => string) => ({ value: s?.mean ?? null, text: fmtMeanStd(s, fmt) });
 
-function rows(stages: string[]): Row[] {
+const better = (f: ScoreFormat): Better => (f.direction === "lower" ? "down" : "up");
+/** A share shown as % differs in pp; anything else in its own unit. */
+const diffOf = (f: ScoreFormat, share: boolean): "pp" | "abs" => (share || f.format === "percent" ? "pp" : "abs");
+
+/** Rows follow the first (base) evaluation's display; the others are read by theirs. */
+function rows(stages: string[], base: EvalStats): Row[] {
+  const { stage, total } = base.formats;
   return [
-    { label: "总分", get: (s) => ms(s.score, pct), better: "up", diff: "pp" },
+    {
+      label: total.name || "总分",
+      get: (s) => ms(s.score, (x) => fmtValue(s.formats.total, x)),
+      better: better(total),
+      diff: diffOf(total, false),
+      fmt: total,
+    },
     ...stages.map(
       (name): Row => ({
-        label: name,
+        label: stage.name ? `${name} · ${stage.name}` : name,
         get: (s) => {
           const st = s.stages[name];
-          const r = ms(st?.score ?? null, pct);
-          return { ...r, text: st && st.total > 0 ? `${r.text}（${st.passed}/${st.total}）` : r.text };
+          const f = s.formats.stage;
+          const r = ms(st?.score ?? null, (x) => fmtStageNumber(f, x));
+          return { ...r, text: f.format === "fraction" && st && st.max > 0 ? `${r.text}（${st.sum}/${st.max}）` : r.text };
         },
-        better: "up",
-        diff: "pp",
+        better: better(stage),
+        diff: diffOf(stage, stage.format === "fraction"),
+        fmt: stage,
       }),
     ),
     { label: "用时", get: (s) => ms(s.wall_s, fmtDuration), better: "down", diff: "rel" },
@@ -56,9 +83,11 @@ function DeltaText({ base, x, row }: { base: number | null; x: number | null; ro
   const text =
     row.diff === "pp"
       ? `${sign}${Math.abs(d.diff * 100).toFixed(1)} pp`
-      : d.rel !== null
-        ? `${sign}${Math.abs(d.rel * 100).toFixed(1)}%`
-        : "";
+      : row.diff === "abs" && row.fmt
+        ? `${sign}${fmtValue({ ...row.fmt, format: "number" }, Math.abs(d.diff))}`
+        : d.rel !== null
+          ? `${sign}${Math.abs(d.rel * 100).toFixed(1)}%`
+          : "";
   return (
     <div class={`delta ${d.tone}`}>
       {arrow} {text}
@@ -94,7 +123,7 @@ export function ComparePage({ ids }: { ids: string[] }) {
   const mans: Partial<Manifest>[] = details.map((d) => d.manifest ?? {});
   const al = alignStages(mans);
   const stats = mans.map((m) => evalStats(m, al.common));
-  const table = rows(al.common);
+  const table = rows(al.common, stats[0]);
   const anyDropped = al.dropped.some((d) => d.length > 0);
 
   return (
@@ -168,7 +197,7 @@ export function ComparePage({ ids }: { ids: string[] }) {
           </table>
         </div>
         <p class="hint">
-          均值 ± 标准差，按遍计算；括号内为各遍通过数合计；pp 为百分点。差值以第一列为基准：分数、缓存命中率升高为好，用时、请求、输入/输出 token、花销降低为好。
+          均值 ± 标准差，按遍计算；按用例计数的阶段括号内为各遍通过数合计；pp 为百分点。差值以第一列为基准，分数按题目包声明的方向判断好坏（绿色更好、红色更差）；缓存命中率升高为好，用时、请求、输入/输出 token、花销降低为好。
         </p>
       </Card>
     </div>

@@ -8,7 +8,11 @@ import {
   fmtRange,
   fmtScore,
   fmtUsd,
+  fmtValue,
+  formatsOf,
+  readScore,
   replicaTotals,
+  scoreStatusLabel,
   stageNames,
   stageScore,
   statusLabel,
@@ -122,3 +126,49 @@ describe("formatting", () => {
     expect(statusLabel("weird").text).toBe("weird");
   });
 });
+
+// Shapes of evaluations published before result v2 (e.g. 7b444600… app
+// mode 1/1, 90fa75ee… agent mode 0/1 + 0/1, an astro run 4458556/10000000).
+describe("old manifests", () => {
+  const usage = { requests: 0, prompt_tokens: 0, cached_tokens: 0, completion_tokens: 0, reasoning_tokens: 0 };
+  const old = (stages: StageEntry[]) => ({ schema: 1, taskset: "hello-world", replicas: [{ replica: 1, stages }] });
+
+  it("app mode 1/1 reads as 1/1 and 100%", () => {
+    const m = old([{ stage: "stage-1", score: { status: "passed", passed: 1, total: 1 }, usage }]);
+    const f = formatsOf(m);
+    const sc = readScore(m.replicas[0].stages[0].score)!;
+    expect(sc).toMatchObject({ status: "scored", score: 1, max: 1, passed: true });
+    expect(fmtValue(f.stage, sc.score, sc.max)).toBe("1/1");
+    expect(fmtValue(f.total, replicaTotals(m.replicas[0], f.aggregate).score)).toBe("100.0%");
+    expect(scoreStatusLabel(m.replicas[0].stages[0].score)).toBe("通过");
+  });
+
+  it("agent mode 0/1 + 0/1 is scored 0%, not an error", () => {
+    const s = { status: "failed", passed: 0, total: 1 } as const;
+    const m = old([
+      { stage: "stage-1", score: s, usage },
+      { stage: "stage-2", score: s, usage },
+    ]);
+    const f = formatsOf(m);
+    expect(fmtValue(f.total, replicaTotals(m.replicas[0], f.aggregate).score)).toBe("0.0%");
+    expect(scoreStatusLabel(s)).toBe("已计分");
+  });
+
+  it("an old astro run keeps its ratio", () => {
+    const m = old([{ stage: "l1", score: { status: "failed", passed: 4458556, total: 10000000 }, usage }]);
+    expect(replicaTotals(m.replicas[0]).score).toBeCloseTo(0.4458556);
+    expect(scoreStatusLabel({ status: "system_error", passed: 0, total: 0 })).toBe("平台错误（不计分）");
+  });
+
+  it("list totals: by display, else an old ratio", () => {
+    expect(fmtScore(4458.556, { name: "四卡总分", unit: "分", decimals: 2 })).toBe("4458.56 分");
+    expect(fmtScore(0.4459)).toBe("44.6%");
+  });
+
+  it("v2 errors and negative scores", () => {
+    expect(readScore({ status: "error", error: "system" })).toMatchObject({ status: "error", score: null });
+    expect(stageScore({ stage: "x", score: { status: "scored", score: -3 } }, { format: "number" })).toBe(-3);
+    expect(fmtValue({ decimals: 2 }, -3)).toBe("-3.00");
+  });
+});
+
