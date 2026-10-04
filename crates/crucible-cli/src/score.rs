@@ -4,7 +4,13 @@
 //! checkpoint.sealed` (plus `logs.sealed` when the stage ran). Per stage the
 //! tests blob is fetched and opened into a temporary directory that is
 //! deleted as soon as that stage is scored; each checkpoint is opened into a
-//! temporary file the same way. The scorer (`scorers/<name>/score.sh`, see
+//! temporary file the same way.
+//!
+//! Isolation (docs/scorer-contract.md §7): in the workflows the tests run
+//! on a machine that holds no secret. `handoff` (on the machine with the
+//! platform key) re-seals the selected tests blobs and checkpoints to a
+//! fresh one-run key; `score` then runs elsewhere with only that key, read
+//! from `TestsFrom::Dir`, and the scorer process never sees it. The scorer (`scorers/<name>/score.sh`, see
 //! docs/scorer-contract.md) runs with `--visibility hidden`, so its
 //! result.json holds only status / passed / total and a fixed detail text:
 //! nothing of the tests leaves this job.
@@ -35,16 +41,26 @@ pub const TESTS_LIMITS: ExtractLimits = ExtractLimits {
     max_bytes: 256 << 20,
 };
 
+/// Where the tests of a stage come from.
+pub enum TestsFrom<'a> {
+    /// The taskset's tests blob in the store.
+    Store(&'a Store),
+    /// `<dir>/<stage id>.sealed`, written by `handoff`.
+    Dir(&'a Path),
+}
+
 pub struct ScoreOpts<'a> {
     pub taskset: &'a TaskSet,
     /// Indices into `taskset.stages` to score.
     pub stages: Vec<usize>,
     pub results: &'a Path,
     pub out: &'a Path,
-    pub store: &'a Store,
+    pub tests: TestsFrom<'a>,
     pub keys: &'a [PrivateKey],
     /// `score.sh` of the taskset's scorer.
     pub scorer: &'a Path,
+    /// Environment variables never passed to the scorer (the key names).
+    pub scrub_env: &'a [String],
 }
 
 /// Normalise a scorer result against the stage's declared total.
@@ -104,13 +120,23 @@ fn replicas(results: &Path) -> Result<Vec<u32>> {
 }
 
 /// Run the scorer on one opened checkpoint.
-fn run_scorer(scorer: &Path, artifact: &Path, tests: &Path, stage: &Stage) -> ScoreResult {
+fn run_scorer(
+    scorer: &Path,
+    artifact: &Path,
+    tests: &Path,
+    stage: &Stage,
+    scrub_env: &[String],
+) -> ScoreResult {
     let work = match tempfile::tempdir() {
         Ok(w) => w,
         Err(e) => return system_error(format!("temp dir: {e}")),
     };
     let out = work.path().join("result.json");
-    let status = Command::new("bash")
+    let mut cmd = Command::new("bash");
+    for k in scrub_env {
+        cmd.env_remove(k);
+    }
+    let status = cmd
         .arg(scorer)
         .arg("--artifact")
         .arg(artifact)
@@ -160,7 +186,14 @@ pub async fn score(o: &ScoreOpts<'_>) -> Result<Vec<(u32, String, ScoreResult)>>
         }
         // The tests exist in clear only inside this scope.
         let tests = tempfile::tempdir()?;
-        let plain = o.store.get_sealed(&stage.tests_blob, o.keys).await?;
+        let plain = match o.tests {
+            TestsFrom::Store(store) => store.get_sealed(&stage.tests_blob, o.keys).await?,
+            TestsFrom::Dir(d) => {
+                let p = d.join(format!("{}.sealed", stage.id));
+                crucible_crypto::open(o.keys, &std::fs::read(&p)?)
+                    .with_context(|| format!("opening {}", p.display()))?
+            }
+        };
         zipdir::safe_extract(Cursor::new(plain), tests.path(), TESTS_LIMITS)
             .with_context(|| format!("stage {} tests", stage.id))?;
         for r in todo {
@@ -172,7 +205,7 @@ pub async fn score(o: &ScoreOpts<'_>) -> Result<Vec<(u32, String, ScoreResult)>>
                     .with_context(|| format!("opening {}", ckpt.display()))?;
                 std::fs::write(app.path(), &zip)?;
                 drop(zip);
-                run_scorer(o.scorer, app.path(), tests.path(), stage)
+                run_scorer(o.scorer, app.path(), tests.path(), stage, o.scrub_env)
             } else {
                 // The stage ran (it left logs) but produced nothing to score.
                 failed("the stage left no checkpoint")
@@ -193,6 +226,59 @@ pub async fn score(o: &ScoreOpts<'_>) -> Result<Vec<(u32, String, ScoreResult)>>
         drop(tests);
     }
     Ok(done)
+}
+
+/// Re-seal what the scoring machine needs to a fresh one-run key:
+/// `<out>/tests/<stage>.sealed` (the stage's tests zip) and
+/// `<out>/results/<replica>/<stage>/checkpoint.sealed` (an empty directory
+/// when the stage ran but left no checkpoint). Nothing else of `results`
+/// (logs, agent facts) is copied. Returns the one-run key.
+pub async fn handoff(
+    ts: &TaskSet,
+    stages: &[usize],
+    results: &Path,
+    store: &Store,
+    keys: &[PrivateKey],
+    out: &Path,
+) -> Result<PrivateKey> {
+    let run_key = PrivateKey::generate();
+    let to = run_key.public();
+    let reps = replicas(results)?;
+    std::fs::create_dir_all(out.join("tests"))?;
+    for &i in stages {
+        let stage = &ts.stages[i];
+        let todo: Vec<u32> = reps
+            .iter()
+            .copied()
+            .filter(|r| results.join(r.to_string()).join(&stage.id).is_dir())
+            .collect();
+        if todo.is_empty() {
+            continue;
+        }
+        let plain = store.get_sealed(&stage.tests_blob, keys).await?;
+        std::fs::write(
+            out.join("tests").join(format!("{}.sealed", stage.id)),
+            crucible_crypto::seal(&to, &plain)?,
+        )?;
+        drop(plain);
+        for r in todo {
+            let dir = out.join("results").join(r.to_string()).join(&stage.id);
+            std::fs::create_dir_all(&dir)?;
+            let ckpt = results
+                .join(r.to_string())
+                .join(&stage.id)
+                .join("checkpoint.sealed");
+            if ckpt.is_file() {
+                let zip = crucible_crypto::open(keys, &std::fs::read(&ckpt)?)
+                    .with_context(|| format!("opening {}", ckpt.display()))?;
+                std::fs::write(
+                    dir.join("checkpoint.sealed"),
+                    crucible_crypto::seal(&to, &zip)?,
+                )?;
+            }
+        }
+    }
+    Ok(run_key)
 }
 
 /// `<scores>/<replica>/<stage>/score.json`, if present.
@@ -288,9 +374,10 @@ printf '{"visibility":"hidden","status":"failed","passed":1,"total":2,"detail":"
             stages: vec![0, 1],
             results: &results,
             out: &out,
-            store: &store,
+            tests: TestsFrom::Store(&store),
             keys: std::slice::from_ref(&sk),
             scorer: &scorer,
+            scrub_env: &[],
         })
         .await
         .unwrap();
@@ -306,5 +393,57 @@ printf '{"visibility":"hidden","status":"failed","passed":1,"total":2,"detail":"
             (ScoreStatus::Failed, 0, 2)
         );
         assert!(read_score(&out, 2, "stage-1").unwrap().is_none());
+
+        // Hand off to a machine without the platform key: same scores with
+        // only the one-run key, and the scorer never sees the key variable.
+        let hand = d.path().join("handoff");
+        let run_key = handoff(
+            &ts,
+            &[0, 1],
+            &results,
+            &store,
+            std::slice::from_ref(&sk),
+            &hand,
+        )
+        .await
+        .unwrap();
+        assert!(hand.join("tests/stage-1.sealed").is_file());
+        assert!(hand.join("results/1/stage-2").is_dir());
+        assert!(!hand.join("results/1/stage-2/checkpoint.sealed").exists());
+        assert!(
+            crucible_crypto::open(
+                std::slice::from_ref(&sk),
+                &std::fs::read(hand.join("tests/stage-1.sealed")).unwrap()
+            )
+            .is_err()
+        );
+        std::fs::write(
+            &scorer,
+            format!(
+                "[ -z \"${{PATH_CRUCIBLE_TEST_KEY:-}}\" ] || exit 1\n{}",
+                std::fs::read_to_string(&scorer).unwrap()
+            ),
+        )
+        .unwrap();
+        let out2 = d.path().join("scores2");
+        let keys = [run_key];
+        // SAFETY: test-only; nothing else reads this variable.
+        unsafe { std::env::set_var("PATH_CRUCIBLE_TEST_KEY", "x") };
+        score(&ScoreOpts {
+            taskset: &ts,
+            stages: vec![0, 1],
+            results: &hand.join("results"),
+            out: &out2,
+            tests: TestsFrom::Dir(&hand.join("tests")),
+            keys: &keys,
+            scorer: &scorer,
+            scrub_env: &["PATH_CRUCIBLE_TEST_KEY".into()],
+        })
+        .await
+        .unwrap();
+        let s1 = read_score(&out2, 1, "stage-1").unwrap().unwrap();
+        assert_eq!((s1.passed, s1.total), (1, 2));
+        let s2 = read_score(&out2, 1, "stage-2").unwrap().unwrap();
+        assert_eq!((s2.passed, s2.total), (0, 2));
     }
 }

@@ -29,8 +29,7 @@ COPY playwright.config.js wait-ready.mjs run.sh /opt/scorer/
 COPY src/ /opt/scorer/src/
 RUN chmod -R a+rX /opt/scorer && chmod a+x /opt/scorer/run.sh
 
-# Unprivileged by default; Chromium's own sandbox stays on (needs
-# unprivileged user namespaces + seccomp_profile.json, see score.sh).
+# Unprivileged by default (score.sh also drops every capability).
 USER node
 
 ENTRYPOINT ["/opt/scorer/run.sh"]

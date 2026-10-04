@@ -19,10 +19,14 @@
 # Host requirements: bash (3.2+), docker, timeout (coreutils).
 # Environment (optional):
 #   CRUCIBLE_SCORER_IMAGE        prebuilt scorer image (default: build ./image)
-#   CHROMIUM_SANDBOX             1 (default) or 0 = launch Chromium with --no-sandbox
 #   CRUCIBLE_PRUNE_BUILD_CACHE   1 = `docker builder prune` after the run
 #                                (for throwaway CI machines; off by default
 #                                because it wipes the whole daemon's cache)
+#   CRUCIBLE_SCORER_FIREWALL     1 = with `sudo iptables`, drop everything the
+#                                scoring network sends to the host (INPUT, v4
+#                                and v6) or out of the network (DOCKER-USER);
+#                                failing to install the rules is system_error.
+#                                For CI machines (Linux, passwordless sudo).
 set -uo pipefail
 
 # Everything runs inside main() so bash parses the whole file before
@@ -83,6 +87,9 @@ if [ -n "$ARTIFACTS_OUT" ]; then mkdir -p "$ARTIFACTS_OUT" || exit 1; ARTIFACTS_
 RUN_ID="$(date +%s)$$${RANDOM}"
 APP_IMAGE="crucible-app-$RUN_ID"
 NET="crucible-net-$RUN_ID"
+# Linux interface names are at most 15 characters.
+BRIDGE="crs$(printf '%s' "$RUN_ID" | cksum | cut -d' ' -f1)"
+FIREWALL_UP=0
 APP_CTR="crucible-app-$RUN_ID"
 RUNNER_CTR="crucible-runner-$RUN_ID"
 LABEL="crucible.scorer.run=$RUN_ID"
@@ -102,12 +109,22 @@ mkdir -p "$RESULTS" "$APP_SRC"
 # shellcheck disable=SC2317,SC2329 # invoked via trap
 cleanup() {
   docker rm -f "$RUNNER_CTR" "$APP_CTR" >/dev/null 2>&1 || true
+  [ "$FIREWALL_UP" = 1 ] && firewall -D >/dev/null 2>&1
+  FIREWALL_UP=0
   docker network rm "$NET" >/dev/null 2>&1 || true
   docker image rm -f "$APP_IMAGE" >/dev/null 2>&1 || true
   if [ "${CRUCIBLE_PRUNE_BUILD_CACHE:-0}" = "1" ]; then
     docker builder prune -f --filter "until=0s" >/dev/null 2>&1 || true
   fi
   rm -rf "$WORK" 2>/dev/null || true
+}
+# shellcheck disable=SC2317,SC2329 # also invoked from cleanup
+firewall() { # -I | -D; every rule is attempted, fails if any failed
+  local rc=0
+  sudo -n iptables "$1" INPUT -i "$BRIDGE" -j DROP || rc=1
+  sudo -n ip6tables "$1" INPUT -i "$BRIDGE" -j DROP || rc=1
+  sudo -n iptables "$1" DOCKER-USER -i "$BRIDGE" ! -o "$BRIDGE" -j DROP || rc=1
+  return "$rc"
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
@@ -175,8 +192,11 @@ fi
 
 # 3. App container on a fresh internal (no internet) network.
 if [ -z "$STATUS" ]; then
-  if ! docker network create --driver bridge --internal --label "$LABEL" "$NET" >/dev/null 2>"$RESULTS/net.log"; then
+  if ! docker network create --driver bridge --internal --label "$LABEL" \
+      -o com.docker.network.bridge.name="$BRIDGE" "$NET" >/dev/null 2>"$RESULTS/net.log"; then
     set_outcome system_error "could not create the scoring network"
+  elif [ "${CRUCIBLE_SCORER_FIREWALL:-0}" = 1 ] && ! { FIREWALL_UP=1; firewall -I >>"$RESULTS/net.log" 2>&1; }; then
+    set_outcome system_error "could not install the scoring firewall"
   elif ! docker run -d --name "$APP_CTR" --network "$NET" --network-alias app \
       --label "$LABEL" \
       -e "PORT=$APP_PORT" \
@@ -191,6 +211,12 @@ if [ -z "$STATUS" ]; then
 fi
 
 # 4. Playwright runner: sees only the tests (read-only) and the app's URL.
+# The tests may be untrusted (uploaded tasksets): no environment beyond the
+# three variables below, non-root, no capabilities, no-new-privileges,
+# Docker's default seccomp profile, on the internal network only (plus the
+# firewall above on CI). The container is the boundary: test code runs in it
+# directly, so Chromium's own sandbox (which needs user namespaces, i.e.
+# capabilities and a looser seccomp profile) would add nothing and is off.
 # Retried once if the harness itself died without a report (scorer fault);
 # never retried once the app was ready and tests ran or timed out.
 if [ -z "$STATUS" ]; then
@@ -204,10 +230,9 @@ if [ -z "$STATUS" ]; then
       --label "$LABEL" --user "$RUN_AS" \
       -e "BASE_URL=http://app:$APP_PORT" \
       -e "READY_TIMEOUT=$READY_TIMEOUT_S" \
-      -e "CHROMIUM_SANDBOX=${CHROMIUM_SANDBOX:-1}" \
+      -e "CHROMIUM_SANDBOX=0" \
       --memory=2g --cpus=2.0 --pids-limit=1024 \
-      --security-opt no-new-privileges \
-      --security-opt "seccomp=$HERE/seccomp_profile.json" \
+      --cap-drop ALL --security-opt no-new-privileges \
       --shm-size=1g \
       -v "$TESTS:/pack:ro" \
       -v "$RESULTS:/results" \

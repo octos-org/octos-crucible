@@ -40,6 +40,14 @@ check "$T/bad.json" 'r.status === "failed" && r.total === 0 && r.detail.startsWi
 "$SCORE" --artifact "$T/noroot.zip" --tests "$HERE/fixtures/tests" --out "$T/noroot.json"
 check "$T/noroot.json" 'r.status === "failed" && r.detail === "no Dockerfile at the root of the submitted app"'
 
+# Untrusted tests: every escape attempt in the hostile pack must be blocked
+# (needs the firewall: Linux + passwordless sudo, as on CI).
+if [ "${CRUCIBLE_SCORER_FIREWALL:-0}" = 1 ]; then
+  "$SCORE" --artifact "$T/app.zip" --tests "$HERE/fixtures/hostile" --out "$T/hostile.json"
+  check "$T/hostile.json" 'r.status === "passed" && r.passed === 5 && r.total === 5'
+  need '! sudo -n iptables -S | grep -q -- "-i crs"'
+fi
+
 rc=0; "$SCORE" --artifact "$T/app.zip" --tests "$T/missing" --out "$T/x.json" 2>/dev/null || rc=$?
 need '[ "$rc" -eq 2 ] && [ ! -f "$T/x.json" ]'
 

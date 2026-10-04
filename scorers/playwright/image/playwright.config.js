@@ -13,13 +13,10 @@ module.exports = {
     headless: true,
     baseURL: process.env.BASE_URL,
     screenshot: 'only-on-failure',
-    // Chromium's own sandbox is on unless the caller sets CHROMIUM_SANDBOX=0.
-    // It needs unprivileged user namespaces: on GitHub's ubuntu-latest the
-    // workflow lifts AppArmor's restriction on them and score.sh runs this
-    // container with Playwright's seccomp profile. Off, the container still
-    // runs as a non-root user,
-    // on an internal (no-internet) network, with no-new-privileges, holding
-    // only this task's tests and no secrets.
+    // score.sh sets CHROMIUM_SANDBOX=0: the tests themselves may be
+    // untrusted code running in this container, so the container (non-root,
+    // no capabilities, no-new-privileges, internal network, no secrets) is
+    // the boundary and Chromium's own sandbox would add nothing.
     launchOptions: { chromiumSandbox: process.env.CHROMIUM_SANDBOX !== '0' },
   },
 };
