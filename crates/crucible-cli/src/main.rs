@@ -14,6 +14,7 @@ mod build;
 mod cred;
 mod ctr;
 mod executor;
+mod k8s_eval;
 mod keys;
 mod local;
 mod nomad;
@@ -481,6 +482,9 @@ async fn run(cmd: Cmd, secrets: Option<steps::Secrets>) -> Result<()> {
         Cmd::Eval {
             cmd: local::EvalCmd::Nomad(a),
         } => local::eval_nomad(*a).await,
+        Cmd::Eval {
+            cmd: local::EvalCmd::K8s(a),
+        } => local::eval_k8s(*a).await,
         Cmd::Keys {
             cmd: local::KeysCmd::Gen { out },
         } => local::keys_gen(&out),

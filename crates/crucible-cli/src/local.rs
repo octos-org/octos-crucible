@@ -34,6 +34,9 @@ pub enum EvalCmd {
     Local(Box<LocalArgs>),
     /// The same, each step a Nomad batch job (docs/nomad.md).
     Nomad(Box<crate::nomad::NomadArgs>),
+    /// The same, each step a Kubernetes Job, containers as Pods
+    /// (docs/kubernetes.md).
+    K8s(Box<crate::k8s_eval::K8sArgs>),
 }
 
 #[derive(clap::Args)]
@@ -173,11 +176,15 @@ pub enum Backend {
     Local,
     /// One Nomad batch job per step.
     Nomad(crate::nomad::Nomad),
+    /// One Kubernetes Job per step, in the evaluation's namespace.
+    K8s(Box<crate::k8s_eval::K8s>),
 }
 
 struct Driver {
     backend: Backend,
     eval_id: String,
+    /// The evaluation directory (copied to the Kubernetes volume).
+    dir: PathBuf,
     secrets_base: PathBuf,
     records: Vec<StepRecord>,
 }
@@ -193,7 +200,16 @@ impl Driver {
         args: &[String],
     ) -> Result<bool> {
         eprintln!("== step {label}");
+        if let Backend::K8s(k) = &mut self.backend {
+            k.prepare(&self.dir).await?;
+        }
         let (ok, started, ended) = match &self.backend {
+            Backend::K8s(k) => {
+                let e = k
+                    .run_step(label, spec(name), &exe.display().to_string(), args, secrets)
+                    .await?;
+                (e.ok, e.started, e.ended)
+            }
             Backend::Local => self.local_step(exe, name, secrets, args).await?,
             Backend::Nomad(n) => {
                 let env: Vec<(String, String)> = if name == "score-tests" {
@@ -255,6 +271,22 @@ impl Driver {
     }
 }
 
+/// Copy a directory tree (regular files and directories; links are
+/// copied as the files they point to).
+fn copy_dir(from: &Path, to: &Path) -> Result<()> {
+    std::fs::create_dir_all(to)?;
+    for e in std::fs::read_dir(from)? {
+        let e = e?;
+        let (src, dst) = (e.path(), to.join(e.file_name()));
+        if std::fs::metadata(&src)?.is_dir() {
+            copy_dir(&src, &dst)?;
+        } else {
+            std::fs::copy(&src, &dst)?;
+        }
+    }
+    Ok(())
+}
+
 /// Pack a taskset source with `keys_json`'s key into `store`; returns
 /// the taskset.
 async fn pack_taskset(
@@ -299,13 +331,27 @@ pub async fn eval_nomad(a: crate::nomad::NomadArgs) -> Result<()> {
     run_eval(a.eval, Backend::Nomad(n), exe).await
 }
 
+pub async fn eval_k8s(a: crate::k8s_eval::K8sArgs) -> Result<()> {
+    if a.eval.store.is_some() {
+        bail!("eval k8s keeps each evaluation's store on its volume: no --store");
+    }
+    let exe = match &a.crucible_bin {
+        Some(p) => std::path::absolute(p)?,
+        None => std::env::current_exe()?,
+    };
+    let k = crate::k8s_eval::K8s::new(&a);
+    run_eval(a.eval, Backend::K8s(Box::new(k)), exe).await
+}
+
 /// The driver: plan, generate per replica, handoff, score-tests per
 /// replica, publish, each step run by `backend`.
-async fn run_eval(a: LocalArgs, backend: Backend, exe: PathBuf) -> Result<()> {
+async fn run_eval(a: LocalArgs, mut backend: Backend, exe: PathBuf) -> Result<()> {
     let (prefix, timing_source) = match backend {
         Backend::Local => ("local", "local"),
         Backend::Nomad(_) => ("nomad", "nomad"),
+        Backend::K8s(_) => ("k8s", "k8s"),
     };
+    let k8s = matches!(backend, Backend::K8s(_));
     let root =
         std::fs::canonicalize(&a.root).with_context(|| format!("--root {}", a.root.display()))?;
     let keys_dir = match &a.keys {
@@ -318,14 +364,6 @@ async fn run_eval(a: LocalArgs, backend: Backend, exe: PathBuf) -> Result<()> {
     let private = std::fs::read(keys_dir.join("private.key"))?;
     let key = PrivateKey::parse(std::str::from_utf8(&private)?)?;
     let public = key.public();
-    let store_spec = match &a.store {
-        Some(s) => s.clone(),
-        None => format!("dir:{}", home()?.join(".crucible/store").display()),
-    };
-    if !store_spec.starts_with("dir:") {
-        bail!("eval local stores on this machine: --store dir:<path>");
-    }
-    let store = Store::parse(&store_spec)?;
     let eval_id = match a.eval_id.trim() {
         "" => {
             let t = humantime::format_rfc3339_seconds(SystemTime::now()).to_string();
@@ -341,12 +379,50 @@ async fn run_eval(a: LocalArgs, backend: Backend, exe: PathBuf) -> Result<()> {
     }
     std::fs::create_dir_all(&dir)?;
     eprintln!("eval {eval_id}: {}", dir.display());
+    // Paths as the steps see them: Kubernetes steps see the evaluation
+    // directory at /crucible (its volume).
+    let remote = k8s.then(|| PathBuf::from(crate::k8s_eval::ROOT));
+    let s = |x: &Path| match &remote {
+        Some(r) => r
+            .join(x.strip_prefix(&dir).unwrap_or(x))
+            .display()
+            .to_string(),
+        None => x.display().to_string(),
+    };
+    let (store_spec, local_store) = match (&a.store, k8s) {
+        (_, true) => (
+            format!("dir:{}", s(&dir.join("store"))),
+            format!("dir:{}", dir.join("store").display()),
+        ),
+        (Some(x), false) => (x.clone(), x.clone()),
+        (None, false) => {
+            let d = format!("dir:{}", home()?.join(".crucible/store").display());
+            (d.clone(), d)
+        }
+    };
+    if !store_spec.starts_with("dir:") {
+        bail!("eval local stores on this machine: --store dir:<path>");
+    }
+    let store = Store::parse(&local_store)?;
+    let exe = if let Backend::K8s(k) = &mut backend {
+        k.bind(&eval_id);
+        std::fs::create_dir_all(dir.join("bin"))?;
+        std::fs::copy(&exe, dir.join("bin/crucible"))?;
+        PathBuf::from(s(&dir.join("bin/crucible")))
+    } else {
+        exe
+    };
 
     // The steps' root: the repository's plugins and agents, the local key.
     let sroot = dir.join("root");
     std::fs::create_dir_all(sroot.join("config"))?;
     for d in ["agents", "scorers", "runners", "tools"] {
-        std::os::unix::fs::symlink(root.join(d), sroot.join(d))?;
+        if k8s {
+            // The volume gets copies (the repository is not there).
+            copy_dir(&root.join(d), &sroot.join(d))?;
+        } else {
+            std::os::unix::fs::symlink(root.join(d), sroot.join(d))?;
+        }
     }
     for f in ["pricing.json", "egress.json"] {
         std::fs::copy(root.join("config").join(f), sroot.join("config").join(f))?;
@@ -385,11 +461,11 @@ async fn run_eval(a: LocalArgs, backend: Backend, exe: PathBuf) -> Result<()> {
     let mut drv = Driver {
         backend,
         eval_id: eval_id.clone(),
+        dir: dir.clone(),
         secrets_base,
         records: Vec::new(),
     };
     let pk: &[u8] = &private;
-    let s = |x: &Path| x.display().to_string();
     let ts_s = s(&ts_path);
     let (gens, scores, handoff, publish) = (
         dir.join("gen"),
@@ -526,7 +602,7 @@ async fn run_eval(a: LocalArgs, backend: Backend, exe: PathBuf) -> Result<()> {
         if !drv.step(&exe, "handoff", "handoff", &hs, &args).await? {
             bail!("handoff failed");
         }
-        let hexe = handoff.join("bin/crucible");
+        let hexe = PathBuf::from(s(&handoff.join("bin/crucible")));
         for r in 1..=replicas {
             drv.step(
                 &hexe,
@@ -593,6 +669,17 @@ async fn run_eval(a: LocalArgs, backend: Backend, exe: PathBuf) -> Result<()> {
     }
     .await;
 
+    // Kubernetes: the results come back from the volume (never the
+    // handoff, the work dirs or temporary files), then the namespace goes.
+    if let Backend::K8s(k) = &drv.backend {
+        if let Err(e) = k
+            .fetch(&dir, &["./gen", "./scores", "./publish", "./store"])
+            .await
+        {
+            eprintln!("warning: fetching the results: {e:#}");
+        }
+        k.delete().await;
+    }
     // What stays: sealed bundles, scores, the manifest. Clear material
     // (the handoff's opened copies never touch disk; work dirs) goes.
     let _ = std::fs::remove_dir_all(&handoff);
