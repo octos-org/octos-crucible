@@ -16,8 +16,9 @@ use super::{Common, Secret, Secrets};
 use crate::agentpkg;
 use crate::build;
 use crate::cred::{self, CredSource};
+use crate::executor::Executor;
+use crate::executor::docker::DockerExecutor;
 use crate::runners;
-use crate::sandbox::SandboxNet;
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -191,7 +192,9 @@ async fn generate(a: &Args, s: &Secrets, work: &Path, rdir: &Path) -> Result<()>
         bail!("test material in the stage inputs");
     }
 
-    let net = SandboxNet::up("8787,3128")?;
+    let exec = DockerExecutor;
+    super::check_caps(super::spec("generate"), exec.caps())?;
+    let net = exec.sandbox(&[8787, 3128])?;
 
     // The model credential: opened here, kept in this process only.
     let src = CredSource::parse(&a.cred_source)?;
@@ -225,7 +228,7 @@ async fn generate(a: &Args, s: &Secrets, work: &Path, rdir: &Path) -> Result<()>
         scratch_dir: work.join("scratch"),
         pricing: a.root.join("config/pricing.json"),
         egress_allow: a.root.join("config/egress.json"),
-        bind: net.gateway.clone(),
+        bind: net.host.clone(),
         agent_host: None,
         meter_port: 8787,
         egress_port: 3128,
@@ -254,11 +257,11 @@ async fn generate(a: &Args, s: &Secrets, work: &Path, rdir: &Path) -> Result<()>
     };
     let r = tokio::time::timeout(
         Duration::from_secs(a.run_timeout_min * 60),
-        runners::run_with(&args, &cred, &on_stage),
+        runners::run_with(&exec, &args, &cred, &on_stage),
     )
     .await;
     drop(cred);
-    remove_containers(&label);
+    exec.cleanup(&label);
     drop(net);
     match r {
         Ok(r) => r,
@@ -283,22 +286,4 @@ fn ls_remote(repo: &str, r#ref: &str) -> Result<String> {
         bail!("cannot resolve {} of {repo}", r#ref);
     }
     Ok(commit)
-}
-
-/// Remove every container labelled `crucible.run=<label>` (left behind
-/// when the run was cut short).
-pub fn remove_containers(label: &str) {
-    let filter = format!("label={}={label}", runners::workdir::RUN_LABEL);
-    if let Ok(out) = build::docker()
-        .args(["ps", "-aq", "--filter", &filter])
-        .output()
-    {
-        for id in String::from_utf8_lossy(&out.stdout).split_whitespace() {
-            let _ = build::docker()
-                .args(["rm", "-f", id])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-        }
-    }
 }

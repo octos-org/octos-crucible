@@ -10,7 +10,8 @@ use std::path::PathBuf;
 use anyhow::{Result, bail};
 
 use super::{Common, Secret, Secrets};
-use crate::sandbox::SandboxNet;
+use crate::executor::Executor;
+use crate::executor::docker::DockerExecutor;
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -34,6 +35,7 @@ pub async fn run(a: Args, s: &Secrets) -> Result<()> {
     let ts = crate::taskset_cmd::load(&h.join("taskset.json"))?;
     ts.validate(crucible_core::taskset::MAX_TOTAL_TIME_S)?;
     let keys = s.keys(Secret::RunKey)?;
+    super::check_caps(super::spec("score-tests"), DockerExecutor.caps())?;
 
     // The container plugins the taskset uses, from the registry compiled
     // into crucible; `crucible score` hands each its image.
@@ -69,7 +71,7 @@ pub async fn run(a: Args, s: &Secrets) -> Result<()> {
 
     let cred = h.join("cred.sealed");
     let net = if cred.is_file() {
-        Some(SandboxNet::up(&METER_PORT.to_string())?)
+        Some(DockerExecutor.sandbox(&[METER_PORT])?)
     } else {
         eprintln!("no model credential in the handoff");
         None
@@ -81,7 +83,7 @@ pub async fn run(a: Args, s: &Secrets) -> Result<()> {
             &h.join("pricing.json"),
             &keys,
             &n.network,
-            &n.gateway,
+            &n.host,
             METER_PORT,
         )?),
         None => None,
