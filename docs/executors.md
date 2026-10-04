@@ -4,7 +4,7 @@
 
 插件化（`docs/plugins.md`，P2 的 `plugins.json`、产出运行器 `workdir`、打包器、打分器）是本文的前提：插件决定"一步里做什么"，本文只决定"这一步在哪、用什么起容器、密钥怎么送到"。插件接口不因执行层而改变。
 
-第 5 节给出实施顺序，每一步单独上线。**已实现**：步骤层（`crucible step <名字>`，`crucible step list` 输出全部声明）、执行后端接口与 Docker 实现（沙箱按槽位分配，一台机器可同时跑多个评测）、单机运行 `crucible eval local`（用法见 §5.2 末尾）、Nomad 后端 `crucible eval nomad`（整步托管，用法见 `docs/nomad.md`）。Kubernetes 尚未开始。
+第 5 节给出实施顺序，每一步单独上线。**已实现**：步骤层（`crucible step <名字>`，`crucible step list` 输出全部声明）、执行后端接口与 Docker 实现（沙箱按槽位分配，一台机器可同时跑多个评测）、单机运行 `crucible eval local`（用法见 §5.2 末尾）、Nomad 后端 `crucible eval nomad`（整步托管，用法见 `docs/nomad.md`）。Kubernetes 的执行后端 `K8sExecutor`（容器即 Pod、网络隔离用 NetworkPolicy、集群内 BuildKit + 镜像仓库，`deploy/k8s/`）已实现，调度（`crucible eval k8s`）进行中。
 
 ---
 

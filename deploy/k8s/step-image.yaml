@@ -1,0 +1,59 @@
+# Builds the step image (crucible-step) inside the cluster with BuildKit and
+# pushes it to the cluster registry: the image the step Jobs run in. The
+# crucible binary itself is not in it: each evaluation brings its own on
+# its volume. Base: the same Ubuntu as the machine the binary is built on
+# (glibc). Run once after crucible-system.yaml, and again to update:
+#   kubectl -n crucible-system delete job step-image --ignore-not-found
+#   kubectl apply -f deploy/k8s/step-image.yaml
+#   kubectl -n crucible-system wait --for=condition=complete job/step-image --timeout=15m
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: step-image
+  namespace: crucible-system
+data:
+  Dockerfile: |
+    FROM moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea AS buildkit
+    FROM rancher/kubectl:v1.36.2@sha256:06c7a7a9772737494ae1e0c3af90f1b5385630c147e47c1c7cea92f4bed55fbe AS kubectl
+    FROM ubuntu:resolute-20260927@sha256:f144425ff09be612d6d9ad965196e9cdc23dae1f42110a8a11a3e9a8198759f7
+    RUN apt-get update \
+     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        bash coreutils ca-certificates curl git tar gzip procps \
+     && rm -rf /var/lib/apt/lists/*
+    COPY --from=buildkit /usr/bin/buildctl /usr/local/bin/buildctl
+    COPY --from=kubectl /bin/kubectl /usr/local/bin/kubectl
+    # Steps run as 1000:1000 (the evaluation's volume, the containers' uid).
+    USER 1000:1000
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: step-image
+  namespace: crucible-system
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: build
+          image: moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
+          command: [buildctl]
+          args:
+            - --addr
+            - tcp://buildkitd.crucible-system:1234
+            - build
+            - --frontend
+            - dockerfile.v0
+            - --local
+            - context=/src
+            - --local
+            - dockerfile=/src
+            - --output
+            - type=image,name=10.43.200.200:5000/crucible-step:1,push=true,registry.insecure=true
+          volumeMounts:
+            - {name: src, mountPath: /src}
+      volumes:
+        - name: src
+          configMap:
+            name: step-image

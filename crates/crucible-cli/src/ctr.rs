@@ -20,6 +20,7 @@
 //! ctr net create [--internal] [--label K=V] NAME | net connect [--alias A] NET NAME | net rm NAME
 //! ctr volume create [--label K=V] NAME | volume rm [-f] NAME
 //! ctr prune-build-cache
+//! ctr sandbox-check [--ports 8787,3128]   bring up a sandbox, probe it, take it down
 //! ```
 
 use std::path::PathBuf;
@@ -441,6 +442,24 @@ pub async fn run(argv: &[String]) -> Result<i32> {
         }
         "prune-build-cache" => {
             exec.prune_build_cache().await;
+            0
+        }
+        "sandbox-check" => {
+            let (_, v, ops) = simple(rest, &[], &["--ports"])?;
+            if !ops.is_empty() {
+                bail!("ctr sandbox-check [--ports 8787,3128]");
+            }
+            let ports: Vec<u16> = v
+                .last()
+                .map_or("8787,3128", |(_, p)| p.as_str())
+                .split(',')
+                .map(|p| p.trim().parse().map_err(|_| anyhow!("--ports")))
+                .collect::<Result<_>>()?;
+            let label = format!("check-{}", std::process::id());
+            let sb = exec.sandbox(&ports, &label)?;
+            drop(sb);
+            exec.cleanup(&label);
+            eprintln!("sandbox check passed: every probe was blocked");
             0
         }
         other => bail!("ctr {other}: unknown command"),

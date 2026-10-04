@@ -1,0 +1,138 @@
+# The cluster side of crucible's Kubernetes backend (docs/kubernetes.md):
+# an image registry and BuildKit in namespace crucible-system, and the
+# ClusterRole a step's service account is bound to (per evaluation, in the
+# evaluation's own namespace only). Evaluations themselves are created by
+# `crucible eval k8s`, one namespace each.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: crucible-system
+---
+# Images built by evaluations (agents, scorer plugins, submitted apps).
+# Plain HTTP inside the cluster; the nodes pull through the fixed service
+# address 10.43.200.200:5000 (k3s: /etc/rancher/k3s/registries.yaml, see
+# docs/kubernetes.md). Manifests can be deleted (evaluations delete their
+# per-run images); run `registry garbage-collect` to free the space.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: registry
+  namespace: crucible-system
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 50Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: registry
+  namespace: crucible-system
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {app: registry}
+  template:
+    metadata:
+      labels: {app: registry}
+    spec:
+      containers:
+        - name: registry
+          image: registry:3.1.2@sha256:ddf754342cfc8acc51a56d5d0ab6af06826461864460636d8bd5c546dab2a7b8
+          env:
+            - {name: REGISTRY_STORAGE_DELETE_ENABLED, value: "true"}
+          ports:
+            - containerPort: 5000
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/registry}
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: registry
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: registry
+  namespace: crucible-system
+spec:
+  # Fixed: nodes and image references use this address.
+  clusterIP: 10.43.200.200
+  selector: {app: registry}
+  ports:
+    - {port: 5000, targetPort: 5000}
+---
+# BuildKit, rootless (moby/buildkit's own Kubernetes example). It needs
+# unconfined seccomp/AppArmor for its user namespace; RUN steps of builds
+# with --network=none get no network (force-network-mode=none).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: buildkitd
+  namespace: crucible-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: buildkitd}
+  template:
+    metadata:
+      labels: {app: buildkitd}
+    spec:
+      containers:
+        - name: buildkitd
+          image: moby/buildkit:v0.33.1-rootless@sha256:f8a833b2de9d68e27f0815e4a737abdfaf8a2e4c615650557df11025101557b4
+          args:
+            - --addr
+            - unix:///run/user/1000/buildkit/buildkitd.sock
+            - --addr
+            - tcp://0.0.0.0:1234
+            - --oci-worker-no-process-sandbox
+          readinessProbe:
+            exec:
+              command: [buildctl, debug, workers]
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          securityContext:
+            seccompProfile: {type: Unconfined}
+            appArmorProfile: {type: Unconfined}
+            runAsUser: 1000
+            runAsGroup: 1000
+          ports:
+            - containerPort: 1234
+          volumeMounts:
+            - {name: state, mountPath: /home/user/.local/share/buildkit}
+      volumes:
+        # Build cache; lost when the pod is replaced.
+        - name: state
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: buildkitd
+  namespace: crucible-system
+spec:
+  selector: {app: buildkitd}
+  ports:
+    - {port: 1234, targetPort: 1234}
+---
+# What a step may do in its evaluation's namespace (bound there by a
+# RoleBinding the driver creates): start and remove the Pods it runs and
+# the NetworkPolicies of its networks. Nothing else (no Secrets).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: crucible-step
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch, create, delete, patch]
+  - apiGroups: [""]
+    resources: [pods/log]
+    verbs: [get]
+  - apiGroups: [networking.k8s.io]
+    resources: [networkpolicies]
+    verbs: [get, list, create, delete, patch]
