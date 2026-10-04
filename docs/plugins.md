@@ -443,7 +443,7 @@ trait Packager {
 
 ```
 --artifact /in/artifact          # 本阶段产出（打包器的格式，如 files 的 zip），只读
---tests /in/tests                # 本阶段的隐藏材料，只读
+--tests /in/tests                # 本阶段的隐藏材料，只读：source.json 里 tests 列出的路径，相对阶段目录
 --out /out/result.json           # 写 result.json v2（§7）
 --visibility hidden|public       # 正式评测一律 hidden
 [--run /in/run]                  # 本阶段有交互运行器时的运行记录，只读
