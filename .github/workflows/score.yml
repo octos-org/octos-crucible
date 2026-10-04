@@ -87,6 +87,7 @@ jobs:
             /Cargo.toml
             /Cargo.lock
             /crates/
+            /plugins.json
             /config/
             /scorers/
             /tasksets/
