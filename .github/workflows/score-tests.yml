@@ -10,7 +10,18 @@ name: score-tests
 # tests and checkpoints of the stages to score, re-sealed to a one-run key
 # that opens nothing else. That key arrives as a workflow_call secret so
 # GitHub masks it, and `crucible score` removes it from the scorer's
-# environment. Only score.json (result v2: score, max, fixed-name items) leaves the job.
+# environment. Only score.json (result v2: score, max, fixed-name items)
+# and the scoring meters' usage logs leave the job.
+#
+# One job per replica (matrix): an interactive run takes real time.
+#
+# Model use (docs/plugins.md §10): when the taskset gives a scoring slot a
+# model and the submitter gave a credential, the handoff carries it sealed
+# to the same one-run key (cred.sealed). `crucible score` opens it in its
+# own process and runs a meter on the sandbox network's host side; plugin
+# containers get the meter's address and a dummy key, never the key. Plugins
+# that execute taskset files (`runs_taskset_code`) can never get a model
+# (registry and taskset checks).
 #
 # The scorer adds its own walls (docs/scorer-contract.md §5, §7): test
 # container non-root, cap-drop ALL, no-new-privileges, no environment, on an
@@ -25,9 +36,13 @@ on:
         type: string
         required: true
       scores:
-        description: "artifact to write: <replica>/<stage>/score.json"
+        description: "artifact prefix to write: <prefix>-r<N> holding <replica>/<stage>/score.json"
         type: string
         required: true
+      matrix:
+        description: 'JSON {"replica": [1, 2, ...]}'
+        type: string
+        default: '{"replica": [1]}'
     secrets:
       run_key:
         description: "the handoff's one-run key"
@@ -37,9 +52,14 @@ permissions: {}
 
 jobs:
   tests:
+    name: tests r${{ matrix.replica }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 360
     permissions: {}
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix: ${{ fromJSON(inputs.matrix) }}
     env:
       H: ${{ github.workspace }}/handoff
     steps:
@@ -64,21 +84,44 @@ jobs:
             echo "$kind $name ready"
           done < "$RUNNER_TEMP/plugins.txt"
 
+      - name: Sandbox network for the meter
+        run: |
+          set -euo pipefail
+          if [ -f "$H/cred.sealed" ]; then
+            chmod 0755 "$H/tools/sandbox-net.sh"
+            SANDBOX_PORTS=8787 "$H/tools/sandbox-net.sh" up
+            SANDBOX_PORTS=8787 "$H/tools/sandbox-net.sh" check
+          else
+            echo "no model credential in the handoff"
+          fi
+
       - name: Run the tests
         env:
           RUN_KEY: ${{ secrets.run_key }}
+          REPLICA: ${{ matrix.replica }}
           CRUCIBLE_SCORER_FIREWALL: "1"
           CRUCIBLE_PRUNE_BUILD_CACHE: "1"
         run: |
           set -euo pipefail
           mkdir -p "$H/results" "$RUNNER_TEMP/scores"
-          "$H/bin/crucible" score --taskset "$H/taskset.json" \
+          model=()
+          if [ -f "$H/cred.sealed" ]; then
+            model=(--cred "$H/cred.sealed" --model-plan "$H/model.json" --pricing "$H/pricing.json")
+          fi
+          "$H/bin/crucible" score --taskset "$H/taskset.json" --replica "$REPLICA" \
             --results "$H/results" --tests-dir "$H/tests" --out "$RUNNER_TEMP/scores" \
-            --identity-env RUN_KEY --plugins-root "$H"
+            --identity-env RUN_KEY --plugins-root "$H" "${model[@]}"
+
+      - name: Stop the sandbox network
+        if: always()
+        run: |
+          if [ -f "$H/tools/sandbox-net.sh" ] && [ -f "$H/cred.sealed" ]; then
+            SANDBOX_PORTS=8787 "$H/tools/sandbox-net.sh" down || true
+          fi
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ${{ inputs.scores }}
+          name: ${{ inputs.scores }}-r${{ matrix.replica }}
           path: ${{ runner.temp }}/scores
           retention-days: 1
           if-no-files-found: warn

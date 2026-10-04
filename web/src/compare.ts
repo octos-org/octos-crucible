@@ -59,6 +59,11 @@ export interface EvalStats {
   /** null when any replica's price is unknown. */
   cost_usd: Summary | null;
   cost_known: boolean;
+  /** Model use while scoring (judge, interactive agent), apart from the above. */
+  eval_any: boolean;
+  eval_requests: Summary | null;
+  eval_tokens: Summary | null;
+  eval_cost_usd: Summary | null;
 }
 
 /** Statistics over the given stages only, per replica then mean ± std across replicas. */
@@ -97,6 +102,12 @@ export function evalStats(m: Partial<Manifest>, stages: string[]): EvalStats {
     cache_rate: summarize(totals.map((t) => cacheRate(t.usage))),
     cost_usd: cost_known ? summarize(totals.map((t) => t.cost_usd)) : null,
     cost_known,
+    eval_any: totals.some((t) => t.eval.any),
+    eval_requests: summarize(totals.map((t) => t.eval.usage.requests)),
+    eval_tokens: summarize(totals.map((t) => t.eval.usage.prompt_tokens + t.eval.usage.completion_tokens)),
+    eval_cost_usd: totals.every((t) => !t.eval.any || t.eval.cost_usd !== null)
+      ? summarize(totals.map((t) => t.eval.cost_usd ?? 0))
+      : null,
   };
 }
 

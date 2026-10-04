@@ -161,7 +161,7 @@ pub fn read_sealed_zip(path: &Path, keys: &[PrivateKey]) -> Result<Vec<(String, 
 /// from its sealed logs.
 type Raw = Option<Vec<u8>>;
 
-fn stage_numbers(sdir: &Path, keys: &[PrivateKey]) -> Result<(Raw, Raw)> {
+pub(crate) fn stage_numbers(sdir: &Path, keys: &[PrivateKey]) -> Result<(Raw, Raw)> {
     let plain = |n: &str| std::fs::read(sdir.join(n)).ok();
     let (mut usage, mut timing) = (plain("usage.jsonl"), plain("timing.json"));
     let logs = sdir.join("logs.sealed");
@@ -186,6 +186,35 @@ fn blob(path: &Path) -> Result<Option<BlobRef>> {
         sha256: crucible_store::sha256_hex(&data),
         key_id: crucible_crypto::sealed_key_id(&data)?,
     }))
+}
+
+/// Model use of the scoring job: `<dir>/{interactive,scorer}.jsonl` from
+/// `crucible score` (the meters of the slots that used a model).
+fn eval_usage(
+    dir: &Path,
+    pricing: &Pricing,
+    user_price: Option<Price>,
+) -> Option<crucible_core::manifest::EvalUsage> {
+    let slot = |name: &str| {
+        let raw = std::fs::read_to_string(dir.join(format!("{name}.jsonl"))).ok()?;
+        let records = crucible_report::usage::parse_jsonl(&raw);
+        let t = crucible_report::usage::summarise(&records, pricing, user_price).total;
+        Some(crucible_core::manifest::SlotUsage {
+            usage: UsageTotals {
+                requests: t.requests,
+                prompt_tokens: t.prompt_tokens,
+                cached_tokens: t.cached_tokens,
+                completion_tokens: t.completion_tokens,
+                reasoning_tokens: t.reasoning_tokens,
+            },
+            cost_usd: t.cost_usd,
+        })
+    };
+    let u = crucible_core::manifest::EvalUsage {
+        interactive: slot("interactive"),
+        scorer: slot("scorer"),
+    };
+    (u.interactive.is_some() || u.scorer.is_some()).then_some(u)
 }
 
 pub struct ManifestInputs<'a> {
@@ -258,6 +287,14 @@ pub fn build_manifest(m: &ManifestInputs) -> Result<Manifest> {
             if (timing.is_some() || m.mode == Mode::App) && output.is_none() && failure.is_none() {
                 failure = Some(format!("stage {} left no checkpoint", st.id));
             }
+            let eval_usage = match m.scores {
+                Some(dir) => eval_usage(
+                    &dir.join(r.to_string()).join(&st.id).join("eval_usage"),
+                    m.pricing,
+                    m.user_price,
+                ),
+                None => None,
+            };
             stages.push(StageEntry {
                 stage: st.id.clone(),
                 score,
@@ -275,6 +312,7 @@ pub fn build_manifest(m: &ManifestInputs) -> Result<Manifest> {
                 ended: timing.as_ref().map(|t| t.ended.clone()),
                 exit_code: timing.as_ref().and_then(|t| t.exit_code),
                 checkpoint_source: timing.as_ref().map(|t| t.checkpoint_source.clone()),
+                eval_usage,
             });
         }
         // The stage clock runs inside the run step: it cannot exceed it.

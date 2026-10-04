@@ -1,6 +1,6 @@
 # 插件接口规范
 
-本文是插件化设计的接口细节，总览与原则见 `docs/DESIGN.md`。P1（§7–§9 的结果格式、汇总与展示）和 P2（§3 注册表、§4.1 `workdir` 运行器、§5 打包器）已落地。本文描述的是目标形态，按 §13 的三个阶段（P1–P3）落地；某一部分落地之前，现行行为以 `docs/scorer-contract.md`、`docs/agent-contract.md` 为准，落地时这两份文档同步改写。
+本文是插件化设计的接口细节，总览与原则见 `docs/DESIGN.md`。P1（§7–§9 的结果格式、汇总与展示）、P2（§3 注册表、§4.1 `workdir` 运行器、§5 打包器）和 P3（§4.2 交互运行器、§10 打分时用模型、§12 巡天迁移）已落地。本文描述的是目标形态，按 §13 的三个阶段（P1–P3）落地；某一部分落地之前，现行行为以 `docs/scorer-contract.md`、`docs/agent-contract.md` 为准，落地时这两份文档同步改写。
 
 ## 1. 核心与插件的分工
 
@@ -53,7 +53,7 @@ P3 起 `score-tests` 按遍拆成矩阵（每遍一个 job），因为交互运�
 }
 ```
 
-（节选；完整内容以仓库里的 `plugins.json` 为准。P3 加入交互运行器 `astro-v4` 和模型评判打分器。）
+（节选；完整内容以仓库里的 `plugins.json` 为准。）
 
 | 字段 | 含义 |
 |---|---|
@@ -92,7 +92,7 @@ P3 起 `score-tests` 按遍拆成矩阵（每遍一个 job），因为交互运�
 用于"agent 不是交一份产出就完事，而是要和裁判一问一答"的题目，例如巡天：裁判进程持有真值和时间墙，agent 每一步收到观测状态、回一条指令。
 
 - **位置**：`runners/<name>/`，例如 `runners/astro-v4/`。
-- **声明**：题目包 `interactive: {"name": "astro-v4", "time_limit_s": 1200}`。
+- **声明**：题目包 `interactive: {"name": "astro-v4", "time_limit_s": 1200, "options": {...}}`（`options` 可选，经 `--options` 传给插件）。
 - **形式**：入口 `run.sh` + `image/`。命令行固定为：
 
 ```
@@ -274,7 +274,9 @@ trait Packager {
 
 - 只能给注册表里 `model: true` 的插件声明模型；`runs_taskset_code: true` 的插件（会执行题目包文件的，如 Playwright）永远拿不到模型。这由注册表校验和题目包登记校验保证。
 - 用的总是提交者自己的 key 和接口，平台不提供模型。
-- 计量与记账：`score-tests` 里每个用到模型的插槽各起一个 meter（宿主机进程），各写一份 `usage.jsonl`。manifest 的阶段条目在现有 `usage`（产出阶段）之外加 `eval_usage: {"interactive": {usage, cost_usd}, "scorer": {usage, cost_usd}}`。网页分开展示，不并入 agent 产出阶段的 token 和花销，对比视图也分开比较。三处用量都计入提交者设的预算。
+- 计量与记账：`score-tests` 里每个用到模型的插槽各起一个 meter（`crucible score` 进程内，监听沙箱网络宿主机一侧 `172.31.250.1:8787`，网络由 `tools/sandbox-net.sh` 建立，`SANDBOX_PORTS=8787` 只放行这一个端口），各写一份 `<遍>/<阶段>/eval_usage/{interactive,scorer}.jsonl`，随 `score.json` 一起交给 `publish`。manifest 的阶段条目在现有 `usage`（产出阶段）之外加 `eval_usage: {"interactive": {usage, cost_usd}, "scorer": {usage, cost_usd}}`。网页分开展示，不并入 agent 产出阶段的 token 和花销，对比视图也分开比较。三处用量都计入提交者设的预算。
+
+凭据怎样到 `score-tests`：`score`（交接）job 判断题目包声明了打分用模型且有凭据时，`crucible cred open … | crucible score-handoff --cred-stdin --model M --budget B`，凭据只经管道进 `score-handoff`，被封给一次性钥匙写成 handoff 里的 `cred.sealed`，同时写 `model.json`（模型名、每遍剩余预算 = 整次预算 − 该遍产出阶段用量）。`score-tests` 里 `crucible score --cred cred.sealed --model-plan model.json` 用一次性钥匙在自己进程里解开。预算按遍累计：产出阶段、交互运行、模型评判三处用量共用提交者设的上限；题目包的 `max_requests` / `max_tokens` 另按阶段限制。app 模式（`score.yml`）的 `cred_source` 可为 `workers-kv`（网页提交）或 `github-secret`（开发），`model` 是新增的输入。
 
 ### 10.1 与打分隔离的关系
 

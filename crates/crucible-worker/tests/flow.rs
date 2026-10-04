@@ -1019,7 +1019,7 @@ fn app_mode_and_failures() {
         json!({
             "_workflow": "score.yml", "eval_id": EID,
             "artifact_source": format!("blob:{hash}"), "taskset": "github-full",
-            "stage": "2", "cred_source": "none", "score_public": "false",
+            "stage": "2", "cred_source": "none", "model": "", "score_public": "false",
             "owner": "42:octocat",
             "results_url": format!("https://crucible.example.workers.dev/internal/results/{EID}")
         })

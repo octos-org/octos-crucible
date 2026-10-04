@@ -252,7 +252,7 @@ fn now_rfc3339() -> String {
     humantime::format_rfc3339_seconds(SystemTime::now()).to_string()
 }
 
-pub(super) fn read_usage(p: &Path) -> Vec<UsageRecord> {
+pub(crate) fn read_usage(p: &Path) -> Vec<UsageRecord> {
     std::fs::read_to_string(p)
         .map(|s| crucible_report::usage::parse_jsonl(&s))
         .unwrap_or_default()

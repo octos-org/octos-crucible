@@ -34,13 +34,22 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use std::collections::BTreeMap;
+
 use anyhow::{Context, Result, bail};
+use crucible_core::plugins::Kind;
 use crucible_core::score::ErrorKind;
-use crucible_core::taskset::{Aggregate, Stage};
+use crucible_core::taskset::{Aggregate, ModelUse, Stage};
 use crucible_core::{ScoreResult, TaskSet};
 use crucible_crypto::PrivateKey;
+use crucible_meter::{Credential, Limits, MeterConfig, Upstream};
+use crucible_metering::{Price, Pricing};
+use serde::{Deserialize, Serialize};
+use tokio::net::TcpListener;
 
 use crate::keys::Store;
+use crate::plan::Budget;
+use crate::runners::workdir::{Used, read_usage, remaining, used};
 use crate::zipdir::{self, ExtractLimits};
 
 /// Limits for unpacking a tests blob.
@@ -67,8 +76,12 @@ pub struct ScoreOpts<'a> {
     pub keys: &'a [PrivateKey],
     /// Where the registry's plugin directories are (`scorers/<name>/`).
     pub plugins_root: &'a Path,
-    /// Environment variables never passed to the scorer (the key names).
+    /// Environment variables never passed to the plugins (the key names).
     pub scrub_env: &'a [String],
+    /// Score only this replica (one scoring job per replica).
+    pub replica: Option<u32>,
+    /// The submitter's model for slots that use one.
+    pub model: Option<&'a ModelSetup>,
 }
 
 /// Normalise a scorer result for the manifest: [`ScoreResult::finish`]
@@ -118,7 +131,7 @@ fn zero(detail: impl Into<String>) -> ScoreResult {
 }
 
 /// Numeric replica directories under `results`, sorted.
-fn replicas(results: &Path) -> Result<Vec<u32>> {
+pub fn replicas(results: &Path) -> Result<Vec<u32>> {
     let mut out: Vec<u32> = std::fs::read_dir(results)
         .with_context(|| format!("reading {}", results.display()))?
         .filter_map(|e| e.ok())
@@ -139,7 +152,7 @@ pub struct ContainerPlugin {
 /// Resolve a container plugin of the registry under `root`.
 pub fn container_plugin(
     root: &Path,
-    kind: crucible_core::plugins::Kind,
+    kind: Kind,
     reference: &str,
     entry: &str,
 ) -> Result<ContainerPlugin> {
@@ -169,12 +182,254 @@ pub fn container_plugin(
     Ok(ContainerPlugin { entry, image })
 }
 
+/// The two slots of the scoring job that may use a model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Slot {
+    Interactive,
+    Scorer,
+}
+
+impl Slot {
+    fn name(self) -> &'static str {
+        match self {
+            Slot::Interactive => "interactive",
+            Slot::Scorer => "scorer",
+        }
+    }
+}
+
+/// Everything the scoring job needs to give a slot the submitter's model
+/// (docs/plugins.md §10). The credential lives only here, in this
+/// process: plugins get the meter's address and nothing else.
+pub struct ModelSetup {
+    pub cred: Credential,
+    /// The submitter's model; a taskset's `model.name` wins.
+    pub model: String,
+    pub pricing: Pricing,
+    pub user_price: Option<Price>,
+    /// Docker network the plugin containers join; its only reachable
+    /// address is `bind:port` (tools/sandbox-net.sh).
+    pub network: String,
+    pub bind: String,
+    pub port: u16,
+    /// Per replica: the caps of the whole evaluation minus what the
+    /// generation already used (empty: no caps).
+    pub budgets: BTreeMap<u32, Budget>,
+}
+
+/// The JSON `score-handoff` writes next to the sealed credential.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct ModelPlan {
+    pub model: String,
+    #[serde(default)]
+    pub budgets: BTreeMap<u32, Budget>,
+    /// The submitter's own price (`budget.price`), if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price: Option<serde_json::Value>,
+}
+
+/// A meter for one slot run, with its own usage log.
+struct SlotMeter {
+    task: tokio::task::JoinHandle<std::result::Result<(), crucible_meter::ConfigError>>,
+    log: PathBuf,
+}
+
+impl SlotMeter {
+    async fn stop(self) -> Used {
+        self.task.abort();
+        let _ = self.task.await;
+        used(&read_usage(&self.log))
+    }
+}
+
+/// The model a slot of `stage` runs with, if any: `Ok(None)` = run without
+/// one; `Err` = the stage requires a model and none was given.
+fn slot_model(ts: &TaskSet, slot: Slot, m: Option<&ModelSetup>) -> Result<Option<String>, String> {
+    let decl = ts.model.clone().unwrap_or_default();
+    let use_ = match slot {
+        Slot::Interactive => decl.interactive,
+        Slot::Scorer => decl.scorer,
+    };
+    if use_ == ModelUse::None {
+        return Ok(None);
+    }
+    let name = decl
+        .name
+        .clone()
+        .or_else(|| m.map(|m| m.model.clone()))
+        .filter(|n| !n.is_empty());
+    match (m, name) {
+        (Some(_), Some(n)) => Ok(Some(n)),
+        _ if use_ == ModelUse::Required => Err(format!(
+            "the {} of this stage needs a model credential",
+            slot.name()
+        )),
+        _ => Ok(None),
+    }
+}
+
+/// Start the slot's meter and return it with the plugin's model arguments.
+async fn start_meter(
+    m: &ModelSetup,
+    model: &str,
+    log: PathBuf,
+    limits: Limits,
+    network_flag: &str,
+) -> Result<(SlotMeter, Vec<String>)> {
+    if let Some(dir) = log.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::File::create(&log)?;
+    let cfg = MeterConfig {
+        upstream: Upstream::new(m.cred.clone(), false)?,
+        model: model.to_owned(),
+        pricing: m.pricing.clone(),
+        user_price: m.user_price,
+        force_usage: true,
+        limits,
+        log_path: log.clone(),
+        insecure_allow_loopback_for_tests: false,
+    };
+    let listener = TcpListener::bind((m.bind.as_str(), m.port))
+        .await
+        .with_context(|| format!("meter: binding {}:{}", m.bind, m.port))?;
+    let task = tokio::spawn(crucible_meter::serve(listener, cfg));
+    let args = vec![
+        network_flag.to_owned(),
+        m.network.clone(),
+        "--model-base-url".into(),
+        format!("http://{}:{}/v1", m.bind, m.port),
+        "--model".into(),
+        model.to_owned(),
+    ];
+    Ok((SlotMeter { task, log }, args))
+}
+
+/// The caps for the next slot run: the taskset's per-stage caps minus what
+/// this stage used, and the replica's remaining budget.
+fn slot_limits(
+    ts: &TaskSet,
+    budget: Option<&Budget>,
+    stage_used: Used,
+    replica_used: Used,
+) -> Limits {
+    let decl = ts.model.clone().unwrap_or_default();
+    let mut l = match budget {
+        Some(b) => remaining(b, replica_used),
+        None => Limits::default(),
+    };
+    let min = |a: Option<u64>, b: Option<u64>| match (a, b) {
+        (Some(x), Some(y)) => Some(x.min(y)),
+        (x, y) => x.or(y),
+    };
+    l.max_requests = min(
+        l.max_requests,
+        decl.max_requests
+            .map(|c| c.saturating_sub(stage_used.requests)),
+    );
+    l.max_tokens = min(
+        l.max_tokens,
+        decl.max_tokens.map(|c| c.saturating_sub(stage_used.tokens)),
+    );
+    l
+}
+
+fn add_used(a: &mut Used, b: Used) {
+    a.requests += b.requests;
+    a.tokens += b.tokens;
+    a.cost += b.cost;
+}
+
+/// Write `opts` (a plugin's options from the taskset) to a temp file.
+fn options_file(opts: Option<&serde_json::Value>) -> Result<Option<tempfile::NamedTempFile>> {
+    match opts {
+        None => Ok(None),
+        Some(v) => {
+            let f = tempfile::NamedTempFile::new()?;
+            std::fs::write(f.path(), serde_json::to_vec(v)?)?;
+            Ok(Some(f))
+        }
+    }
+}
+
+/// Run a container plugin's entry script; the scrubbed variables and the
+/// other kind's image variable are removed from its environment.
+fn plugin_command(p: &ContainerPlugin, image_var: &str, scrub_env: &[String]) -> Command {
+    let mut cmd = Command::new("bash");
+    for k in scrub_env {
+        cmd.env_remove(k);
+    }
+    for k in ["CRUCIBLE_SCORER_IMAGE", "CRUCIBLE_RUNNER_IMAGE"] {
+        cmd.env_remove(k);
+    }
+    if let Some(i) = &p.image {
+        cmd.env(image_var, i);
+    }
+    cmd.arg(&p.entry);
+    cmd
+}
+
+/// What an interactive run left (`run.json`).
+#[derive(Deserialize)]
+struct RunRecord {
+    status: String,
+    #[serde(default)]
+    detail: String,
+}
+
+/// Run the interactive runner; `Err` is a system error of the run.
+#[allow(clippy::too_many_arguments)]
+fn run_interactive(
+    runner: &ContainerPlugin,
+    agent: &Path,
+    material: &Path,
+    out: &Path,
+    time_limit_s: u64,
+    model_args: &[String],
+    options: Option<&Path>,
+    scrub_env: &[String],
+) -> std::result::Result<(), String> {
+    let mut cmd = plugin_command(runner, "CRUCIBLE_RUNNER_IMAGE", scrub_env);
+    cmd.arg("--agent")
+        .arg(agent)
+        .arg("--material")
+        .arg(material)
+        .arg("--out")
+        .arg(out)
+        .args(["--time-limit", &time_limit_s.to_string()])
+        .args(model_args);
+    if let Some(o) = options {
+        cmd.arg("--options").arg(o);
+    }
+    match cmd.status() {
+        Ok(s) if s.success() => {}
+        Ok(s) if s.code() == Some(2) => return Err("runner refused its arguments (exit 2)".into()),
+        Ok(s) => return Err(format!("runner wrote no run record ({s})")),
+        Err(e) => return Err(format!("could not start the runner: {e}")),
+    }
+    let rec: RunRecord = std::fs::read(out.join("run.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .ok_or("runner run.json is missing or malformed")?;
+    match rec.status.as_str() {
+        "completed" | "agent_failed" => Ok(()),
+        _ => Err(format!(
+            "interactive run failed: {}",
+            rec.detail.chars().take(200).collect::<String>()
+        )),
+    }
+}
+
 /// Run the scorer on one opened checkpoint.
+#[allow(clippy::too_many_arguments)]
 fn run_scorer(
     scorer: &ContainerPlugin,
     artifact: &Path,
     tests: &Path,
     stage: &Stage,
+    run: Option<&Path>,
+    model_args: &[String],
+    options: Option<&Path>,
     scrub_env: &[String],
 ) -> ScoreResult {
     let work = match tempfile::tempdir() {
@@ -182,25 +437,22 @@ fn run_scorer(
         Err(e) => return system_error(format!("temp dir: {e}")),
     };
     let out = work.path().join("result.json");
-    let mut cmd = Command::new("bash");
-    for k in scrub_env {
-        cmd.env_remove(k);
-    }
-    match &scorer.image {
-        Some(i) => cmd.env("CRUCIBLE_SCORER_IMAGE", i),
-        None => cmd.env_remove("CRUCIBLE_SCORER_IMAGE"),
-    };
-    let status = cmd
-        .arg(&scorer.entry)
-        .arg("--artifact")
+    let mut cmd = plugin_command(scorer, "CRUCIBLE_SCORER_IMAGE", scrub_env);
+    cmd.arg("--artifact")
         .arg(artifact)
         .arg("--tests")
         .arg(tests)
         .arg("--out")
         .arg(&out)
         .args(["--visibility", "hidden", "--task-id", &stage.id])
-        .status();
-    match status {
+        .args(model_args);
+    if let Some(r) = run {
+        cmd.arg("--run").arg(r);
+    }
+    if let Some(o) = options {
+        cmd.arg("--options").arg(o);
+    }
+    match cmd.status() {
         Ok(s) if s.success() => {}
         Ok(s) if s.code() == Some(2) => {
             return system_error("scorer refused its arguments (exit 2)");
@@ -217,12 +469,168 @@ fn run_scorer(
     }
 }
 
+/// Everything to score one replica's output of one stage.
+struct StageJob<'a> {
+    o: &'a ScoreOpts<'a>,
+    stage: &'a Stage,
+    scorer: &'a ContainerPlugin,
+    runner: Option<&'a ContainerPlugin>,
+    tests: &'a Path,
+}
+
+impl StageJob<'_> {
+    /// Score the output `app`; model use is added to `spent` (this
+    /// replica) and logged under `usage_dir`.
+    async fn score(&self, r: u32, app: &Path, usage_dir: &Path, spent: &mut Used) -> ScoreResult {
+        let (o, stage) = (self.o, self.stage);
+        let budget = o.model.and_then(|m| m.budgets.get(&r));
+        let mut stage_used = Used::default();
+        let scrub: Vec<String> = o.scrub_env.to_vec();
+        let run_dir = match tempfile::tempdir() {
+            Ok(d) => d,
+            Err(e) => return system_error(format!("temp dir: {e}")),
+        };
+        let mut have_run = false;
+        if let (Some(runner), Some(i)) = (self.runner, &stage.interactive) {
+            let model = match slot_model(o.taskset, Slot::Interactive, o.model) {
+                Ok(m) => m,
+                Err(e) => return rejected(e),
+            };
+            let mut meter = None;
+            let mut model_args = Vec::new();
+            if let (Some(name), Some(m)) = (&model, o.model) {
+                let limits = slot_limits(o.taskset, budget, stage_used, *spent);
+                match start_meter(
+                    m,
+                    name,
+                    usage_dir.join("interactive.jsonl"),
+                    limits,
+                    "--agent-network",
+                )
+                .await
+                {
+                    Ok((mt, a)) => {
+                        meter = Some(mt);
+                        model_args = a;
+                    }
+                    Err(e) => return system_error(format!("meter: {e:#}")),
+                }
+            }
+            let opts = match options_file(i.options.as_ref()) {
+                Ok(f) => f,
+                Err(e) => return system_error(format!("options: {e}")),
+            };
+            let (rn, agent, material, out) = (
+                ContainerPlugin {
+                    entry: runner.entry.clone(),
+                    image: runner.image.clone(),
+                },
+                app.to_path_buf(),
+                self.tests.to_path_buf(),
+                run_dir.path().to_path_buf(),
+            );
+            let (limit, scrub2, opt_path) = (
+                i.time_limit_s,
+                scrub.clone(),
+                opts.as_ref().map(|f| f.path().to_path_buf()),
+            );
+            let res = tokio::task::spawn_blocking(move || {
+                run_interactive(
+                    &rn,
+                    &agent,
+                    &material,
+                    &out,
+                    limit,
+                    &model_args,
+                    opt_path.as_deref(),
+                    &scrub2,
+                )
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("runner task: {e}")));
+            if let Some(mt) = meter {
+                let u = mt.stop().await;
+                add_used(&mut stage_used, u);
+                add_used(spent, u);
+            }
+            if let Err(e) = res {
+                return system_error(e);
+            }
+            have_run = true;
+        }
+        let model = match slot_model(o.taskset, Slot::Scorer, o.model) {
+            Ok(m) => m,
+            Err(e) => return rejected(e),
+        };
+        let mut meter = None;
+        let mut model_args = Vec::new();
+        if let (Some(name), Some(m)) = (&model, o.model) {
+            let limits = slot_limits(o.taskset, budget, stage_used, *spent);
+            match start_meter(
+                m,
+                name,
+                usage_dir.join("scorer.jsonl"),
+                limits,
+                "--model-network",
+            )
+            .await
+            {
+                Ok((mt, a)) => {
+                    meter = Some(mt);
+                    model_args = a;
+                }
+                Err(e) => return system_error(format!("meter: {e:#}")),
+            }
+        }
+        let opts = match options_file(stage.scorer_options.as_ref()) {
+            Ok(f) => f,
+            Err(e) => return system_error(format!("options: {e}")),
+        };
+        let sc = ContainerPlugin {
+            entry: self.scorer.entry.clone(),
+            image: self.scorer.image.clone(),
+        };
+        let (app, tests, st) = (app.to_path_buf(), self.tests.to_path_buf(), stage.clone());
+        let run = have_run.then(|| run_dir.path().to_path_buf());
+        let opt_path = opts.as_ref().map(|f| f.path().to_path_buf());
+        let result = tokio::task::spawn_blocking(move || {
+            run_scorer(
+                &sc,
+                &app,
+                &tests,
+                &st,
+                run.as_deref(),
+                &model_args,
+                opt_path.as_deref(),
+                &scrub,
+            )
+        })
+        .await
+        .unwrap_or_else(|e| system_error(format!("scorer task: {e}")));
+        if let Some(mt) = meter {
+            add_used(spent, mt.stop().await);
+        }
+        result
+    }
+}
+
+fn rejected(detail: String) -> ScoreResult {
+    ScoreResult {
+        visibility: Some("hidden".into()),
+        ..ScoreResult::error(ErrorKind::Rejected, detail)
+    }
+}
+
 /// Score every replica's checkpoint of the selected stages.
 pub async fn score(o: &ScoreOpts<'_>) -> Result<Vec<(u32, String, ScoreResult)>> {
-    let reps = replicas(o.results)?;
+    let reps: Vec<u32> = replicas(o.results)?
+        .into_iter()
+        .filter(|r| o.replica.is_none_or(|x| x == *r))
+        .collect();
     if reps.is_empty() {
         bail!("no replica directories under {}", o.results.display());
     }
+    let mut spent: BTreeMap<u32, Used> = BTreeMap::new();
     let mut done = Vec::new();
     for &i in &o.stages {
         let stage = &o.taskset.stages[i];
@@ -237,10 +645,19 @@ pub async fn score(o: &ScoreOpts<'_>) -> Result<Vec<(u32, String, ScoreResult)>>
         }
         let scorer = container_plugin(
             o.plugins_root,
-            crucible_core::plugins::Kind::Scorer,
+            Kind::Scorer,
             &crucible_core::taskset::scorer_spec(stage.scorer_ref(o.taskset)),
             "score.sh",
         )?;
+        let runner = match &stage.interactive {
+            Some(i) => Some(container_plugin(
+                o.plugins_root,
+                Kind::Runner,
+                &i.name,
+                "run.sh",
+            )?),
+            None => None,
+        };
         // The tests exist in clear only inside this scope.
         let tests = tempfile::tempdir()?;
         let plain = match o.tests {
@@ -253,8 +670,17 @@ pub async fn score(o: &ScoreOpts<'_>) -> Result<Vec<(u32, String, ScoreResult)>>
         };
         zipdir::safe_extract(Cursor::new(plain), tests.path(), TESTS_LIMITS)
             .with_context(|| format!("stage {} tests", stage.id))?;
+        let job = StageJob {
+            o,
+            stage,
+            scorer: &scorer,
+            runner: runner.as_ref(),
+            tests: tests.path(),
+        };
         for r in todo {
             let sdir = o.results.join(r.to_string()).join(&stage.id);
+            let dir = o.out.join(r.to_string()).join(&stage.id);
+            std::fs::create_dir_all(&dir)?;
             let ckpt = sdir.join("checkpoint.sealed");
             let result = if ckpt.is_file() {
                 let app = tempfile::NamedTempFile::new()?;
@@ -265,7 +691,10 @@ pub async fn score(o: &ScoreOpts<'_>) -> Result<Vec<(u32, String, ScoreResult)>>
                     crate::packagers::check(&stage.packager, &zip, stage.packager_options.as_ref());
                 drop(zip);
                 match format {
-                    Ok(()) => run_scorer(&scorer, app.path(), tests.path(), stage, o.scrub_env),
+                    Ok(()) => {
+                        let s = spent.entry(r).or_default();
+                        job.score(r, app.path(), &dir.join("eval_usage"), s).await
+                    }
                     Err(e) => {
                         eprintln!(
                             "r{r} {}: output refused by packager {}: {e:#}",
@@ -279,8 +708,6 @@ pub async fn score(o: &ScoreOpts<'_>) -> Result<Vec<(u32, String, ScoreResult)>>
                 zero("the stage left no checkpoint")
             };
             let result = normalise(result, stage.expected_total, &o.taskset.aggregate);
-            let dir = o.out.join(r.to_string()).join(&stage.id);
-            std::fs::create_dir_all(&dir)?;
             std::fs::write(
                 dir.join("score.json"),
                 serde_json::to_string_pretty(&result)? + "\n",
@@ -490,6 +917,8 @@ printf '{"visibility":"hidden","status":"failed","passed":1,"total":2,"detail":"
             keys: std::slice::from_ref(&sk),
             plugins_root: &root,
             scrub_env: &[],
+            replica: None,
+            model: None,
         })
         .await
         .unwrap();
@@ -552,6 +981,8 @@ printf '{"visibility":"hidden","status":"failed","passed":1,"total":2,"detail":"
             keys: &keys,
             plugins_root: &root,
             scrub_env: &["PATH_CRUCIBLE_TEST_KEY".into()],
+            replica: Some(1),
+            model: None,
         })
         .await
         .unwrap();

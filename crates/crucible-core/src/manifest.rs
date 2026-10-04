@@ -217,6 +217,27 @@ pub struct StageEntry {
     /// `final` (work dir at the end) or `snapshot` (last periodic snapshot).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint_source: Option<String>,
+    /// Model use of the scoring job (interactive runner, judge scorer),
+    /// kept apart from `usage` (the agent producing its output).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eval_usage: Option<EvalUsage>,
+}
+
+/// Model use while scoring, per slot (docs/plugins.md §10).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct EvalUsage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interactive: Option<SlotUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scorer: Option<SlotUsage>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SlotUsage {
+    pub usage: UsageTotals,
+    /// `None` when the model's price is unknown.
+    #[serde(default)]
+    pub cost_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -276,6 +297,7 @@ mod tests {
                     ended: Some("exited".into()),
                     exit_code: Some(0),
                     checkpoint_source: Some("final".into()),
+                    eval_usage: None,
                 }],
             }],
         };
@@ -351,6 +373,7 @@ mod tests {
             ended: None,
             exit_code: None,
             checkpoint_source: None,
+            eval_usage: None,
         };
         let rep = |n: u32, stages: Vec<StageEntry>| ReplicaEntry {
             replica: n,

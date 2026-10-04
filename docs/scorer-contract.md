@@ -28,6 +28,17 @@ score.sh --artifact FILE --tests DIR --out result.json
          [--task-id ID] [--submission-id ID]   # 只回填到 result.json，[A-Za-z0-9._-]
 ```
 
+平台还会按题目包的声明追加下面的参数（`docs/plugins.md` §6），打分器不用的可以忽略：
+
+```
+         [--run DIR]                    # 本阶段有交互运行器时：它的 --out 目录（运行记录）
+         [--options FILE]               # 题目包给打分器的参数（阶段的 scorer_options，JSON）
+         [--model-network NAME --model-base-url URL --model NAME]
+                                        # 只在注册表 model: true、题目包声明 model.scorer、且提交者给了凭据时出现
+```
+
+`--model-*`：打分器自己的容器接到 `--model-network`（平台建好并装了防火墙，唯一可达的地址是宿主机上的计量代理），用 `OPENAI_BASE_URL=--model-base-url`、`OPENAI_API_KEY=dummy` 调模型。模型 key 只在 `crucible` 进程里，打分器拿不到；用量记进 manifest 的 `eval_usage.scorer`。
+
 各打分器可以追加自己的可选参数（例如 Playwright 的 `--app-port`、各类超时），但不能改上面这些参数的含义。
 
 退出码：
@@ -151,7 +162,8 @@ score.sh --artifact FILE --tests DIR --out result.json
 | `publish` | 平台私钥、写仓库权限 | 收尾：读 `scores`，生成清单、回传 Worker。 |
 
 要点：
-- 跑测试的机器上没有平台私钥、Worker 令牌、模型 key，`GITHUB_TOKEN` 没有任何权限。一次性钥匙只能打开本次 handoff 里的东西，而这些东西本来就要交给这台机器。
+- 跑测试的机器上没有平台私钥、Worker 令牌，`GITHUB_TOKEN` 没有任何权限。题目包声明打分要用模型、且提交者给了凭据时，模型 key 随 handoff 一起封给一次性钥匙，只在 `crucible score` 的计量代理里解开；会执行题目包文件的打分器（`runs_taskset_code: true`，如 Playwright）永远拿不到模型（`docs/plugins.md` §10）。
+- `score-tests` 每遍一个 job（矩阵），交互运行要占真实时间。一次性钥匙只能打开本次 handoff 里的东西，而这些东西本来就要交给这台机器。
 - handoff 是密文：仓库是公开的，公开仓库的 Actions artifact 任何登录用户都能下载，所以绝不能把明文测试或产出放进 artifact。
 - 一次性钥匙经 job output 传递。GitHub 不在网页或 API 里展示 job output；它只在 `score-tests` 里以 secret 的身份出现，日志中打码。
 - 已知残余风险：从测试或应用容器逃逸的代码可以伪造本次 `score.json`（它能写 `scores` artifact）。这只影响它自己参与的这次分数：题目包作者本来就决定测试怎么判，agent 产出逃逸则与以前相同。

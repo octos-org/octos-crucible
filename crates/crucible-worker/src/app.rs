@@ -114,6 +114,7 @@ fn user_taskset_info(u: &UserTaskset) -> TasksetInfo {
     let display = u.parsed().map(|ts| ts.display).filter(|d| !d.is_empty());
     TasksetInfo {
         display,
+        model_required: crate::github::model_required(u.parsed().and_then(|ts| ts.model).as_ref()),
         name: u.id.clone(),
         version: "upload".into(),
         stages,
@@ -849,6 +850,12 @@ impl<'a, B: Backend> App<'a, B> {
             }
             // One stage, 1-based.
             Mode::App => {
+                if ts.model_required && v.cred.is_none() {
+                    return Err(ApiError::bad_request(format!(
+                        "taskset {} scores with a model: cred_envelope is required",
+                        ts.name
+                    )));
+                }
                 let i = v.stages.unwrap_or(1);
                 if i > n {
                     return Err(ApiError::bad_request(format!(

@@ -2,6 +2,7 @@ import { useEffect, useState } from "preact/hooks";
 import { api } from "../api";
 import {
   cacheRate,
+  evalSlots,
   fmtCount,
   fmtDuration,
   fmtMeanStd,
@@ -310,6 +311,39 @@ function ReplicaCard({ r, f }: { r: ReplicaEntry; f: Formats }) {
           </tfoot>
         </table>
       </div>
+      {t.eval.any && (
+        <div class="table-wrap">
+          <p class="muted small">
+            评测阶段的模型用量（交互运行中的 agent、模型评判），用的是提交者的 key，单独计算，不含在上表里。
+          </p>
+          <table>
+            <thead>
+              <tr>
+                <th>阶段</th>
+                <th>用途</th>
+                <th>请求</th>
+                <th>输入 token</th>
+                <th>输出 token</th>
+                <th>等价花销</th>
+              </tr>
+            </thead>
+            <tbody>
+              {stages.flatMap((s) =>
+                evalSlots(s).map(([label, u, c]) => (
+                  <tr>
+                    <th scope="row">{s.stage}</th>
+                    <td>{label}</td>
+                    <td class="num">{fmtCount(u.requests)}</td>
+                    <td class="num">{fmtCount(u.prompt_tokens)}</td>
+                    <td class="num">{fmtCount(u.completion_tokens)}</td>
+                    <td class="num">{fmtUsd(c)}</td>
+                  </tr>
+                )),
+              )}
+            </tbody>
+          </table>
+        </div>
+      )}
       {withItems.map((s) => (
         <div class="table-wrap">
           <p class="muted small">{s.stage} 分项</p>

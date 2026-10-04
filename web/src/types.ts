@@ -144,12 +144,20 @@ export interface BlobRef {
   key_id: string;
 }
 
+/** Model use of one scoring slot (docs/plugins.md §10). */
+export interface SlotUsage {
+  usage?: Partial<UsageTotals> | null;
+  cost_usd?: number | null;
+}
+
 export interface StageEntry {
   stage: string;
   score?: StageScore | null;
   wall_s?: number | null;
   usage?: Partial<UsageTotals> | null;
   cost_usd?: number | null;
+  /** Model use while scoring (interactive runner, judge), apart from `usage`. */
+  eval_usage?: { interactive?: SlotUsage | null; scorer?: SlotUsage | null } | null;
   output?: BlobRef | null;
   logs?: BlobRef | null;
 }

@@ -54,7 +54,7 @@ pub struct TaskSet {
     /// How scores are shown; see [`Display`].
     #[serde(default, skip_serializing_if = "Display::is_empty")]
     pub display: Display,
-    /// Model use while scoring (docs/plugins.md §10). Parsed, not used yet.
+    /// Model use while scoring (docs/plugins.md §10).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<ModelDecl>,
     /// Declared wall clock of a whole run; at least the sum of the stage
@@ -269,8 +269,17 @@ impl ScoreFormat {
     }
 }
 
-/// `model` of docs/plugins.md §10 (P3; parsed only).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// A model name as the meter and the plugins take it.
+pub fn model_name_ok(m: &str) -> bool {
+    !m.is_empty()
+        && m.len() <= 80
+        && m.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._:/-".contains(&b))
+}
+
+/// `model` of docs/plugins.md §10: which slots of the scoring job may use
+/// the submitter's model, through the meter.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelDecl {
     #[serde(default)]
@@ -351,11 +360,29 @@ pub struct Stage {
     /// This stage's scorer when it differs from the taskset's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scorer: Option<ScorerRef>,
+    /// Parameters for the scorer (`--options FILE`), e.g. how many times a
+    /// judge model grades.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scorer_options: Option<serde_json::Value>,
+    /// The interactive runner (slot 3), run in the scoring job before the
+    /// scorer, in both modes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interactive: Option<InteractiveRef>,
     pub time_limit_s: u64,
     /// Number of tests the scorer is expected to report. A mismatch is
     /// flagged rather than silently summed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_total: Option<u32>,
+}
+
+/// An interactive runner and its wall clock (docs/plugins.md §4.2).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InteractiveRef {
+    pub name: String,
+    pub time_limit_s: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<serde_json::Value>,
 }
 
 /// The default producing runner.
@@ -506,6 +533,11 @@ impl TaskSet {
             }
         }
         for s in &self.stages {
+            if let Some(i) = &s.interactive {
+                add(Kind::Runner, &i.name);
+            }
+        }
+        for s in &self.stages {
             add(Kind::Runner, s.runner_name());
             add(Kind::Packager, &s.packager);
         }
@@ -533,15 +565,79 @@ impl TaskSet {
                     scorer.accepts.join(" or ")
                 )));
             }
-            if let Some(o) = &s.packager_options
-                && (!o.is_object() || o.to_string().len() > MAX_PLUGIN_OPTIONS_BYTES)
-            {
+            for (what, o) in [
+                ("packager_options", &s.packager_options),
+                ("scorer_options", &s.scorer_options),
+                (
+                    "interactive.options",
+                    &s.interactive.as_ref().and_then(|i| i.options.clone()),
+                ),
+            ] {
+                if let Some(o) = o
+                    && (!o.is_object() || o.to_string().len() > MAX_PLUGIN_OPTIONS_BYTES)
+                {
+                    return Err(at(format!(
+                        "{what} must be a JSON object of at most {MAX_PLUGIN_OPTIONS_BYTES} bytes"
+                    )));
+                }
+            }
+            let model = self.model.clone().unwrap_or_default();
+            if let Some(i) = &s.interactive {
+                let r = reg.resolve(Kind::Runner, &i.name).map_err(at)?;
+                if !r.interactive {
+                    return Err(at(format!("runner {} is not interactive", r.name)));
+                }
+                if i.time_limit_s == 0 || i.time_limit_s > MAX_TOTAL_TIME_S {
+                    return Err(at("interactive.time_limit_s must be 1..=18000".into()));
+                }
+                if model.interactive != ModelUse::None && !r.model {
+                    return Err(at(format!("runner {} cannot be given a model", r.name)));
+                }
+            }
+            if model.scorer != ModelUse::None && !scorer.model {
                 return Err(at(format!(
-                    "packager_options must be a JSON object of at most {MAX_PLUGIN_OPTIONS_BYTES} bytes"
+                    "scorer {} cannot be given a model",
+                    scorer.name
                 )));
             }
         }
+        if let Some(m) = &self.model {
+            if m.interactive != ModelUse::None
+                && !self.stages.iter().any(|s| s.interactive.is_some())
+            {
+                return Err(
+                    "model.interactive is set but no stage has an interactive runner".into(),
+                );
+            }
+            if let Some(n) = &m.name
+                && !model_name_ok(n)
+            {
+                return Err("model.name: at most 80 characters of [A-Za-z0-9._:/-]".into());
+            }
+            if m.max_requests == Some(0) || m.max_tokens == Some(0) {
+                return Err("model.max_requests / max_tokens must be > 0".into());
+            }
+        }
+        // The scoring job of one replica runs every stage's interactive
+        // run back to back.
+        let interactive_s: u64 = self
+            .stages
+            .iter()
+            .filter_map(|s| s.interactive.as_ref())
+            .map(|i| i.time_limit_s)
+            .sum();
+        if interactive_s > MAX_TOTAL_TIME_S {
+            return Err(format!(
+                "interactive time limits add up to {interactive_s}s, more than {MAX_TOTAL_TIME_S}s"
+            ));
+        }
         Ok(())
+    }
+
+    /// Does any stage's slot use a model (`interactive` or `scorer`)?
+    pub fn model_use(&self) -> (ModelUse, ModelUse) {
+        let m = self.model.clone().unwrap_or_default();
+        (m.interactive, m.scorer)
     }
 
     /// The extra rule for uploaded tasksets: every plugin they use is
@@ -551,11 +647,18 @@ impl TaskSet {
         let reg = crate::plugins::registry();
         for s in &self.stages {
             let sc = s.scorer_ref(self);
+            let interactive = s
+                .interactive
+                .as_ref()
+                .map(|i| (Kind::Runner, i.name.clone()));
             for (kind, r) in [
                 (Kind::Scorer, scorer_spec(sc)),
                 (Kind::Runner, s.runner_name().to_owned()),
                 (Kind::Packager, s.packager.clone()),
-            ] {
+            ]
+            .into_iter()
+            .chain(interactive)
+            {
                 let p = reg.resolve(kind, &r)?;
                 // The default runner needs no review of its own: it never
                 // sees test material.
@@ -736,13 +839,73 @@ mod tests {
                 "{why}"
             );
         }
+        // Models only for plugins that may have one; interactive runners
+        // only in the interactive slot.
+        let astro = |t: &mut TaskSet| {
+            t.scorer.name = "astro-survey".into();
+            for s in &mut t.stages {
+                s.packager = "files".into();
+                s.expected_total = None;
+                s.interactive = Some(InteractiveRef {
+                    name: "astro-v4".into(),
+                    time_limit_s: 1500,
+                    options: None,
+                });
+            }
+        };
+        let mut t = base.clone();
+        astro(&mut t);
+        t.model = Some(ModelDecl {
+            interactive: ModelUse::Optional,
+            ..ModelDecl::default()
+        });
+        t.validate(1 << 20).unwrap();
+        t.check_user_plugins().unwrap();
+        for (f, why) in [
+            (
+                Box::new(|t: &mut TaskSet| t.model.as_mut().unwrap().scorer = ModelUse::Required)
+                    as Box<dyn Fn(&mut TaskSet)>,
+                "astro-survey has no model",
+            ),
+            (
+                Box::new(|t: &mut TaskSet| {
+                    t.stages[0].interactive.as_mut().unwrap().name = "workdir".into()
+                }),
+                "workdir is not interactive",
+            ),
+            (
+                Box::new(|t: &mut TaskSet| t.stages[0].runner = Some("astro-v4".into())),
+                "interactive runner in slot 1",
+            ),
+            (
+                Box::new(|t: &mut TaskSet| t.model.as_mut().unwrap().name = Some("a b".into())),
+                "model name",
+            ),
+            (
+                Box::new(|t: &mut TaskSet| {
+                    t.stages[0].interactive.as_mut().unwrap().time_limit_s = 18_000
+                }),
+                "interactive time",
+            ),
+        ] {
+            let mut t2 = t.clone();
+            f(&mut t2);
+            assert!(
+                matches!(t2.validate(1 << 20), Err(TaskSetError::Plugin(_))),
+                "{why}"
+            );
+        }
+        // Playwright runs taskset code: never a model.
+        let mut t = base.clone();
+        t.model = Some(ModelDecl {
+            scorer: ModelUse::Optional,
+            ..ModelDecl::default()
+        });
+        assert!(matches!(t.validate(1 << 20), Err(TaskSetError::Plugin(_))));
         // Uploaded tasksets: only plugins marked `user`.
         base.check_user_plugins().unwrap();
         let mut t = base;
-        t.scorer.name = "astro-survey".into();
-        for s in &mut t.stages {
-            s.packager = "files".into();
-        }
+        t.scorer.name = "arcbench-official".into();
         t.validate(1 << 20).unwrap();
         assert!(t.check_user_plugins().is_err());
     }
