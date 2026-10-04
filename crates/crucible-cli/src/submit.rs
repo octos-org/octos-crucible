@@ -304,8 +304,18 @@ impl Api {
                     let status = r.status();
                     return Ok((status, r.bytes().await?.to_vec(), attempt));
                 }
-                Ok(r) => last = Some(anyhow!("{method} {path}: HTTP {}", r.status())),
+                Ok(r) => {
+                    let status = r.status();
+                    let body = r.bytes().await.unwrap_or_default();
+                    last = Some(match check(&method, path, status, &body) {
+                        Err(e) => e,
+                        Ok(()) => anyhow!("{method} {path}: HTTP {status}"),
+                    });
+                }
                 Err(e) => last = Some(anyhow!("{method} {path}: {}", e.without_url())),
+            }
+            if attempt < 4 {
+                eprintln!("{:#} (retrying)", last.as_ref().expect("set above"));
             }
             if attempt < 4 {
                 tokio::time::sleep(Duration::from_secs(2 * attempt as u64)).await;
@@ -490,13 +500,22 @@ pub async fn submit(cmd: SubmitCmd) -> Result<()> {
         )
         .await?;
     // A retried POST whose first attempt landed answers 409; it is ours if
-    // the eval exists.
+    // the eval exists, unless the Worker already marked it failed (the first
+    // attempt's 5xx was a failed workflow dispatch).
     let landed_earlier = status == StatusCode::CONFLICT
         && attempt > 1
-        && api
+        && match api
             .ok_json(Method::GET, &format!("/evals/{eval_id}"), &[], None)
             .await
-            .is_ok();
+        {
+            Ok(v) if v["status"] == "failed" => {
+                bail!(
+                    "eval {eval_id} was created but could not be started (status failed); submit again"
+                )
+            }
+            Ok(_) => true,
+            Err(_) => false,
+        };
     if !landed_earlier {
         check(&Method::POST, path, status, &bytes)?;
     }
