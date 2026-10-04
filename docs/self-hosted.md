@@ -70,6 +70,14 @@ cd ~/crucible-runner && setsid nohup ./run.sh > runner.log 2>&1 < /dev/null &
 gh api repos/octos-org/octos-crucible/actions/runners --jq '.runners[] | {name, status, labels: [.labels[].name]}'
 ```
 
+**网络不稳时用代理。** 运行器要长时间连着 GitHub（取任务、下载 action 和 artifact、回传日志），连接时断时续会让 job 卡在下载上直到超时。在运行器目录的 `.env` 里写代理，运行器和它起的每个 job 都会用上；`no_proxy` 必须包含沙箱网桥地址 `172.31.250.1`。改完重启 `run.sh`。WSL（NAT 模式）用不了 Windows 的 `127.0.0.1` 代理，要写 Windows 主机在 WSL 里的地址（`ip route` 的默认网关），且代理要监听所有网卡：
+
+```
+https_proxy=http://172.28.160.1:10808
+http_proxy=http://172.28.160.1:10808
+no_proxy=localhost,127.0.0.1,::1,172.31.250.1
+```
+
 然后设好 `CRUCIBLE_SANDBOX_RUNNER`，照常用 `eval.yml` / `score.yml` 发起评测。
 
 ## 每个 job 的清理

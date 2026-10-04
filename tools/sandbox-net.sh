@@ -83,9 +83,9 @@ drop_rules() {
 clean() {
   { docker ps -aq --filter name=crucible-; docker ps -aq --filter label=crucible.scorer.run; } \
     | sort -u | xargs -r docker rm -f >/dev/null 2>&1 || true
-  { docker network ls -q --filter name=crucible-net-; docker network ls -q --filter name=crucible-bnet-
-    docker network ls -q --filter name="$NET"; } \
+  { docker network ls -q --filter name=crucible-net-; docker network ls -q --filter name=crucible-bnet-; } \
     | sort -u | xargs -r docker network rm >/dev/null 2>&1 || true
+  docker network rm "$NET" >/dev/null 2>&1 || true
   docker volume ls -q --filter name=crucible- | xargs -r docker volume rm -f >/dev/null 2>&1 || true
   drop_rules iptables
   drop_rules ip6tables
