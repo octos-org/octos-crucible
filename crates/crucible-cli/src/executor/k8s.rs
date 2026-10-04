@@ -452,9 +452,22 @@ pub fn pod_spec(conf: &Conf, c: &ContainerSpec, aliases: &[(String, String)]) ->
     Ok(json!({
         "apiVersion": "v1",
         "kind": "Pod",
-        "metadata": {"name": dns_name(&c.name), "namespace": conf.namespace, "labels": labels},
+        "metadata": {"name": pod_name(c), "namespace": conf.namespace, "labels": labels},
         "spec": spec,
     }))
+}
+
+/// The Pod name of a container: its `--name`, or for an unnamed one a
+/// fresh `ctr-<random>` (Docker would pick a name; a fixed one would make
+/// two unnamed containers of one evaluation collide). Unnamed Pods carry
+/// the run label like any other, so cleanup by scope still finds them.
+pub fn pod_name(c: &ContainerSpec) -> String {
+    if !c.name.is_empty() {
+        return dns_name(&c.name);
+    }
+    let mut b = [0u8; 6];
+    getrandom::getrandom(&mut b).expect("random");
+    format!("ctr-{}", hex::encode(b))
 }
 
 /// The init container that holds a Pod back until the network policies
@@ -1707,6 +1720,32 @@ mod tests {
         // A probe pod that died before the end refuses too.
         assert!(probe_failures("dns_cluster blocked\n", &p).is_err());
         assert!(probe_script(&p).contains("if nc -w 5 169.254.169.254 80"));
+    }
+
+    #[test]
+    fn unnamed_containers_get_distinct_pod_names() {
+        let c = ContainerSpec {
+            image: "busybox".into(),
+            labels: vec![(RUN_LABEL.into(), "local-x-score-r1".into())],
+            network: Network::None,
+            ..Default::default()
+        };
+        let a = pod_spec(&conf(), &c, &[]).unwrap();
+        let b = pod_spec(&conf(), &c, &[]).unwrap();
+        let (na, nb) = (
+            a["metadata"]["name"].as_str().unwrap(),
+            b["metadata"]["name"].as_str().unwrap(),
+        );
+        assert_ne!(na, nb);
+        for (n, p) in [(na, &a), (nb, &b)] {
+            assert!(n.starts_with("ctr-") && dns_name(n) == n, "{n}");
+            assert_eq!(p["metadata"]["labels"][RUN_LABEL], "local-x-score-r1");
+        }
+        let named = ContainerSpec {
+            name: "crucible-app".into(),
+            ..c
+        };
+        assert_eq!(pod_name(&named), "crucible-app");
     }
 
     #[test]
