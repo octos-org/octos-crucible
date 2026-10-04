@@ -32,6 +32,8 @@ pub enum EvalCmd {
     /// Run an evaluation on this machine (Linux, Docker, passwordless
     /// `sudo iptables`): an agent (`--agent`) or an uploaded output (`--app`).
     Local(Box<LocalArgs>),
+    /// The same, each step a Nomad batch job (docs/nomad.md).
+    Nomad(Box<crate::nomad::NomadArgs>),
 }
 
 #[derive(clap::Args)]
@@ -165,7 +167,17 @@ struct StepRecord {
     ok: bool,
 }
 
+/// Who runs the steps.
+pub enum Backend {
+    /// Child processes of the driver.
+    Local,
+    /// One Nomad batch job per step.
+    Nomad(crate::nomad::Nomad),
+}
+
 struct Driver {
+    backend: Backend,
+    eval_id: String,
     secrets_base: PathBuf,
     records: Vec<StepRecord>,
 }
@@ -180,8 +192,47 @@ impl Driver {
         secrets: &[(Secret, &[u8])],
         args: &[String],
     ) -> Result<bool> {
-        let dir = SecretsDir::new(&self.secrets_base, name, secrets)?;
         eprintln!("== step {label}");
+        let (ok, started, ended) = match &self.backend {
+            Backend::Local => self.local_step(exe, name, secrets, args).await?,
+            Backend::Nomad(n) => {
+                let env: Vec<(String, String)> = if name == "score-tests" {
+                    vec![("CRUCIBLE_SCORER_FIREWALL".into(), "1".into())]
+                } else {
+                    vec![]
+                };
+                let id = crate::nomad::job_id(&self.eval_id, label);
+                let e = n
+                    .run_step(&id, spec(name), exe, args, &env, secrets)
+                    .await?;
+                (e.ok, e.started, e.ended)
+            }
+        };
+        self.records.push(StepRecord {
+            step: label.into(),
+            started_at: humantime::format_rfc3339_seconds(started).to_string(),
+            ended_at: humantime::format_rfc3339_seconds(ended).to_string(),
+            wall_s: ended
+                .duration_since(started)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0),
+            ok,
+        });
+        if !ok {
+            eprintln!("== step {label} failed");
+        }
+        Ok(ok)
+    }
+
+    /// A child process with a secrets directory removed when it exits.
+    async fn local_step(
+        &self,
+        exe: &Path,
+        name: &str,
+        secrets: &[(Secret, &[u8])],
+        args: &[String],
+    ) -> Result<(bool, SystemTime, SystemTime)> {
+        let dir = SecretsDir::new(&self.secrets_base, name, secrets)?;
         let started = SystemTime::now();
         let mut cmd = tokio::process::Command::new(exe);
         cmd.arg("step")
@@ -200,21 +251,7 @@ impl Driver {
             .await
             .with_context(|| format!("starting step {name}"))?;
         drop(dir);
-        let ended = SystemTime::now();
-        self.records.push(StepRecord {
-            step: label.into(),
-            started_at: humantime::format_rfc3339_seconds(started).to_string(),
-            ended_at: humantime::format_rfc3339_seconds(ended).to_string(),
-            wall_s: ended
-                .duration_since(started)
-                .map(|d| d.as_secs_f64())
-                .unwrap_or(0.0),
-            ok: status.success(),
-        });
-        if !status.success() {
-            eprintln!("== step {label} failed ({status})");
-        }
-        Ok(status.success())
+        Ok((status.success(), started, SystemTime::now()))
     }
 }
 
@@ -249,6 +286,26 @@ pub async fn eval_local(a: LocalArgs) -> Result<()> {
     if !cfg!(target_os = "linux") {
         bail!("eval local needs Linux (Docker with iptables); see docs/executors.md");
     }
+    let exe = std::env::current_exe()?;
+    run_eval(a, Backend::Local, exe).await
+}
+
+pub async fn eval_nomad(a: crate::nomad::NomadArgs) -> Result<()> {
+    let n = crate::nomad::Nomad::new(&a)?;
+    let exe = match &a.crucible_bin {
+        Some(p) => std::path::absolute(p)?,
+        None => std::env::current_exe()?,
+    };
+    run_eval(a.eval, Backend::Nomad(n), exe).await
+}
+
+/// The driver: plan, generate per replica, handoff, score-tests per
+/// replica, publish, each step run by `backend`.
+async fn run_eval(a: LocalArgs, backend: Backend, exe: PathBuf) -> Result<()> {
+    let (prefix, timing_source) = match backend {
+        Backend::Local => ("local", "local"),
+        Backend::Nomad(_) => ("nomad", "nomad"),
+    };
     let root =
         std::fs::canonicalize(&a.root).with_context(|| format!("--root {}", a.root.display()))?;
     let keys_dir = match &a.keys {
@@ -273,7 +330,7 @@ pub async fn eval_local(a: LocalArgs) -> Result<()> {
         "" => {
             let t = humantime::format_rfc3339_seconds(SystemTime::now()).to_string();
             let t: String = t.chars().filter(char::is_ascii_digit).take(14).collect();
-            format!("local-{t}-{}", rand_hex(3))
+            format!("{prefix}-{t}-{}", rand_hex(3))
         }
         id if crate::plan::eval_id_ok(id) => id.to_owned(),
         _ => bail!("--eval-id must match [a-z0-9][a-z0-9-]{{7,63}}"),
@@ -325,8 +382,9 @@ pub async fn eval_local(a: LocalArgs) -> Result<()> {
     } else {
         dir.clone()
     };
-    let exe = std::env::current_exe()?;
     let mut drv = Driver {
+        backend,
+        eval_id: eval_id.clone(),
         secrets_base,
         records: Vec::new(),
     };
@@ -514,7 +572,7 @@ pub async fn eval_local(a: LocalArgs) -> Result<()> {
             "--store".into(),
             store_spec.clone(),
             "--timing-source".into(),
-            "local".into(),
+            timing_source.into(),
             "--out".into(),
             s(&publish),
         ];
