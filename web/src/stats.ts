@@ -154,7 +154,8 @@ export function fmtCount(n: number | null | undefined): string {
 }
 
 function trim(x: number): string {
-  return x.toFixed(x >= 100 ? 0 : x >= 10 ? 1 : 2).replace(/\.?0+$/, "");
+  const t = x.toFixed(x >= 100 ? 0 : x >= 10 ? 1 : 2);
+  return t.includes(".") ? t.replace(/\.?0+$/, "") : t;
 }
 
 export function fmtUsd(x: number | null | undefined): string {

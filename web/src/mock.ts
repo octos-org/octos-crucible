@@ -54,7 +54,7 @@ const DONE: Manifest = {
   eval_id: "7c1e2f5a-0b8d-4e57-9a51-3f2c1d0e9b11",
   created_at: "2026-10-02T08:12:00Z",
   taskset: "github-full",
-  agent: { name: "my-agent", version: "0.3.0" },
+  agent: { name: "my-agent", version: "0.3.0", commit: "4f2a9c1e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39" },
   model: "glm-5.3",
   public: false,
   replicas: [
@@ -91,6 +91,63 @@ const DONE: Manifest = {
   ],
 };
 
+// The same agent after a change: better score, fewer tokens, a bit slower.
+const TUNED: Manifest = {
+  schema: 1,
+  eval_id: "5b9e1c3d-7a2f-4d68-b0e4-9c8a7f6e5d21",
+  created_at: "2026-10-02T20:45:00Z",
+  taskset: "github-full",
+  agent: { name: "my-agent", version: "0.3.1", commit: "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678" },
+  model: "glm-5.3",
+  public: false,
+  replicas: [
+    {
+      replica: 1,
+      stages: [
+        stage("stage-1", 29, 30, 1790, 118, 3_400_000, 2_980_000, 52_000, 1.82),
+        stage("stage-2", 37, 42, 3010, 201, 6_900_000, 6_010_000, 90_100, 3.44),
+        stage("stage-3", 44, 55, 5120, 270, 9_800_000, 8_500_000, 128_000, 4.95),
+      ],
+    },
+    {
+      replica: 2,
+      stages: [
+        stage("stage-1", 30, 30, 1702, 110, 3_300_000, 2_900_000, 50_400, 1.74),
+        stage("stage-2", 38, 42, 3150, 214, 7_100_000, 6_200_000, 93_000, 3.58),
+        stage("stage-3", 42, 55, 5003, 262, 9_500_000, 8_300_000, 125_000, 4.80),
+      ],
+    },
+    {
+      replica: 3,
+      stages: [
+        stage("stage-1", 28, 30, 1655, 121, 3_500_000, 3_050_000, 53_800, 1.88),
+        stage("stage-2", 36, 42, 2990, 208, 7_000_000, 6_100_000, 91_500, 3.51),
+        stage("stage-3", 45, 55, 5230, 281, 10_100_000, 8_800_000, 131_000, 5.10),
+      ],
+    },
+  ],
+};
+
+// A quick dev run of the first two stages only.
+const QUICK: Manifest = {
+  schema: 1,
+  eval_id: "c6d7e8f9-0a1b-4c2d-9e3f-4a5b6c7d8e90",
+  created_at: "2026-10-02T23:10:00Z",
+  taskset: "github-full",
+  agent: { name: "my-agent", version: "0.3.2", commit: "9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a291807" },
+  model: "glm-5.3",
+  public: false,
+  replicas: [
+    {
+      replica: 1,
+      stages: [
+        stage("stage-1", 30, 30, 1580, 104, 3_100_000, 2_800_000, 47_000, 1.61),
+        stage("stage-2", 39, 42, 2870, 190, 6_500_000, 5_800_000, 86_000, 3.21),
+      ],
+    },
+  ],
+};
+
 const KIMI: Manifest = {
   schema: 1,
   eval_id: "d40c9a7e-5b6f-4a21-8e3d-6a9b2c7f1e04",
@@ -117,6 +174,8 @@ let EVALS: EvalSummary[] = [
   { eval_id: RUNNING.eval_id!, mode: "agent", taskset: "github-full", model: "glm-5.3-flash", created_at: "2026-10-03T06:30:00Z", status: "running:stage-2" },
   { eval_id: "b2e7c4d0-9f1a-4c63-8d27-5e0a1b3c4f68", mode: "app", taskset: "github-full", model: null, created_at: "2026-10-03T05:02:00Z", status: "scoring" },
   { eval_id: "e9d3b1a2-7c5f-4e08-b6a4-2d1c0f9e8a75", mode: "agent", taskset: "github-full", model: "glm-5", created_at: "2026-10-03T04:10:00Z", status: "queued" },
+  { eval_id: QUICK.eval_id, mode: "agent", taskset: "github-full", model: "glm-5.3", created_at: QUICK.created_at, status: "done", total_score: 0.9583 },
+  { eval_id: TUNED.eval_id, mode: "agent", taskset: "github-full", model: "glm-5.3", created_at: TUNED.created_at, status: "done", total_score: 0.8635 },
   { eval_id: DONE.eval_id, mode: "agent", taskset: "github-full", model: "glm-5.3", created_at: DONE.created_at, status: "done", total_score: 0.775 },
   { eval_id: KIMI.eval_id, mode: "agent", taskset: "github-lite", model: "kimi-k3", created_at: KIMI.created_at, status: "done", total_score: 0.8 },
   { eval_id: "0f5a6b7c-8d9e-4f10-a1b2-c3d4e5f60718", mode: "agent", taskset: "github-full", model: "glm-4.7", created_at: "2026-09-30T10:00:00Z", status: "failed" },
@@ -124,6 +183,8 @@ let EVALS: EvalSummary[] = [
 
 const DETAILS: Record<string, EvalDetail> = {
   [DONE.eval_id]: { eval_id: DONE.eval_id, status: "done", run_url: "https://github.com/octos-org/octos-crucible/actions", manifest: DONE },
+  [TUNED.eval_id]: { eval_id: TUNED.eval_id, status: "done", manifest: TUNED },
+  [QUICK.eval_id]: { eval_id: QUICK.eval_id, status: "done", manifest: QUICK },
   [KIMI.eval_id]: { eval_id: KIMI.eval_id, status: "done", manifest: KIMI },
   [RUNNING.eval_id!]: { eval_id: RUNNING.eval_id!, status: "running:stage-2", run_url: "https://github.com/octos-org/octos-crucible/actions", manifest: RUNNING },
 };
