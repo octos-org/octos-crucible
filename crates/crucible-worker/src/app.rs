@@ -7,33 +7,36 @@ use crate::authz::{self, Principal};
 use crate::config::Config;
 use crate::dispatch;
 use crate::github::{GitHub, RunView, TasksetInfo, UploadOutcome, view_run};
+use crate::http::Stmt;
 use crate::http::{ApiError, Backend, PutOptions, Req, Resp};
 use crate::keys;
 use crate::model::{
-    CRED_TTL_S, DONE, EvalRecord, EvalRequest, EvalSummary, FAILED, MAX_UPLOAD, Mode, QUEUED,
+    BUILDING, CRED_TTL_S, DONE, EvalRecord, EvalRequest, FAILED, MAX_UPLOAD, Mode, QUEUED,
     StoredResults, UploadRecord, ValidEval, is_login, is_status, is_terminal, is_uuid_v4,
     parse_results, status_rank,
 };
 use crate::model::{
-    PackResult, TS_FAILED, TS_PACKING, TS_READY, UploadKind, UserTaskset, UserTasksetMeta,
-    parse_pack_result,
+    PackResult, TS_FAILED, TS_PACKING, TS_READY, UploadKind, UserTaskset, parse_pack_result,
 };
 use crate::session;
 use crate::shard::{release_tag, sha256_hex};
+use crate::store::{self, Claim, Db};
 use crate::tokens::{self, TokenRecord, TokenSummary};
 use crate::util::{ct_eq, parse_query, query_get, rfc3339};
 use crucible_core::taskset::is_user_taskset_id;
 
 const OAUTH_COOKIE: &str = "crucible_oauth";
-const TASKSETS_CACHE: &str = "cache/tasksets";
+const TASKSETS_CACHE: &str = "tasksets";
 const TASKSETS_TTL_S: u64 = 300;
 const LIST_LIMIT: usize = 1000;
-/// KV prefix of user-uploaded tasksets.
-const USER_TASKSETS: &str = "tasksets/";
-/// Keeps `GET /tasksets` within the Worker's per-request KV budget.
 const MAX_LISTED_USER_TASKSETS: usize = 50;
 /// How long a run may be finished before missing results count as failure.
 const RESULTS_GRACE_S: u64 = 600;
+/// Old KV prefixes copied by `POST /internal/migrate-kv`, in this order.
+const MIGRATE_PREFIXES: [&str; 5] = ["upload/", "evals/", "tasksets/", "token/", "ban/"];
+/// Keys per migration call: at most 2 KV reads and 2 D1 statements each,
+/// well inside the free plan's per-request limits.
+const MIGRATE_BATCH: usize = 20;
 
 type Result<T> = std::result::Result<T, ApiError>;
 
@@ -169,6 +172,7 @@ impl<'a, B: Backend> App<'a, B> {
             ("DELETE", ["tokens", id]) => self.delete_token(req, id).await,
             ("POST", ["admin", "ban"]) => self.ban(req, true).await,
             ("POST", ["admin", "unban"]) => self.ban(req, false).await,
+            ("POST", ["internal", "migrate-kv"]) => self.migrate_kv(req).await,
             (
                 _,
                 ["auth", ..]
@@ -191,11 +195,16 @@ impl<'a, B: Backend> App<'a, B> {
 
     // ---- storage helpers ------------------------------------------------
 
-    fn storage_err(&self, e: String) -> ApiError {
-        self.b.log(&format!("KV error: {e}"));
-        if e.contains("limit exceeded") {
-            // Workers KV daily quota (free plan: 1000 writes/day, reset at
-            // 00:00 UTC). Not a bug in the request; say so.
+    fn db(&self) -> Db<'a, B> {
+        Db(self.b)
+    }
+
+    pub(crate) fn storage_err(&self, e: String) -> ApiError {
+        self.b.log(&format!("storage error: {e}"));
+        let l = e.to_ascii_lowercase();
+        if (l.contains("exceed") && l.contains("limit")) || l.contains("quota") {
+            // A daily free-plan quota (D1 rows written, or KV writes for the
+            // credential); resets at 00:00 UTC. Not a bug in the request.
             return ApiError::new(
                 503,
                 "storage_quota",
@@ -205,52 +214,11 @@ impl<'a, B: Backend> App<'a, B> {
         ApiError::internal("storage error")
     }
 
-    async fn kv_json<T: for<'de> Deserialize<'de>>(&self, key: &str) -> Result<Option<T>> {
-        match self.b.kv_get(key).await.map_err(|e| self.storage_err(e))? {
-            None => Ok(None),
-            Some(raw) => serde_json::from_slice(&raw)
-                .map(Some)
-                .map_err(|_| self.storage_err(format!("corrupt value at {key}"))),
-        }
-    }
-
-    async fn kv_put(&self, key: &str, value: &[u8], opts: PutOptions) -> Result<()> {
-        self.b
-            .kv_put(key, value, opts)
+    async fn is_banned(&self, github_id: u64) -> Result<bool> {
+        self.db()
+            .is_banned(github_id)
             .await
             .map_err(|e| self.storage_err(e))
-    }
-
-    async fn is_banned(&self, github_id: u64) -> Result<bool> {
-        Ok(self
-            .b
-            .kv_get(&format!("ban/{github_id}"))
-            .await
-            .map_err(|e| self.storage_err(e))?
-            .is_some())
-    }
-
-    /// Writes `evals/<id>` (never results; see [`StoredResults`]) with the
-    /// list summary of the eval as shown.
-    async fn save_record(&self, rec: &EvalRecord, results: Option<&StoredResults>) -> Result<()> {
-        let view = rec.clone().with_results(results);
-        let meta = serde_json::to_value(view.summary()).expect("json");
-        let opts = || PutOptions {
-            ttl: None,
-            metadata: Some(meta.clone()),
-        };
-        self.kv_put(
-            &format!("evals/{}", rec.eval_id),
-            &serde_json::to_vec(rec).expect("json"),
-            opts(),
-        )
-        .await?;
-        self.kv_put(
-            &format!("owner/{}/{}", rec.owner_id, rec.eval_id),
-            b"",
-            opts(),
-        )
-        .await
     }
 
     async fn load_record(&self, id: &str) -> Result<EvalRecord> {
@@ -259,13 +227,25 @@ impl<'a, B: Backend> App<'a, B> {
                 "eval id must be a lower-case UUID v4",
             ));
         }
-        self.kv_json(&format!("evals/{id}"))
-            .await?
+        self.db()
+            .eval(id)
+            .await
+            .map_err(|e| self.storage_err(e))?
             .ok_or_else(|| ApiError::not_found("no such eval"))
     }
 
     async fn load_results(&self, id: &str) -> Result<Option<StoredResults>> {
-        self.kv_json(&format!("results/{id}")).await
+        self.db().results(id).await.map_err(|e| self.storage_err(e))
+    }
+
+    /// Deletes the sealed credential once the eval is over. Read first: a
+    /// KV delete counts against the daily write quota, and usually the
+    /// workflow has deleted it already.
+    async fn drop_cred(&self, id: &str) {
+        let key = format!("cred/{id}");
+        if let Ok(Some(_)) = self.b.kv_get(&key).await {
+            let _ = self.b.kv_delete(&key).await;
+        }
     }
 
     // ---- auth -----------------------------------------------------------
@@ -281,8 +261,10 @@ impl<'a, B: Backend> App<'a, B> {
         };
         let bad = || ApiError::unauthorized("invalid or revoked API token");
         let rec: TokenRecord = self
-            .kv_json(&format!("token/{id}"))
-            .await?
+            .db()
+            .token(id)
+            .await
+            .map_err(|e| self.storage_err(e))?
             .ok_or_else(bad)?;
         if !tokens::matches(&rec, token) {
             return Err(bad());
@@ -421,21 +403,19 @@ impl<'a, B: Backend> App<'a, B> {
     // ---- tasksets -------------------------------------------------------
 
     async fn tasksets(&self) -> Result<Vec<TasksetInfo>> {
-        if let Ok(Some(raw)) = self.b.kv_get(TASKSETS_CACHE).await
-            && let Ok(list) = serde_json::from_slice::<Vec<TasksetInfo>>(&raw)
+        let now = self.b.now_s();
+        if let Ok(Some(raw)) = self.db().cache_get(TASKSETS_CACHE, now).await
+            && let Ok(list) = serde_json::from_str::<Vec<TasksetInfo>>(&raw)
         {
             return Ok(list);
         }
         let list = self.gh().tasksets().await?;
         let _ = self
-            .b
-            .kv_put(
+            .db()
+            .cache_put(
                 TASKSETS_CACHE,
-                &serde_json::to_vec(&list).expect("json"),
-                PutOptions {
-                    ttl: Some(TASKSETS_TTL_S),
-                    metadata: None,
-                },
+                &serde_json::to_string(&list).expect("json"),
+                Some(now + TASKSETS_TTL_S),
             )
             .await;
         Ok(list)
@@ -447,19 +427,7 @@ impl<'a, B: Backend> App<'a, B> {
         if !is_user_taskset_id(id) {
             return Ok(None);
         }
-        self.kv_json(&format!("{USER_TASKSETS}{id}")).await
-    }
-
-    async fn save_user_taskset(&self, u: &UserTaskset) -> Result<()> {
-        self.kv_put(
-            &format!("{USER_TASKSETS}{}", u.id),
-            &serde_json::to_vec(u).expect("json"),
-            PutOptions {
-                ttl: None,
-                metadata: Some(serde_json::to_value(u.meta()).expect("json")),
-            },
-        )
-        .await
+        self.db().taskset(id).await.map_err(|e| self.storage_err(e))
     }
 
     /// `GET /tasksets`: built-in tasksets for everyone; with a valid token
@@ -471,28 +439,18 @@ impl<'a, B: Backend> App<'a, B> {
             Some(_) => self.principal(req).await.ok(),
             None => None,
         };
-        let all = query_get(&parse_query(&req.query), "all") == Some("1");
-        let keys = self
-            .b
-            .kv_list(USER_TASKSETS, LIST_LIMIT)
+        let all = query_get(&parse_query(&req.query), "all") == Some("1")
+            && p.as_ref().is_some_and(|p| p.is_admin);
+        let users = self
+            .db()
+            .list_tasksets(
+                p.as_ref().map(|p| p.github_id),
+                all,
+                MAX_LISTED_USER_TASKSETS,
+            )
             .await
             .map_err(|e| self.storage_err(e))?;
-        let mut picked: Vec<(String, String)> = keys
-            .into_iter()
-            .filter_map(|k| {
-                let m: UserTasksetMeta = serde_json::from_value(k.metadata?).ok()?;
-                let mine = p.as_ref().is_some_and(|p| p.github_id == m.owner_id);
-                let admin_all = all && p.as_ref().is_some_and(|p| p.is_admin);
-                (mine || admin_all || (m.public && m.status == TS_READY))
-                    .then_some((m.created_at, k.name))
-            })
-            .collect();
-        picked.sort_by(|a, b| b.0.cmp(&a.0));
-        for (_, key) in picked.into_iter().take(MAX_LISTED_USER_TASKSETS) {
-            if let Some(u) = self.kv_json::<UserTaskset>(&key).await? {
-                list.push(user_taskset_info(&u));
-            }
-        }
+        list.extend(users.iter().map(user_taskset_info));
         Ok(Resp::json(200, &list))
     }
 
@@ -514,13 +472,7 @@ impl<'a, B: Backend> App<'a, B> {
                 "upload_hash must be 64 lower-case hex characters",
             ));
         }
-        let upload: UploadRecord = self
-            .kv_json(&format!("upload/{}", body.upload_hash))
-            .await?
-            .ok_or_else(|| ApiError::bad_request("upload_hash is unknown; upload first"))?;
-        if upload.owner_id != p.github_id {
-            return Err(ApiError::forbidden("upload_hash belongs to another user"));
-        }
+        let upload = self.own_upload(&p, &body.upload_hash).await?;
         if upload.kind != UploadKind::Taskset {
             return Err(ApiError::bad_request(format!(
                 "upload_hash was uploaded as {}, not taskset",
@@ -528,9 +480,6 @@ impl<'a, B: Backend> App<'a, B> {
             )));
         }
         let id = format!("u-{}", hex::encode(self.b.random_bytes(8)));
-        if self.load_user_taskset(&id).await?.is_some() {
-            return Err(ApiError::conflict("taskset id collision; retry"));
-        }
         let now = rfc3339(self.b.now_s());
         let mut u = UserTaskset {
             id: id.clone(),
@@ -545,7 +494,14 @@ impl<'a, B: Backend> App<'a, B> {
             created_at: now.clone(),
             updated_at: now,
         };
-        self.save_user_taskset(&u).await?;
+        if !self
+            .db()
+            .add_taskset(&u)
+            .await
+            .map_err(|e| self.storage_err(e))?
+        {
+            return Err(ApiError::conflict("taskset id collision; retry"));
+        }
         let worker_url = self
             .cfg
             .worker_url
@@ -564,7 +520,7 @@ impl<'a, B: Backend> App<'a, B> {
             u.status = TS_FAILED.into();
             u.error = Some("could not start packing; please retry".into());
             u.updated_at = rfc3339(self.b.now_s());
-            let _ = self.save_user_taskset(&u).await;
+            let _ = self.db().finish_packing(&u).await;
             return Err(e);
         }
         Ok(Resp::json(201, &json!({"id": id, "status": TS_PACKING})))
@@ -605,7 +561,10 @@ impl<'a, B: Backend> App<'a, B> {
         }
         u.public = body.public;
         u.updated_at = rfc3339(self.b.now_s());
-        self.save_user_taskset(&u).await?;
+        self.db()
+            .set_taskset_public(&u.id, u.public, &u.updated_at)
+            .await
+            .map_err(|e| self.storage_err(e))?;
         self.b.log(&format!(
             "admin {} set {id} public={}",
             p.github_id, u.public
@@ -666,7 +625,15 @@ impl<'a, B: Backend> App<'a, B> {
             }
         }
         u.updated_at = rfc3339(self.b.now_s());
-        self.save_user_taskset(&u).await?;
+        if !self
+            .db()
+            .finish_packing(&u)
+            .await
+            .map_err(|e| self.storage_err(e))?
+        {
+            // Another delivery got there first.
+            return Err(ApiError::conflict("taskset is already packed"));
+        }
         Ok(Resp::json(200, &json!({"ok": true, "status": u.status})))
     }
 
@@ -700,52 +667,63 @@ impl<'a, B: Backend> App<'a, B> {
             }
         }
         let hash = sha256_hex(&req.body);
-        let record_key = format!("upload/{hash}");
         let tag = release_tag(&hash).expect("sha256 hex");
         let gh = self.gh();
-        // The KV record is the claim and is written before the bytes reach
-        // GitHub, so a request cut short after its GitHub upload can be
-        // retried: the owner's retry finds its record and accepts the asset
-        // already there once its bytes check out. Bytes in the store without
-        // a record are someone else's (e.g. workflow outputs) and stay
-        // unclaimable.
-        if let Some(rec) = self.kv_json::<UploadRecord>(&record_key).await? {
-            if rec.owner_id != p.github_id {
-                return Err(ApiError::conflict("this blob belongs to another user"));
-            }
-            let release = gh.release(&tag).await?;
-            if gh.upload_asset(&release, &hash, req.body.clone()).await?
-                == UploadOutcome::AlreadyExists
-                && !gh.asset_matches(&tag, &hash).await?
-            {
-                return Err(ApiError::upstream("stored asset does not match its name"));
-            }
-            return Ok(Resp::json(200, &json!({"hash": hash})));
-        }
         let release = gh.release(&tag).await?;
+        // The D1 row is the claim and is written before the bytes reach
+        // GitHub, so a request cut short after its GitHub upload can be
+        // retried: the owner's retry finds its claim and accepts the asset
+        // already there once its bytes check out. Bytes in the store without
+        // a claim are someone else's (e.g. workflow outputs) and stay
+        // unclaimable. The primary key makes concurrent claims safe.
         let rec = UploadRecord {
             owner_id: p.github_id,
             kind,
             size: req.body.len() as u64,
             created_at: rfc3339(self.b.now_s()),
         };
-        self.kv_put(
-            &record_key,
-            &serde_json::to_vec(&rec).expect("json"),
-            PutOptions::default(),
-        )
-        .await?;
-        if gh.upload_asset(&release, &hash, req.body.clone()).await? == UploadOutcome::AlreadyExists
-        {
-            // Stored earlier but not through this user's upload: withdraw
-            // the claim and refuse, so nobody can claim someone else's
-            // sealed blob.
-            let _ = self.b.kv_delete(&record_key).await;
-            return Err(ApiError::conflict(
-                "a blob with these bytes already exists; encrypt again and re-upload",
-            ));
+        let claim = self
+            .db()
+            .claim_upload(&hash, &rec)
+            .await
+            .map_err(|e| self.storage_err(e))?;
+        let stored = match claim {
+            Claim::Other => return Err(ApiError::conflict("this blob belongs to another user")),
+            Claim::Own | Claim::New => gh.upload_asset(&release, &hash, req.body.clone()).await?,
+        };
+        match (claim, stored) {
+            (Claim::New, UploadOutcome::Created) => {
+                return Ok(Resp::json(201, &json!({"hash": hash})));
+            }
+            (Claim::New, UploadOutcome::AlreadyExists) => {
+                // Stored earlier but not through this user's upload: withdraw
+                // the claim and refuse, so nobody can claim someone else's
+                // sealed blob.
+                let _ = self.db().withdraw_upload(&hash, p.github_id).await;
+                return Err(ApiError::conflict(
+                    "a blob with these bytes already exists; encrypt again and re-upload",
+                ));
+            }
+            (_, UploadOutcome::AlreadyExists) if !gh.asset_matches(&tag, &hash).await? => {
+                return Err(ApiError::upstream("stored asset does not match its name"));
+            }
+            _ => {}
         }
-        Ok(Resp::json(201, &json!({"hash": hash})))
+        Ok(Resp::json(200, &json!({"hash": hash})))
+    }
+
+    /// The caller's own upload record of `hash`.
+    async fn own_upload(&self, p: &Principal, hash: &str) -> Result<UploadRecord> {
+        let upload = self
+            .db()
+            .upload(hash)
+            .await
+            .map_err(|e| self.storage_err(e))?
+            .ok_or_else(|| ApiError::bad_request("upload_hash is unknown; upload first"))?;
+        if upload.owner_id != p.github_id {
+            return Err(ApiError::forbidden("upload_hash belongs to another user"));
+        }
+        Ok(upload)
     }
 
     // ---- evals ----------------------------------------------------------
@@ -754,22 +732,7 @@ impl<'a, B: Backend> App<'a, B> {
         let p = self.principal(req).await?;
         let v: ValidEval = EvalRequest::parse(&req.body)?.validate(&keys::current().key_id)?;
 
-        if self
-            .b
-            .kv_get(&format!("evals/{}", v.eval_id))
-            .await
-            .map_err(|e| self.storage_err(e))?
-            .is_some()
-        {
-            return Err(ApiError::conflict("eval_id already used"));
-        }
-        let upload: UploadRecord = self
-            .kv_json(&format!("upload/{}", v.upload_hash))
-            .await?
-            .ok_or_else(|| ApiError::bad_request("upload_hash is unknown; upload first"))?;
-        if upload.owner_id != p.github_id {
-            return Err(ApiError::forbidden("upload_hash belongs to another user"));
-        }
+        let upload = self.own_upload(&p, &v.upload_hash).await?;
         if upload.kind != UploadKind::from(v.mode) {
             return Err(ApiError::bad_request(format!(
                 "upload_hash was uploaded as {}, not {}",
@@ -820,19 +783,6 @@ impl<'a, B: Backend> App<'a, B> {
             }
         };
 
-        if let Some(cred) = &v.cred {
-            // Stored exactly as sealed by the page; returned unchanged by
-            // GET /internal/cred/:id.
-            self.kv_put(
-                &format!("cred/{}", v.eval_id),
-                cred,
-                PutOptions {
-                    ttl: Some(CRED_TTL_S),
-                    metadata: None,
-                },
-            )
-            .await?;
-        }
         let now = self.b.now_s();
         let mut rec = EvalRecord {
             eval_id: v.eval_id.clone(),
@@ -857,7 +807,38 @@ impl<'a, B: Backend> App<'a, B> {
             download_sha256: None,
             updated_at: rfc3339(now),
         };
-        self.save_record(&rec, None).await?;
+        // The primary key claims the eval id.
+        if !self
+            .db()
+            .add_eval(&rec)
+            .await
+            .map_err(|e| self.storage_err(e))?
+        {
+            return Err(ApiError::conflict("eval_id already used"));
+        }
+        let fail = |rec: &mut EvalRecord| {
+            rec.status = FAILED.into();
+            rec.updated_at = rfc3339(self.b.now_s());
+        };
+        if let Some(cred) = &v.cred {
+            // Stored exactly as sealed by the page; returned unchanged by
+            // GET /internal/cred/:id. KV, so it expires on its own.
+            let put = self
+                .b
+                .kv_put(
+                    &format!("cred/{}", v.eval_id),
+                    cred,
+                    PutOptions {
+                        ttl: Some(CRED_TTL_S),
+                    },
+                )
+                .await;
+            if let Err(e) = put {
+                fail(&mut rec);
+                let _ = self.db().save_refresh(&rec).await;
+                return Err(self.storage_err(e));
+            }
+        }
 
         let worker_url = self
             .cfg
@@ -866,10 +847,11 @@ impl<'a, B: Backend> App<'a, B> {
             .unwrap_or_else(|| req.origin.clone());
         let (workflow, inputs) = dispatch::inputs(self.cfg, &rec, v.cred.is_some(), &worker_url);
         if let Err(e) = self.gh().dispatch(&workflow, &inputs).await {
-            let _ = self.b.kv_delete(&format!("cred/{}", rec.eval_id)).await;
-            rec.status = FAILED.into();
-            rec.updated_at = rfc3339(self.b.now_s());
-            let _ = self.save_record(&rec, None).await;
+            if v.cred.is_some() {
+                let _ = self.b.kv_delete(&format!("cred/{}", rec.eval_id)).await;
+            }
+            fail(&mut rec);
+            let _ = self.db().save_refresh(&rec).await;
             return Err(e);
         }
         Ok(Resp::json(201, &json!({"eval_id": rec.eval_id})))
@@ -878,22 +860,17 @@ impl<'a, B: Backend> App<'a, B> {
     async fn list_evals(&self, req: &Req) -> Result<Resp> {
         let p = self.principal(req).await?;
         let q = parse_query(&req.query);
-        let prefix = if query_get(&q, "all") == Some("1") {
+        let owner = if query_get(&q, "all") == Some("1") {
             authz::require_admin(&p)?;
-            "evals/".to_string()
+            None
         } else {
-            format!("owner/{}/", p.github_id)
+            Some(p.github_id)
         };
-        let keys = self
-            .b
-            .kv_list(&prefix, LIST_LIMIT)
+        let list = self
+            .db()
+            .list_evals(owner, LIST_LIMIT)
             .await
             .map_err(|e| self.storage_err(e))?;
-        let mut list: Vec<EvalSummary> = keys
-            .into_iter()
-            .filter_map(|k| serde_json::from_value(k.metadata?).ok())
-            .collect();
-        list.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         Ok(Resp::json(200, &list))
     }
 
@@ -904,22 +881,8 @@ impl<'a, B: Backend> App<'a, B> {
             return Err(ApiError::forbidden("not your eval"));
         }
         let results = self.load_results(id).await?;
-        let shown = rec.clone().with_results(results.as_ref());
-        let mut dirty = !is_terminal(&shown.status) && self.refresh(&mut rec).await;
-        // A record written from a stale read lags its final results; bring
-        // it (and the list summary) back in line.
-        if let Some(r) = &results
-            && is_terminal(&r.status)
-            && rec.status != r.status
-        {
-            rec.status.clone_from(&r.status);
-            dirty = true;
-        }
-        if dirty {
-            rec.updated_at = rfc3339(self.b.now_s());
-            if let Err(e) = self.save_record(&rec, results.as_ref()).await {
-                self.b.log(&format!("refresh save failed: {}", e.message));
-            }
+        if !is_terminal(&rec.clone().with_results(results.as_ref()).status) {
+            self.refresh(&mut rec).await;
         }
         let rec = rec.with_results(results.as_ref());
         let mut out = json!({
@@ -950,44 +913,47 @@ impl<'a, B: Backend> App<'a, B> {
         Ok(Resp::json(200, &out))
     }
 
-    /// Poll GitHub for an eval that has not finished. Returns whether the
-    /// record changed. GitHub errors leave it as it was. Status only moves
-    /// forward, so a precise status reported by the workflow is never
-    /// replaced by the coarser estimate.
-    async fn refresh(&self, rec: &mut EvalRecord) -> bool {
-        if is_terminal(&rec.status) {
-            return false;
-        }
-        let gh = self.gh();
-        let workflow = match rec.mode {
+    fn workflow_of(&self, mode: Mode) -> &str {
+        match mode {
             Mode::Agent => &self.cfg.eval_workflow,
             Mode::App => &self.cfg.score_workflow,
+        }
+    }
+
+    /// Poll GitHub for an eval that has not finished and estimate its
+    /// status. Status only moves forward, so a precise status reported by
+    /// the workflow is never replaced by the coarser estimate. The estimate
+    /// is shown, not stored: the record is written only when the run turns
+    /// out to be over (or first seen finished without results, which
+    /// starts the grace period). GitHub errors leave it as it was.
+    async fn refresh(&self, rec: &mut EvalRecord) {
+        if is_terminal(&rec.status) {
+            return;
+        }
+        let gh = self.gh();
+        let found = match rec.run_id {
+            None => gh
+                .find_run(self.workflow_of(rec.mode), &rec.eval_id, rec.created_s)
+                .await
+                .transpose(),
+            Some(id) => Some(gh.run(id).await),
         };
-        let run = match rec.run_id {
-            None => match gh.find_run(workflow, &rec.eval_id, rec.created_s).await {
-                Ok(Some(run)) => run,
-                Ok(None) => return false,
-                Err(e) => {
-                    self.b
-                        .log(&format!("refresh {}: {}", rec.eval_id, e.message));
-                    return false;
-                }
-            },
-            Some(id) => match gh.run(id).await {
-                Ok(run) => run,
-                Err(e) => {
-                    self.b
-                        .log(&format!("refresh {}: {}", rec.eval_id, e.message));
-                    return false;
-                }
-            },
+        let run = match found {
+            None => return,
+            Some(Ok(run)) => run,
+            Some(Err(e)) => {
+                self.b
+                    .log(&format!("refresh {}: {}", rec.eval_id, e.message));
+                return;
+            }
         };
-        let before = (rec.status.clone(), rec.run_id, rec.run_completed_s);
+        let completed_before = rec.run_completed_s;
         let job = if run.status == "in_progress" {
             gh.current_job(run.id).await.ok().flatten()
         } else {
             None
         };
+        let now = self.b.now_s();
         let estimate = match view_run(
             &run,
             job.as_deref(),
@@ -995,9 +961,8 @@ impl<'a, B: Backend> App<'a, B> {
         ) {
             RunView::Status(s) => Some(s),
             RunView::CompletedOk => {
-                // Results are posted from inside the run; allow for KV
-                // propagation before calling it failed.
-                let now = self.b.now_s();
+                // Results are posted from inside the run; allow for a late
+                // delivery before calling it failed.
                 let since = *rec.run_completed_s.get_or_insert(now);
                 (now.saturating_sub(since) >= RESULTS_GRACE_S).then(|| FAILED.to_owned())
             }
@@ -1007,14 +972,18 @@ impl<'a, B: Backend> App<'a, B> {
         {
             rec.status = s;
         }
-        let url_changed = rec.run_url.as_deref() != Some(run.html_url.as_str());
         rec.run_id = Some(run.id);
         rec.run_url = Some(run.html_url);
+        if is_terminal(&rec.status) || rec.run_completed_s != completed_before {
+            rec.updated_at = rfc3339(now);
+            if let Err(e) = self.db().save_refresh(rec).await {
+                self.b.log(&format!("refresh save failed: {e}"));
+            }
+        }
         if is_terminal(&rec.status) {
             // The run is over; the key has no further use.
-            let _ = self.b.kv_delete(&format!("cred/{}", rec.eval_id)).await;
+            self.drop_cred(&rec.eval_id).await;
         }
-        url_changed || before != (rec.status.clone(), rec.run_id, rec.run_completed_s)
     }
 
     async fn download(&self, req: &Req, id: &str) -> Result<Resp> {
@@ -1064,19 +1033,29 @@ impl<'a, B: Backend> App<'a, B> {
 
     async fn internal_delete_cred(&self, req: &Req, id: &str) -> Result<Resp> {
         let id = self.internal_id(req, id)?;
-        self.b
-            .kv_delete(&format!("cred/{id}"))
+        let key = format!("cred/{id}");
+        // Read first: a delete is a KV write even when nothing is there.
+        if self
+            .b
+            .kv_get(&key)
             .await
-            .map_err(|e| self.storage_err(e))?;
+            .map_err(|e| self.storage_err(e))?
+            .is_some()
+        {
+            self.b
+                .kv_delete(&key)
+                .await
+                .map_err(|e| self.storage_err(e))?;
+        }
         Ok(Resp::empty(204))
     }
 
     async fn internal_results(&self, req: &Req, id: &str) -> Result<Resp> {
         let id = self.internal_id(req, id)?;
-        let mut rec = self.load_record(id).await?;
+        let rec = self.load_record(id).await?;
         let results = parse_results(&req.body, id)?;
         let prev = self.load_results(id).await?;
-        let mut stored = StoredResults {
+        let new = StoredResults {
             manifest: results.manifest,
             download_sha256: results
                 .download
@@ -1085,43 +1064,36 @@ impl<'a, B: Backend> App<'a, B> {
             updated_at: rfc3339(self.b.now_s()),
         };
         // A repeated delivery (the poster retries when an answer is lost)
-        // keeps what is stored and writes only what is still missing.
-        let repeat = prev.filter(|p| {
-            p.manifest == stored.manifest
-                && p.download_sha256 == stored.download_sha256
-                && p.status == stored.status
-        });
-        if let Some(p) = repeat {
-            stored.updated_at = p.updated_at;
-        } else {
-            // The results key is the source of truth and is written first;
-            // the record write below only mirrors the status for the list.
-            self.kv_put(
-                &format!("results/{id}"),
-                &serde_json::to_vec(&stored).expect("json"),
-                PutOptions::default(),
-            )
-            .await?;
-        }
-        let mirrored = if is_terminal(&stored.status) {
-            stored.status.clone()
-        } else {
-            rec.status.clone()
+        // writes nothing; nor does a late partial delivery after final
+        // results (the upsert's WHERE enforces the same under races).
+        let stored = match prev {
+            Some(p)
+                if (p.manifest == new.manifest
+                    && p.download_sha256 == new.download_sha256
+                    && p.status == new.status)
+                    || (is_terminal(&p.status) && !is_terminal(&new.status)) =>
+            {
+                p
+            }
+            _ => {
+                self.db()
+                    .put_results(id, &new)
+                    .await
+                    .map_err(|e| self.storage_err(e))?;
+                new
+            }
         };
-        if rec.status != mirrored || rec.updated_at < stored.updated_at {
-            rec.status = mirrored;
-            rec.updated_at.clone_from(&stored.updated_at);
-            self.save_record(&rec, Some(&stored)).await?;
-        }
         if is_terminal(&stored.status) {
-            let _ = self.b.kv_delete(&format!("cred/{id}")).await;
+            self.drop_cred(id).await;
         }
         let status = rec.with_results(Some(&stored)).status;
         Ok(Resp::json(200, &json!({"ok": true, "status": status})))
     }
 
     /// Progress from the workflow: `{"status": "building" | "running:<stage>"
-    /// | "scoring" | "failed"}`. `done` comes with the results.
+    /// | "scoring" | "failed"}`. `done` comes with the results. One row
+    /// update per change; `building` is not stored at all (the GitHub
+    /// estimate shown by `GET /evals/:id` says the same).
     async fn internal_status(&self, req: &Req, id: &str) -> Result<Resp> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -1129,7 +1101,7 @@ impl<'a, B: Backend> App<'a, B> {
             status: String,
         }
         let id = self.internal_id(req, id)?;
-        let mut rec = self.load_record(id).await?;
+        let rec = self.load_record(id).await?;
         if req.body.len() > 4096 {
             return Err(ApiError::too_large(4096));
         }
@@ -1145,17 +1117,38 @@ impl<'a, B: Backend> App<'a, B> {
         if is_terminal(&shown) {
             return Err(ApiError::conflict(format!("eval is already {shown}")));
         }
-        if rec.status == body.status {
-            // A repeated report: nothing to write.
-            return Ok(Resp::json(200, &json!({"ok": true, "status": rec.status})));
+        if rec.status == body.status || body.status == BUILDING {
+            // Nothing to write.
+            return Ok(Resp::json(200, &json!({"ok": true, "status": shown})));
         }
-        rec.status = body.status;
-        rec.updated_at = rfc3339(self.b.now_s());
-        self.save_record(&rec, results.as_ref()).await?;
-        if is_terminal(&rec.status) {
-            let _ = self.b.kv_delete(&format!("cred/{id}")).await;
+        // The first stored report also records the run, so queries need not
+        // search for it.
+        let run = match rec.run_id {
+            Some(_) => None,
+            None => self
+                .gh()
+                .find_run(self.workflow_of(rec.mode), id, rec.created_s)
+                .await
+                .ok()
+                .flatten(),
+        };
+        let updated = self
+            .db()
+            .set_status(
+                id,
+                &body.status,
+                &rfc3339(self.b.now_s()),
+                run.as_ref().map(|r| (r.id, r.html_url.as_str())),
+            )
+            .await
+            .map_err(|e| self.storage_err(e))?;
+        if !updated {
+            return Err(ApiError::conflict("eval is already settled"));
         }
-        Ok(Resp::json(200, &json!({"ok": true, "status": rec.status})))
+        if is_terminal(&body.status) {
+            self.drop_cred(id).await;
+        }
+        Ok(Resp::json(200, &json!({"ok": true, "status": body.status})))
     }
 
     // ---- personal API tokens --------------------------------------------
@@ -1183,13 +1176,12 @@ impl<'a, B: Backend> App<'a, B> {
                 tokens::MAX_NAME
             ))
         })?;
-        let prefix = format!("tokens/{}/", p.github_id);
         let existing = self
-            .b
-            .kv_list(&prefix, tokens::MAX_PER_USER + 1)
+            .db()
+            .token_count(p.github_id)
             .await
             .map_err(|e| self.storage_err(e))?;
-        if existing.len() >= tokens::MAX_PER_USER {
+        if existing >= tokens::MAX_PER_USER as u64 {
             return Err(ApiError::conflict(format!(
                 "at most {} tokens; revoke one first",
                 tokens::MAX_PER_USER
@@ -1209,21 +1201,14 @@ impl<'a, B: Backend> App<'a, B> {
             name,
             created_at,
         };
-        self.kv_put(
-            &format!("token/{id}"),
-            &serde_json::to_vec(&rec).expect("json"),
-            PutOptions::default(),
-        )
-        .await?;
-        self.kv_put(
-            &format!("{prefix}{id}"),
-            b"",
-            PutOptions {
-                ttl: None,
-                metadata: Some(serde_json::to_value(&summary).expect("json")),
-            },
-        )
-        .await?;
+        if !self
+            .db()
+            .add_token(&id, &rec)
+            .await
+            .map_err(|e| self.storage_err(e))?
+        {
+            return Err(ApiError::conflict("token id collision; retry"));
+        }
         let mut out = serde_json::to_value(&summary).expect("json");
         out["token"] = json!(token);
         Ok(Resp::json(201, &out))
@@ -1231,16 +1216,11 @@ impl<'a, B: Backend> App<'a, B> {
 
     async fn list_tokens(&self, req: &Req) -> Result<Resp> {
         let p = self.session_principal(req).await?;
-        let keys = self
-            .b
-            .kv_list(&format!("tokens/{}/", p.github_id), LIST_LIMIT)
+        let list = self
+            .db()
+            .tokens_of(p.github_id)
             .await
             .map_err(|e| self.storage_err(e))?;
-        let mut list: Vec<TokenSummary> = keys
-            .into_iter()
-            .filter_map(|k| serde_json::from_value(k.metadata?).ok())
-            .collect();
-        list.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         Ok(Resp::json(200, &list))
     }
 
@@ -1249,19 +1229,14 @@ impl<'a, B: Backend> App<'a, B> {
         if !tokens::is_id(id) {
             return Err(ApiError::bad_request("token id must be 16 hex characters"));
         }
-        let key = format!("token/{id}");
-        match self.kv_json::<TokenRecord>(&key).await? {
-            Some(rec) if rec.owner_id == p.github_id => {}
-            _ => return Err(ApiError::not_found("no such token")),
+        if !self
+            .db()
+            .delete_token(id, p.github_id)
+            .await
+            .map_err(|e| self.storage_err(e))?
+        {
+            return Err(ApiError::not_found("no such token"));
         }
-        self.b
-            .kv_delete(&key)
-            .await
-            .map_err(|e| self.storage_err(e))?;
-        self.b
-            .kv_delete(&format!("tokens/{}/{id}", p.github_id))
-            .await
-            .map_err(|e| self.storage_err(e))?;
         Ok(Resp::empty(204))
     }
 
@@ -1282,24 +1257,21 @@ impl<'a, B: Backend> App<'a, B> {
         }
         let body: Body = serde_json::from_slice(&req.body)
             .map_err(|e| ApiError::bad_request(format!("invalid request body: {e}")))?;
-        let key = format!("ban/{}", body.github_id);
         if ban {
             authz::check_ban_target(&p, body.github_id, self.cfg.is_admin(body.github_id))?;
             let reason: Option<String> = body.reason.map(|r| r.chars().take(200).collect());
-            let value = json!({
-                "by": p.github_id,
-                "at": rfc3339(self.b.now_s()),
-                "reason": reason,
-            });
-            self.kv_put(
-                &key,
-                &serde_json::to_vec(&value).expect("json"),
-                PutOptions::default(),
-            )
-            .await?;
+            self.db()
+                .ban(
+                    body.github_id,
+                    p.github_id,
+                    &rfc3339(self.b.now_s()),
+                    reason.as_deref(),
+                )
+                .await
+                .map_err(|e| self.storage_err(e))?;
         } else {
-            self.b
-                .kv_delete(&key)
+            self.db()
+                .unban(body.github_id)
                 .await
                 .map_err(|e| self.storage_err(e))?;
         }
@@ -1313,5 +1285,148 @@ impl<'a, B: Backend> App<'a, B> {
             200,
             &json!({"ok": true, "github_id": body.github_id, "banned": ban}),
         ))
+    }
+
+    // ---- one-off KV → D1 migration --------------------------------------
+
+    /// `POST /internal/migrate-kv {"cursor"?}`: copies up to [`MIGRATE_BATCH`]
+    /// records of the old KV store into D1 per call and answers with the
+    /// cursor of the next call (`null` when done). Rows already in D1 are
+    /// kept (`ON CONFLICT DO NOTHING`), so calls can be repeated freely.
+    /// KV is only read.
+    async fn migrate_kv(&self, req: &Req) -> Result<Resp> {
+        #[derive(Deserialize, Default)]
+        #[serde(deny_unknown_fields)]
+        struct Body {
+            #[serde(default)]
+            cursor: Option<String>,
+        }
+        self.internal_auth(req)?;
+        if req.body.len() > 4096 {
+            return Err(ApiError::too_large(4096));
+        }
+        let body: Body = if req.body.iter().all(u8::is_ascii_whitespace) {
+            Body::default()
+        } else {
+            serde_json::from_slice(&req.body)
+                .map_err(|e| ApiError::bad_request(format!("invalid request body: {e}")))?
+        };
+        let bad = || ApiError::bad_request("cursor must come from a previous answer");
+        let cursor = body.cursor.unwrap_or_default();
+        let (stage, kv_cursor) = match cursor.split_once(':') {
+            Some((s, c)) => (s.parse::<usize>().map_err(|_| bad())?, Some(c)),
+            None if cursor.is_empty() => (0, None),
+            None => (cursor.parse::<usize>().map_err(|_| bad())?, None),
+        };
+        let prefix = *MIGRATE_PREFIXES.get(stage).ok_or_else(bad)?;
+        let page = self
+            .b
+            .kv_list(prefix, kv_cursor, MIGRATE_BATCH)
+            .await
+            .map_err(|e| self.storage_err(e))?;
+        let mut stmts = Vec::new();
+        let mut skipped = Vec::new();
+        for k in &page.keys {
+            match self.migration_stmts(prefix, &k.name).await? {
+                Some(mut s) => stmts.append(&mut s),
+                None => skipped.push(k.name.clone()),
+            }
+        }
+        self.db()
+            .batch(&stmts)
+            .await
+            .map_err(|e| self.storage_err(e))?;
+        let next = match page.cursor {
+            Some(c) => Some(format!("{stage}:{c}")),
+            None if stage + 1 < MIGRATE_PREFIXES.len() => Some((stage + 1).to_string()),
+            None => None,
+        };
+        self.b.log(&format!(
+            "migrated {} keys under {prefix}",
+            page.keys.len() - skipped.len()
+        ));
+        Ok(Resp::json(
+            200,
+            &json!({
+                "prefix": prefix,
+                "copied": page.keys.len() - skipped.len(),
+                "skipped": skipped,
+                "next": next,
+            }),
+        ))
+    }
+
+    async fn kv_record<T: for<'de> Deserialize<'de>>(&self, key: &str) -> Result<Option<T>> {
+        let raw = self.b.kv_get(key).await.map_err(|e| self.storage_err(e))?;
+        Ok(raw.and_then(|r| serde_json::from_slice(&r).ok()))
+    }
+
+    /// The D1 inserts for one old KV key; `None` for a key that is not a
+    /// record of that kind (or no longer readable).
+    async fn migration_stmts(&self, prefix: &str, key: &str) -> Result<Option<Vec<Stmt>>> {
+        let name = &key[prefix.len()..];
+        Ok(match prefix {
+            "upload/" if crate::shard::is_hash(name) => self
+                .kv_record::<UploadRecord>(key)
+                .await?
+                .map(|u| vec![store::insert_upload(name, &u)]),
+            "evals/" if is_uuid_v4(name) => {
+                let Some(mut rec) = self.kv_record::<EvalRecord>(key).await? else {
+                    return Ok(None);
+                };
+                // Results: the results key, else what older records kept
+                // inline.
+                let results = match self
+                    .kv_record::<StoredResults>(&format!("results/{name}"))
+                    .await?
+                {
+                    Some(mut r) => {
+                        if r.download_sha256.is_none() {
+                            r.download_sha256.clone_from(&rec.download_sha256);
+                        }
+                        Some(r)
+                    }
+                    None => rec.manifest.take().map(|m| StoredResults {
+                        manifest: m,
+                        download_sha256: rec.download_sha256.clone(),
+                        status: rec.status.clone(),
+                        updated_at: rec.updated_at.clone(),
+                    }),
+                };
+                let mut out = vec![store::insert_eval(&rec)];
+                out.extend(results.map(|r| store::insert_results(name, &r)));
+                Some(out)
+            }
+            "tasksets/" if is_user_taskset_id(name) => self
+                .kv_record::<UserTaskset>(key)
+                .await?
+                .filter(|u| u.id == name)
+                .map(|u| vec![store::insert_taskset(&u)]),
+            "token/" if tokens::is_id(name) => self
+                .kv_record::<TokenRecord>(key)
+                .await?
+                .map(|t| vec![store::insert_token(name, &t)]),
+            "ban/" => {
+                #[derive(Deserialize)]
+                struct Ban {
+                    #[serde(default)]
+                    by: u64,
+                    #[serde(default)]
+                    at: String,
+                    #[serde(default)]
+                    reason: Option<String>,
+                }
+                match (name.parse::<u64>(), self.kv_record::<Ban>(key).await?) {
+                    (Ok(gid), Some(b)) if gid > 0 => Some(vec![store::insert_ban(
+                        gid,
+                        b.by,
+                        &b.at,
+                        b.reason.as_deref(),
+                    )]),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
     }
 }

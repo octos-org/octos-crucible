@@ -1,23 +1,45 @@
 //! Workers runtime glue: converts requests/responses and implements
-//! [`Backend`] over Workers KV and `fetch`. Everything else is in
+//! [`Backend`] over D1, Workers KV and `fetch`. Everything else is in
 //! platform-independent modules.
 
+use worker::wasm_bindgen::JsValue;
 use worker::{
-    Context, Date, Env, Fetch, Headers, KvStore, Method, Request, RequestInit, Response,
-    ResponseBuilder, console_error, console_log, event, js_sys,
+    Context, D1Database, D1PreparedStatement, Date, Env, Fetch, Headers, KvStore, Method, Request,
+    RequestInit, Response, ResponseBuilder, console_error, console_log, event, js_sys,
 };
 
 use crate::app;
 use crate::config::Config;
-use crate::http::{Backend, HttpRequest, HttpResponse, KvKey, PutOptions, Req, Resp};
+use crate::http::{
+    Backend, HttpRequest, HttpResponse, KvKey, KvPage, PutOptions, Req, Resp, Row, SqlArg, Stmt,
+};
 use crate::model::MAX_UPLOAD;
 
 const KV_BINDING: &str = "CRUCIBLE_KV";
+const DB_BINDING: &str = "CRUCIBLE_DB";
 /// Largest body read at all; per-route limits are enforced by the handlers.
 const MAX_BODY: usize = MAX_UPLOAD + 64 * 1024;
 
 struct WorkerBackend {
     kv: KvStore,
+    db: D1Database,
+}
+
+fn js_arg(a: &SqlArg) -> JsValue {
+    match a {
+        SqlArg::Null => JsValue::NULL,
+        // Ids, sizes and unix seconds: all well below 2^53.
+        SqlArg::Int(i) => JsValue::from_f64(*i as f64),
+        SqlArg::Real(f) => JsValue::from_f64(*f),
+        SqlArg::Text(s) => JsValue::from_str(s),
+    }
+}
+
+impl WorkerBackend {
+    fn stmt(&self, sql: &str, args: &[SqlArg]) -> Result<D1PreparedStatement, String> {
+        let args: Vec<JsValue> = args.iter().map(js_arg).collect();
+        self.db.prepare(sql).bind(&args).map_err(|e| e.to_string())
+    }
 }
 
 impl Backend for WorkerBackend {
@@ -30,9 +52,6 @@ impl Backend for WorkerBackend {
         if let Some(ttl) = opts.ttl {
             put = put.expiration_ttl(ttl);
         }
-        if let Some(meta) = opts.metadata {
-            put = put.metadata(meta).map_err(|e| e.to_string())?;
-        }
         put.execute().await.map_err(|e| e.to_string())
     }
 
@@ -40,23 +59,57 @@ impl Backend for WorkerBackend {
         self.kv.delete(key).await.map_err(|e| e.to_string())
     }
 
-    async fn kv_list(&self, prefix: &str, limit: usize) -> Result<Vec<KvKey>, String> {
-        let resp = self
-            .kv
-            .list()
-            .prefix(prefix.to_owned())
-            .limit(limit as u64)
-            .execute()
+    async fn kv_list(
+        &self,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<KvPage, String> {
+        let mut list = self.kv.list().prefix(prefix.to_owned()).limit(limit as u64);
+        if let Some(c) = cursor {
+            list = list.cursor(c.to_owned());
+        }
+        let resp = list.execute().await.map_err(|e| e.to_string())?;
+        Ok(KvPage {
+            keys: resp
+                .keys
+                .into_iter()
+                .map(|k| KvKey { name: k.name })
+                .collect(),
+            cursor: resp.cursor.filter(|c| !resp.list_complete && !c.is_empty()),
+        })
+    }
+
+    async fn db_query(&self, sql: &str, args: &[SqlArg]) -> Result<Vec<Row>, String> {
+        let res = self
+            .stmt(sql, args)?
+            .all()
             .await
             .map_err(|e| e.to_string())?;
-        Ok(resp
-            .keys
-            .into_iter()
-            .map(|k| KvKey {
-                name: k.name,
-                metadata: k.metadata,
-            })
-            .collect())
+        res.results::<Row>().map_err(|e| e.to_string())
+    }
+
+    async fn db_exec(&self, sql: &str, args: &[SqlArg]) -> Result<u64, String> {
+        let res = self
+            .stmt(sql, args)?
+            .run()
+            .await
+            .map_err(|e| e.to_string())?;
+        let changes = res
+            .meta()
+            .map_err(|e| e.to_string())?
+            .and_then(|m| m.changes)
+            .unwrap_or(0);
+        Ok(changes as u64)
+    }
+
+    async fn db_batch(&self, stmts: &[Stmt]) -> Result<(), String> {
+        let stmts = stmts
+            .iter()
+            .map(|s| self.stmt(s.sql, &s.args))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.db.batch(stmts).await.map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     async fn fetch(&self, r: HttpRequest) -> Result<HttpResponse, String> {
@@ -124,6 +177,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> worker::Result<Resp
     };
     let backend = WorkerBackend {
         kv: env.kv(KV_BINDING)?,
+        db: env.d1(DB_BINDING)?,
     };
 
     let declared = req

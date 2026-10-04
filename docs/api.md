@@ -6,7 +6,7 @@ Worker 只经手密文：上传文件和模型凭据都是浏览器用平台公�
 
 ## 通用约定
 
-- **认证**：`GET /auth/callback` 把会话令牌放在 Pages 地址的片段里（`#token=<令牌>`）；之后每个请求带 `Authorization: Bearer <令牌>`。用户接口也接受个人 API 令牌（`crt_...`，见下文“命令行令牌”），它代表本人但从不具备管理员权限。不用 cookie 认证（OAuth 往返期间有一个只作用于 `/auth/callback` 的短期 cookie，用来防登录 CSRF）。令牌是 HMAC-SHA256 签名，有效期 24 小时。被封禁的用户（KV `ban/<github_id>`）每次请求都会被拒绝（403 `banned`）。
+- **认证**：`GET /auth/callback` 把会话令牌放在 Pages 地址的片段里（`#token=<令牌>`）；之后每个请求带 `Authorization: Bearer <令牌>`。用户接口也接受个人 API 令牌（`crt_...`，见下文“命令行令牌”），它代表本人但从不具备管理员权限。不用 cookie 认证（OAuth 往返期间有一个只作用于 `/auth/callback` 的短期 cookie，用来防登录 CSRF）。令牌是 HMAC-SHA256 签名，有效期 24 小时。被封禁的用户（D1 表 `bans`）每次请求都会被拒绝（403 `banned`）。
 - **CORS**：只对 `PAGES_ORIGIN` 放行，允许的方法为 `GET, POST, DELETE, OPTIONS`，允许的请求头为 `Authorization, Content-Type, X-Upload-Kind`。`/internal/*` 不响应跨域请求。
 - **错误**：所有错误都是 `{"error": {"code": "...", "message": "..."}}`，HTTP 状态码见下表。
 
@@ -26,7 +26,7 @@ Worker 只经手密文：上传文件和模型凭据都是浏览器用平台公�
 | `payload_too_large` | 413 | |
 | `upstream_error` | 502 | GitHub 调用失败 |
 | `internal` | 500 | 存储错误或配置错误 |
-| `storage_quota` | 503 | KV 当天的写入额度已用完（免费版每天 1000 次，UTC 0 点重置）；稍后重试 |
+| `storage_quota` | 503 | 当天的写入额度已用完（免费版 D1 每天 10 万行、KV 每天 1000 次，UTC 0 点重置）；稍后重试 |
 
 - **评测状态**（`status`）只有这几种取值：`queued` | `building` | `running:<阶段名>` | `scoring` | `done` | `failed`。`done` 和 `failed` 是终态。状态只会前进，不会倒退。
 - **eval_id**：前端生成的小写 UUID v4。
@@ -49,7 +49,7 @@ GitHub 回调。换取 token、读取用户之后，用户的 GitHub token 立�
 
 ## 命令行令牌
 
-供 `crucible submit` / `crucible status` 使用。令牌格式 `crt_<id 16 位十六进制>_<64 位十六进制>`；KV 中只存整串令牌的 SHA-256，明文只在创建时返回一次。令牌可代替会话令牌调用用户接口（`/me`、`/uploads`、`/evals...`），身份为令牌的主人，`is_admin` 恒为 false（因此 `/admin/*`、`?all=1` 都会 403）；`/internal/*` 只认 `CRUCIBLE_WORKER_TOKEN`。主人被封禁时令牌同样被拒（403 `banned`）。下面三个接口**只接受会话令牌**（用 API 令牌调用返回 403），所以泄露的令牌不能自我续命。
+供 `crucible submit` / `crucible status` 使用。令牌格式 `crt_<id 16 位十六进制>_<64 位十六进制>`；D1 中只存整串令牌的 SHA-256，明文只在创建时返回一次。令牌可代替会话令牌调用用户接口（`/me`、`/uploads`、`/evals...`），身份为令牌的主人，`is_admin` 恒为 false（因此 `/admin/*`、`?all=1` 都会 403）；`/internal/*` 只认 `CRUCIBLE_WORKER_TOKEN`。主人被封禁时令牌同样被拒（403 `banned`）。下面三个接口**只接受会话令牌**（用 API 令牌调用返回 403），所以泄露的令牌不能自我续命。
 
 ### `POST /tokens`
 请求体可为空，或 `{"name": "laptop"}`（≤ 60 个字符，无控制字符，默认 `cli`）。每人最多 20 个，超出返回 409。
@@ -59,7 +59,7 @@ GitHub 回调。换取 token、读取用户之后，用户的 GitHub token 立�
 → `[{"id", "name", "created_at"}]`，按创建时间倒序，不含令牌本身。
 
 ### `DELETE /tokens/:id`
-→ 204；不是本人的或不存在 → 404。撤销后令牌失效（KV 全球同步最多约 60 秒）。
+→ 204；不是本人的或不存在 → 404。撤销后令牌立即失效。
 
 ## 公开信息
 
@@ -69,7 +69,7 @@ GitHub 回调。换取 token、读取用户之后，用户的 GitHub token 立�
 ### `GET /tasksets`（无需登录；带令牌时多返回用户上传的题目包）
 → `[{"name": "github-full", "version": "1.0", "stages": [{"name": "stage-1", "time_limit_s": 3600, "total": 30}]}]`
 
-数据读自仓库 `EVAL_REF`（默认 main）分支的 `tasksets/*/taskset.json`，在 KV 中缓存 5 分钟。`version` 取文件里的 `version` 字段，没有时用 `git-<blob sha 前 12 位>`。`total` 取 `expected_total`，可能为 `null`（不按用例计数的题目包）。题目包声明了 `display`（`docs/plugins.md` §9）时原样带上 `display`。目录名必须等于 `name`，不合规的题目包会被跳过。
+数据读自仓库 `EVAL_REF`（默认 main）分支的 `tasksets/*/taskset.json`，在 D1 表 `cache` 中缓存 5 分钟。`version` 取文件里的 `version` 字段，没有时用 `git-<blob sha 前 12 位>`。`total` 取 `expected_total`，可能为 `null`（不按用例计数的题目包）。题目包声明了 `display`（`docs/plugins.md` §9）时原样带上 `display`。目录名必须等于 `name`，不合规的题目包会被跳过。
 
 之后是用户上传的题目包（见下节），按上传时间倒序，最多 50 个：匿名只看到已公开且可用的；带令牌时另有自己上传的（任何状态）；管理员加 `?all=1` 看到全部。令牌无效时按匿名处理。上传的题目包多几个字段：
 `{"name": "u-0123456789abcdef", "version": "upload", "stages": [...], "title": "<source.json 里的 name>", "owner_login": "...", "public": false, "status": "packing|ready|failed", "error"?: "..."}`。`stages` 在 `ready` 之前为空。
@@ -81,7 +81,7 @@ zip 的格式同 `tasksets/hello-world/source`（`source.json` + 各阶段目录
 ### `POST /tasksets`
 `{"upload_hash": "<POST /uploads 返回的 hash，X-Upload-Kind: taskset>"}` → `201 {"id": "u-<16 hex>", "status": "packing"}`
 
-`upload_hash` 必须是本人以 `taskset` 类型上传的。Worker 写入 KV `tasksets/<id>`（`packing`，私有），并触发 `TASKSET_WORKFLOW`（默认 `taskset-pack.yml`），参数：`taskset_id`、`source` = `blob:<upload_hash>`、`results_url` = `<worker>/internal/tasksets/<id>`。触发失败时记为 `failed`，接口返回 502。
+`upload_hash` 必须是本人以 `taskset` 类型上传的。Worker 写入 D1 表 `user_tasksets`（`packing`，私有），并触发 `TASKSET_WORKFLOW`（默认 `taskset-pack.yml`），参数：`taskset_id`、`source` = `blob:<upload_hash>`、`results_url` = `<worker>/internal/tasksets/<id>`。触发失败时记为 `failed`，接口返回 502。
 
 workflow（持私钥，不运行上传的代码）解密 zip、检查、按阶段拆成 inputs / tests 两个块分别封存，把 `taskset.json`（`name` 为 id，`title` 为原名）回传 Worker；检查不通过时回传原因（只给上传者看，不进公开日志）。
 
@@ -102,8 +102,8 @@ workflow（持私钥，不运行上传的代码）解密 zip、检查、按阶�
 - Worker 只检查：内容是 crucible envelope 头、`key_id` 是当前公钥、头后面有密文。
 - 计算 SHA-256 后存为 GitHub Release asset：预发布 release `blobs-NN`，NN = 哈希第一个字节 >> 3（00…31），asset 名为完整的十六进制哈希。release 不存在时会创建为 prerelease。（规则与 crucible-store 一致。）
 - → 新上传返回 `201 {"hash": "<sha256>"}`；同一用户重复上传同样的字节返回 `200`，结果相同。
-- 上传记录写入 KV `upload/<hash>`（owner、kind）。如果这些字节已经存在于存储里但不是本人上传的，返回 409；提交评测时也只能引用自己上传的块。这样任何人都不能拿别人的密文块让平台去解密。
-- 顺序：先写 KV 记录（认领），再传 GitHub。所以请求在传完 GitHub 后中断（应答丢失、超时），同一用户重试同样的字节时会找到自己的记录；GitHub 报 asset 已存在时，Worker 下载该 asset 核对 SHA-256，一致即返回 `200`。没有记录却已存在的字节（别人的、或工作流产出）仍返回 409，并撤回这次认领。KV 写不进去时（`storage_quota` / `internal`）不会上传到 GitHub。
+- 上传记录写入 D1 表 `uploads`（主键 hash，owner、kind）。如果这些字节已经存在于存储里但不是本人上传的，返回 409；提交评测时也只能引用自己上传的块。这样任何人都不能拿别人的密文块让平台去解密。
+- 顺序：先写 D1 记录（认领：`INSERT ... ON CONFLICT DO NOTHING` 后再查 owner，主键保证并发安全），再传 GitHub。所以请求在传完 GitHub 后中断（应答丢失、超时），同一用户重试同样的字节时会找到自己的记录；GitHub 报 asset 已存在时，Worker 下载该 asset 核对 SHA-256，一致即返回 `200`。没有记录却已存在的字节（别人的、或工作流产出）仍返回 409，并撤回这次认领。记录写不进去时（`storage_quota` / `internal`）不会上传到 GitHub。
 
 ## 评测
 
@@ -141,7 +141,7 @@ workflow（持私钥，不运行上传的代码）解密 zip、检查、按阶�
 
 `cred_envelope` 是用平台公钥封装的 JSON `{api_key, endpoint, download_password, eval_id}`，再整体做标准 base64。Worker 无法解密，只检查信封头和 key_id，并限制大小不超过 16 KiB。解码后的字节原样存入 KV `cred/<eval_id>`，24 小时过期。解封以及核对其中的 `eval_id` 由 Actions 中的 `crucible cred open` 负责。
 
-提交之后，Worker 写入 `evals/<eval_id>`（状态为 `queued`），并调用 `workflow_dispatch`（只传非秘密参数，见下文“触发参数”）。触发失败时删除凭据，评测记为 `failed`，接口返回 502。
+提交之后，Worker 写入 D1 表 `evals` 一行（状态为 `queued`，主键 eval_id 保证不重复），并调用 `workflow_dispatch`（只传非秘密参数，见下文“触发参数”）。触发失败时删除凭据，评测记为 `failed`，接口返回 502。
 
 ### `GET /evals`
 → 当前用户的评测列表，按创建时间倒序：
@@ -171,7 +171,9 @@ manifest（`schema: 2`）的阶段分数 `replicas[].stages[].score` 是 result 
 
 workflow 通过 `/internal/status` 上报的精确状态优先。估计值只能让状态前进，不会覆盖已上报的更靠后的状态。
 
-回传的结果单独存在 `results/<eval_id>`，查询时刷新只写 `evals/<eval_id>`、从不碰结果。展示时结果优先：结果状态为终态（`done`/`failed`）时以它为准，否则取两者中更靠后的状态（记录已是 `failed` 则保持 `failed`）。因此即使刷新读到旧记录（KV 最终一致）并写回、甚至在宽限期后写成 `failed`，一旦结果可见，评测就显示 `done` 和 manifest，下一次查询详情时列表摘要也随之更正。
+估计值只用于展示，不写库；只有发现 run 已结束（`failed`），或第一次发现 run 成功结束但没有结果（记下开始宽限的时间）时才写一行。`evals` 的状态更新都带 `WHERE status NOT IN ('done','failed')`，终态不会被覆盖。
+
+回传的结果单独存在 D1 表 `results`（主键 eval_id），状态更新只写 `evals`、从不碰结果。展示时（详情和列表都一样）结果优先：结果状态为终态（`done`/`failed`）时以它为准，否则取两者中更靠后的状态（记录已是 `failed` 则保持 `failed`）。列表用 `evals LEFT JOIN results` 一次查出，所以结果一到列表就同步。
 
 ### `GET /evals/:id/download`（仅 owner 或管理员）
 - 请求头带 `Accept: application/json` 时 → `200 {"url": "<下载地址>"}`（网页使用这种方式）。
@@ -186,10 +188,11 @@ workflow 通过 `/internal/status` 上报的精确状态优先。估计值只能
 |---|---|
 | `GET /internal/cred/:id` | → `200 application/octet-stream`：KV 中原样保存的 envelope 字节（即 `cred_envelope` 经 base64 解码后的内容）。不存在或已过期返回 404。`crucible cred open` 同时接受原始字节和 base64。 |
 | `DELETE /internal/cred/:id` | → 204（幂等）。 |
-| `POST /internal/status/:id` | `{"status": "building" \| "running:<阶段名>" \| "scoring" \| "failed"}` → `200 {"ok":true,"status"}`。评测已结束时返回 409；与当前状态相同时不写入，直接返回 200。 |
+| `POST /internal/status/:id` | `{"status": "building" \| "running:<阶段名>" \| "scoring" \| "failed"}` → `200 {"ok":true,"status"}`。评测已结束时返回 409；与当前状态相同时不写入，直接返回 200。`building` 不写库（查询时按 GitHub 估计得到的也是 `building`），返回当前状态。其他状态每次更新一行；第一次写入时顺带记下 run（查 GitHub 一次）。 |
 | `GET /internal/tasksets/:id?github_id=N` | `:id` 为 `u-<16 hex>`。→ 该题目包的 `taskset.json`；未就绪 409；该用户既不是上传者、题目包也未公开时 403。 |
 | `POST /internal/tasksets/:id` | taskset-pack 的结果：`{"status": "ready", "taskset": {...}}`（`name` 必须等于 id，打分器必须是用户可用的，校验通过）或 `{"status": "failed", "error": "<≤500 字符>"}`。只接受一次（之后 409）。 |
-| `POST /internal/results/:id` | 请求体是一个 crucible-core `Manifest`（`eval_id` 必须与 URL 一致；`download` 就是 Manifest 自带的字段，由 `crucible download-zip` 写入），外加两个可选的顶层字段：`download: {"sha256": "<密码 zip 的哈希>"}`，以及 `status`（默认 `done`；如果只是回传部分结果、run 还在继续，可填 `running:<阶段>` 或 `scoring`）。不超过 2 MiB。Worker 把 manifest（去掉这两个字段）存进 `results/<eval_id>`，更新状态；进入终态时删除凭据。→ `200 {"ok":true,"status"}`。幂等：再次回传相同内容时不重写已存的结果，只补上上次没写成的记录，都写好了就什么也不写，照样返回 200。 |
+| `POST /internal/results/:id` | 请求体是一个 crucible-core `Manifest`（`eval_id` 必须与 URL 一致；`download` 就是 Manifest 自带的字段，由 `crucible download-zip` 写入），外加两个可选的顶层字段：`download: {"sha256": "<密码 zip 的哈希>"}`，以及 `status`（默认 `done`；如果只是回传部分结果、run 还在继续，可填 `running:<阶段>` 或 `scoring`）。不超过 1,900,000 字节（D1 单行上限 2 MB）。Worker 把 manifest（去掉这两个字段）存进 `results` 表（只写这一行）；进入终态时删除凭据。终态结果只会被新的终态结果替换，之后到达的部分结果会被忽略。→ `200 {"ok":true,"status"}`。幂等：再次回传相同内容时什么也不写，照样返回 200。 |
+| `POST /internal/migrate-kv` | 一次性把旧 KV 中的记录复制到 D1：请求体 `{"cursor"?: "..."}`，每次处理最多 20 个 key，→ `200 {"prefix", "copied", "skipped", "next"}`；`next` 为 null 表示完成，否则带上它再调。依次处理 `upload/`、`evals/`（连同 `results/`，旧记录内嵌的 manifest 也转成结果行）、`tasksets/`、`token/`、`ban/`。D1 中已有的行保持不变（`ON CONFLICT DO NOTHING`），可重复执行；KV 只读不写。由 `worker.yml` 的 `migrate-kv` job 调用。 |
 
 ## 触发参数（workflow_dispatch）
 
@@ -216,21 +219,35 @@ workflow 通过 `/internal/status` 上报的精确状态优先。估计值只能
 
 两个 workflow 的 `run-name` 都必须包含 eval_id（Worker 靠它找到对应的 run）。workflow 用 `results_url` 的 origin 作为 Worker 地址，调用上面的内部接口。
 
-## KV 布局（绑定名 `CRUCIBLE_KV`）
+## 存储
+
+### D1（绑定名 `CRUCIBLE_DB`，数据库 `octos-crucible`）
+
+表结构见 `crates/crucible-worker/migrations/0001_init.sql`（`wrangler d1 migrations apply` 执行）。
+
+| 表 | 内容 | 索引 |
+|---|---|---|
+| `uploads` | 主键 `hash`；`owner_id, kind, size, created_at` | 主键 |
+| `evals` | 主键 `eval_id`；提交参数、`status`、`run_id`、`run_url`、`run_completed_s`、时间 | `(owner_id, created_s DESC)`（本人列表）、`(created_s DESC)`（管理员 `?all=1`） |
+| `results` | 主键 `eval_id`；`manifest`（JSON）、`download_sha256`、`status`、`total_score`、`display`、`updated_at` | 主键（列表 JOIN） |
+| `user_tasksets` | 主键 `id`；用户题目包 | `(owner_id)`、`(public, status)` |
+| `tokens` | 主键 `id`；`owner_id, login, name, hash, created_at`（hash = SHA-256(令牌)） | `(owner_id)` |
+| `bans` | 主键 `github_id`；`by_id, at, reason` | 主键 |
+| `cache` | 主键 `key`；`tasksets`（5 分钟）、`release/<tag>`（不过期） | 主键 |
+
+常用查询都走主键或索引：详情 2 次主键查询，列表按 `owner_id` 索引取最多 1000 行并按主键 JOIN `results`。
+
+一次评测的写入（行数，不含索引）：上传 1、提交 1、每个存下来的进度上报 1（agent 模式 `running:<阶段>` × 阶段数 + `scoring`；app 模式 `scoring`）、结果 1。2 个阶段的 agent 评测共 6 行，app 评测 4 行。查询详情/列表不写（只在发现 run 已失败时写 1 行）。
+
+### KV（绑定名 `CRUCIBLE_KV`）
+
+只放需要自动过期的数据：
 
 | key | 值 | 过期 |
 |---|---|---|
-| `cred/<eval_id>` | 凭据 envelope 字节 | 24 小时；run 结束时删除 |
-| `evals/<eval_id>` | 评测记录（状态、run 等；旧记录可能含 manifest），key metadata 是列表摘要 | 永久 |
-| `results/<eval_id>` | `{manifest, download_sha256, status, updated_at}`，只由 `/internal/results` 写入 | 永久 |
-| `owner/<github_id>/<eval_id>` | 空值，key metadata 是列表摘要 | 永久 |
-| `upload/<sha256>` | `{owner_id, kind, size, created_at}`，kind 为 `agent`/`app`/`taskset` | 永久 |
-| `tasksets/<u-id>` | 用户题目包 `{id, owner_id, owner_login, upload_hash, status, error, public, title, taskset, created_at, updated_at}`；key metadata 为 `{owner_id, status, public, created_at}` | 永久 |
-| `ban/<github_id>` | `{by, at, reason}` | 永久 |
-| `token/<id>` | `{owner_id, login, name, hash, created_at}`（hash = SHA-256(令牌)） | 撤销前永久 |
-| `tokens/<github_id>/<id>` | 空值，key metadata 是 `{id, name, created_at}` | 撤销前永久 |
-| `cache/tasksets` | `/tasksets` 的缓存 | 5 分钟 |
-| `cache/release/<tag>` | `{id, upload_url}` | 永久 |
+| `cred/<eval_id>` | 凭据 envelope 字节 | 24 小时；run 结束时删除（先读，存在才删，避免白白消耗写额度） |
+
+每次带凭据的评测 2 次 KV 写（写入 + 删除）。KV 里旧的 `evals/`、`results/`、`upload/`、`tasksets/`、`token/`、`ban/` 等记录不再使用，迁移（`POST /internal/migrate-kv`）后可以保留不动。
 
 ## 管理
 
@@ -245,7 +262,8 @@ workflow 通过 `/internal/status` 上报的精确状态优先。估计值只能
 
 | 名称 | 类型 | 说明 |
 |---|---|---|
-| `CRUCIBLE_KV` | KV 绑定 | |
+| `CRUCIBLE_DB` | D1 绑定 | 数据库 `octos-crucible`，`migrations_dir = "migrations"` |
+| `CRUCIBLE_KV` | KV 绑定 | 只存凭据 |
 | `PAGES_ORIGIN` | var | CORS 源，例如 `https://octos-org.github.io` |
 | `PAGES_URL` | var | 登录后跳转的地址，必须以 `PAGES_ORIGIN/` 开头，默认 `PAGES_ORIGIN/` |
 | `GITHUB_REPO` | var | `octos-org/octos-crucible` |
@@ -274,6 +292,8 @@ cargo install worker-build --version 0.8.6 --locked
 rustup target add wasm32-unknown-unknown
 cd crates/crucible-worker
 npx wrangler kv namespace create CRUCIBLE_KV     # 把输出的 id 填进 wrangler.toml
+npx wrangler d1 create octos-crucible            # 把 database_id 填进 wrangler.toml
+npx wrangler d1 migrations apply octos-crucible --remote
 # 修改 wrangler.toml 的 [vars]：ADMIN_GITHUB_IDS，需要时也改 PAGES_URL / WORKER_URL
 for s in GITHUB_CLIENT_ID GITHUB_CLIENT_SECRET GITHUB_TOKEN SESSION_HMAC_KEY CRUCIBLE_WORKER_TOKEN; do
   npx wrangler secret put "$s"
@@ -287,8 +307,9 @@ npx wrangler deploy
 ```sh
 cd crates/crucible-worker
 cp .dev.vars.example .dev.vars          # 全是假值，GitHub 指向本地 mock
+npx wrangler d1 migrations apply octos-crucible --local
 node dev/mock-github.mjs &              # 127.0.0.1:9911
 npx wrangler dev --port 8787 &
 node dev/e2e.mjs                        # 依次测试：登录 → 上传 → 提交 → 取凭据 → 删除凭据 → 上报进度 → 回传结果 → 查询 → 下载 → 封禁
 ```
-CI（`.github/workflows/worker.yml`）运行同样的流程，只构建和测试，不部署。
+CI（`.github/workflows/worker.yml`）在 PR 上运行同样的流程（只构建和测试）；push 到 main 时 `deploy` job 先执行 `wrangler d1 migrations apply octos-crucible --remote`，再 `wrangler deploy`（Cloudflare 令牌需要 Workers 与 D1 的编辑权限）。从 KV 版升级时，部署后执行一次 `gh workflow run worker.yml -f migrate_kv=true`，把旧 KV 记录复制进 D1（可重复执行）。

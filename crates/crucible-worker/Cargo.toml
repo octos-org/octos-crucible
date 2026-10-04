@@ -25,5 +25,9 @@ base64 = "0.22"
 # The Workers runtime glue only exists on wasm32; everything else is plain
 # Rust that the native unit and flow tests exercise.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-worker = "0.8"
+worker = { version = "0.8", features = ["d1"] }
 getrandom = { version = "0.2", features = ["js"] }
+
+# Native tests run the D1 schema and queries on an in-memory SQLite.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+rusqlite = { version = "0.37", features = ["bundled"] }

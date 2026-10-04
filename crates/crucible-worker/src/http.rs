@@ -184,25 +184,61 @@ impl HttpResponse {
 pub struct PutOptions {
     /// Seconds; Workers KV requires at least 60.
     pub ttl: Option<u64>,
-    /// Small JSON (< 1 KiB) returned by `kv_list`.
-    pub metadata: Option<Value>,
 }
 
 #[derive(Debug, Clone)]
 pub struct KvKey {
     pub name: String,
-    pub metadata: Option<Value>,
+}
+
+/// One page of `kv_list`; `cursor` is `None` on the last page.
+#[derive(Debug, Clone, Default)]
+pub struct KvPage {
+    pub keys: Vec<KvKey>,
+    pub cursor: Option<String>,
+}
+
+/// A bound SQL parameter (D1 / SQLite types).
+#[derive(Debug, Clone, PartialEq)]
+pub enum SqlArg {
+    Null,
+    Int(i64),
+    Real(f64),
+    Text(String),
+}
+
+/// A result row: column name → value (`Null`, number or string).
+pub type Row = serde_json::Map<String, Value>;
+
+/// One statement of [`Backend::db_batch`].
+#[derive(Debug, Clone)]
+pub struct Stmt {
+    pub sql: &'static str,
+    pub args: Vec<SqlArg>,
 }
 
 /// What the handlers need from the runtime. Errors are plain strings that
 /// never contain request bodies or secrets.
 #[allow(async_fn_in_trait)] // single-threaded runtime; no Send bound wanted
 pub trait Backend {
+    /// Workers KV: only short-lived data with a TTL (the sealed credential)
+    /// and, for the one-off migration, reads of the old records.
     async fn kv_get(&self, key: &str) -> Result<Option<Vec<u8>>, String>;
     async fn kv_put(&self, key: &str, value: &[u8], opts: PutOptions) -> Result<(), String>;
     async fn kv_delete(&self, key: &str) -> Result<(), String>;
-    /// Up to `limit` keys under `prefix`, with their metadata.
-    async fn kv_list(&self, prefix: &str, limit: usize) -> Result<Vec<KvKey>, String>;
+    /// Up to `limit` keys under `prefix`, continuing from `cursor`.
+    async fn kv_list(
+        &self,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<KvPage, String>;
+    /// D1: rows of a query.
+    async fn db_query(&self, sql: &str, args: &[SqlArg]) -> Result<Vec<Row>, String>;
+    /// D1: a write; returns the number of rows changed.
+    async fn db_exec(&self, sql: &str, args: &[SqlArg]) -> Result<u64, String>;
+    /// D1: several writes, applied atomically.
+    async fn db_batch(&self, stmts: &[Stmt]) -> Result<(), String>;
     async fn fetch(&self, req: HttpRequest) -> Result<HttpResponse, String>;
     fn now_s(&self) -> u64;
     fn random_bytes(&self, n: usize) -> Vec<u8>;
