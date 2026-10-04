@@ -249,14 +249,19 @@ impl ScoreFormat {
     }
 
     fn check(&self) -> Result<(), String> {
-        let text_ok = |s: &str, n: usize| s.chars().count() <= n && !s.chars().any(char::is_control);
+        let text_ok =
+            |s: &str, n: usize| s.chars().count() <= n && !s.chars().any(char::is_control);
         if !text_ok(&self.name, 40) || !text_ok(&self.unit, 10) {
             return Err("display: name ≤ 40, unit ≤ 10 characters, no control characters".into());
         }
         if self.decimals > 6 {
             return Err("display: decimals must be 0–6".into());
         }
-        if [self.min, self.max].iter().flatten().any(|x| !x.is_finite()) {
+        if [self.min, self.max]
+            .iter()
+            .flatten()
+            .any(|x| !x.is_finite())
+        {
             return Err("display: min / max must be finite".into());
         }
         Ok(())
@@ -384,16 +389,27 @@ impl TaskSet {
     /// stages, display texts short and plain.
     fn check_scoring(&self) -> Result<(), String> {
         let a = &self.aggregate;
-        if a.weights.values().chain(a.item_weights.values()).any(|w| !w.is_finite()) {
+        if a.weights
+            .values()
+            .chain(a.item_weights.values())
+            .any(|w| !w.is_finite())
+        {
             return Err("aggregate: weights must be finite".into());
         }
-        if let Some(id) = a.weights.keys().find(|k| !self.stages.iter().any(|s| &s.id == *k)) {
+        if let Some(id) = a
+            .weights
+            .keys()
+            .find(|k| !self.stages.iter().any(|s| &s.id == *k))
+        {
             return Err(format!("aggregate: weight for unknown stage {id:?}"));
         }
         if a.item_weights.len() > crate::score::MAX_ITEMS {
             return Err("aggregate: too many item weights".into());
         }
-        for f in [&self.display.stage, &self.display.total].into_iter().flatten() {
+        for f in [&self.display.stage, &self.display.total]
+            .into_iter()
+            .flatten()
+        {
             f.check()?;
         }
         Ok(())
@@ -576,17 +592,22 @@ mod tests {
     #[test]
     fn builtin_tasksets() {
         let hello: TaskSet =
-            serde_json::from_str(include_str!("../../../tasksets/hello-world/taskset.json")).unwrap();
+            serde_json::from_str(include_str!("../../../tasksets/hello-world/taskset.json"))
+                .unwrap();
         hello.validate(MAX_TOTAL_TIME_S).unwrap();
         let sc = hello.scoring();
         assert_eq!(sc.aggregate.stages, StagesAgg::Ratio);
-        assert_eq!(sc.display.stage.as_ref().unwrap().format, NumFormat::Fraction);
+        assert_eq!(
+            sc.display.stage.as_ref().unwrap().format,
+            NumFormat::Fraction
+        );
         assert_eq!(sc.display.total.as_ref().unwrap().fmt(1.0, None), "100.0%");
         assert_eq!(sc.plugins[0].version, "1");
 
-        let astro: TaskSet =
-            serde_json::from_str(include_str!("../../../tasksets/astro-practice/taskset.json"))
-                .unwrap();
+        let astro: TaskSet = serde_json::from_str(include_str!(
+            "../../../tasksets/astro-practice/taskset.json"
+        ))
+        .unwrap();
         astro.validate(MAX_TOTAL_TIME_S).unwrap();
         let sc = astro.scoring();
         assert_eq!(sc.aggregate.stages, StagesAgg::Sum);
@@ -603,9 +624,11 @@ mod tests {
     fn scoring_checks() {
         let mut t: TaskSet = serde_json::from_str(&github()).unwrap();
         t.schema = 2;
-        t.aggregate = serde_json::from_str(r#"{"stages":"weighted","weights":{"stage-9":1}}"#).unwrap();
+        t.aggregate =
+            serde_json::from_str(r#"{"stages":"weighted","weights":{"stage-9":1}}"#).unwrap();
         assert!(matches!(t.validate(1 << 20), Err(TaskSetError::Scoring(_))));
-        t.aggregate = serde_json::from_str(r#"{"stages":"weighted","weights":{"stage-2":1}}"#).unwrap();
+        t.aggregate =
+            serde_json::from_str(r#"{"stages":"weighted","weights":{"stage-2":1}}"#).unwrap();
         t.validate(1 << 20).unwrap();
         t.display.stage = Some(ScoreFormat {
             name: "x\u{7}".into(),

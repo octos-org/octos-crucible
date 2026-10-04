@@ -406,11 +406,17 @@ mod tests {
         }"#;
         let r: ScoreResult = serde_json::from_str(raw).unwrap();
         assert_eq!(r.status, ScoreStatus::Scored);
-        assert_eq!((r.score, r.max, r.passed), (Some(27.0), Some(30.0), Some(false)));
+        assert_eq!(
+            (r.score, r.max, r.passed),
+            (Some(27.0), Some(30.0), Some(false))
+        );
         assert_eq!(r.items.as_ref().unwrap()[0].passed, Some(true));
         let all: ScoreResult =
             serde_json::from_str(r#"{"status":"passed","passed":1,"total":1}"#).unwrap();
-        assert_eq!((all.score, all.max, all.passed), (Some(1.0), Some(1.0), Some(true)));
+        assert_eq!(
+            (all.score, all.max, all.passed),
+            (Some(1.0), Some(1.0), Some(true))
+        );
         let err: ScoreResult =
             serde_json::from_str(r#"{"status":"system_error","passed":0,"total":0}"#).unwrap();
         assert_eq!(
@@ -444,7 +450,10 @@ mod tests {
         )
         .unwrap();
         let r = r.finish(&agg);
-        assert_eq!((r.status, r.score, r.max), (ScoreStatus::Scored, Some(2.0), Some(3.0)));
+        assert_eq!(
+            (r.status, r.score, r.max),
+            (ScoreStatus::Scored, Some(2.0), Some(3.0))
+        );
         // No score at all: an error.
         let r: ScoreResult = serde_json::from_str(r#"{"schema":2,"status":"scored"}"#).unwrap();
         assert_eq!(r.finish(&agg).status, ScoreStatus::Error);

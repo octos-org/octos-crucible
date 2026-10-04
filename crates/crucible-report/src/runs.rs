@@ -448,35 +448,15 @@ mod tests {
             ReplicaInput {
                 replica: "r1".into(),
                 stages: vec![
-                    stage(
-                        "stage-1",
-                        score("failed", 27, 30),
-                        100.0,
-                        1_000_000,
-                    ),
-                    stage(
-                        "stage-2",
-                        score("failed", 20, 29),
-                        200.0,
-                        2_000_000,
-                    ),
+                    stage("stage-1", score("failed", 27, 30), 100.0, 1_000_000),
+                    stage("stage-2", score("failed", 20, 29), 200.0, 2_000_000),
                 ],
             },
             ReplicaInput {
                 replica: "r2".into(),
                 stages: vec![
-                    stage(
-                        "stage-1",
-                        score("passed", 30, 30),
-                        300.0,
-                        3_000_000,
-                    ),
-                    stage(
-                        "stage-2",
-                        score("failed", 10, 29),
-                        400.0,
-                        4_000_000,
-                    ),
+                    stage("stage-1", score("passed", 30, 30), 300.0, 3_000_000),
+                    stage("stage-2", score("failed", 10, 29), 400.0, 4_000_000),
                 ],
             },
             // Scorer infrastructure fault: excluded from stats, counted.
@@ -524,7 +504,10 @@ mod tests {
         let md = markdown(&r);
         assert!(md.contains("replicas: 4 (ok 2, failed 2)"), "{md}");
         assert!(md.contains("- r4: stage stage-2 missing"), "{md}");
-        assert!(md.contains("| stage-1 | 28.50 ± 2.12 (27.00–30.00)"), "{md}");
+        assert!(
+            md.contains("| stage-1 | 28.50 ± 2.12 (27.00–30.00)"),
+            "{md}"
+        );
     }
 
     #[test]

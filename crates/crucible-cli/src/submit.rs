@@ -545,12 +545,11 @@ pub fn render(d: &Value) -> String {
     let replicas = d["manifest"]["replicas"].as_array().unwrap_or(&empty);
     // Typed, the old score format reads as the new one; the display comes
     // from the manifest's own snapshot (old manifests: test counts, %).
-    let display = serde_json::from_value::<crucible_core::taskset::Scoring>(
-        d["manifest"]["scoring"].clone(),
-    )
-    .ok()
-    .map(|s| s.display)
-        .unwrap_or_else(crucible_core::taskset::legacy_display);
+    let display =
+        serde_json::from_value::<crucible_core::taskset::Scoring>(d["manifest"]["scoring"].clone())
+            .ok()
+            .map(|s| s.display)
+            .unwrap_or_else(crucible_core::taskset::legacy_display);
     let (stage_fmt, total_fmt) = (
         display.stage.clone().unwrap_or_default(),
         display.total.clone().unwrap_or_default(),

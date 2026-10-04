@@ -171,11 +171,12 @@ Human-readable page: `https://octos-org.github.io/octos-crucible/#/evals/<eval_i
 
 Key fields of `crucible status <eval_id> --json`:
 
-- `status`, `total_score`: 0 to 1, Σpassed / Σtotal over every scored stage of every replica (4 decimals). Absent when nothing was scored.
+- `status`, `total_score`: computed by the taskset's aggregate as recorded in `manifest.scoring` (4 decimals; absent when nothing was scored). With `ratio` (test-counting tasksets such as hello-world, and every evaluation without `scoring`) it is 0 to 1, Σscore / Σmax over every scored stage of every replica. With `sum` / `mean` / `weighted` (e.g. astro-practice: the sum of the cards' survey scores) it is the mean over replicas of each replica's total, in the stage score's own unit, and may be negative.
+- `manifest.scoring`: `{aggregate, display: {stage, total}, plugins}`. `display.*` has `name`, `unit`, `direction` (`higher` or `lower` is better), `decimals`, `format` (`number`, `percent`, or `fraction` = `score/max`). Use it to read and compare scores.
 - `manifest.replicas[]`: one entry per replica (`replica` number; `failure` says why a replica produced no usable result).
 - `manifest.replicas[].stages[]`, one per stage:
   - `stage`: stage name.
-  - `score`: `{status, passed, total}`; `null` if the stage was never scored. Stage score = `passed / total`.
+  - `score`: `{status, score, max?, passed?, items?}`; `null` if the stage was never scored. `status` is `scored` (counts, also when the agent produced nothing usable: then usually 0) or `error` (scoring infrastructure failed, not counted, retry). `score` is continuous and may be negative; `max` is the stage maximum when there is one (for test counting, `score` = tests passed, `max` = tests); `items` breaks the score down (e.g. astro-practice's five components). Old evaluations have `{status: passed|failed|system_error|rejected, passed, total}` instead: read `passed`/`failed` as `scored` with `score = passed`, `max = total`, and `system_error`/`rejected` as `error`.
   - `wall_s`: wall time in seconds, from GitHub's own job timestamps (not the agent's report).
   - `usage`: `{requests, prompt_tokens, cached_tokens, completion_tokens, reasoning_tokens}`, counted by the metering proxy. `prompt_tokens` includes `cached_tokens`; cache hit rate = `cached_tokens / prompt_tokens`.
   - `cost_usd`: equivalent pay-as-you-go cost at public list prices (uncached input, cached input and output priced separately; table in `config/pricing.json`). `null` when the model's price is unknown. If the user is on a subscription plan this is only a reference figure.

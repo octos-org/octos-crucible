@@ -425,7 +425,7 @@ impl UserTaskset {
 
 /// Body of `POST /internal/tasksets/:id` (from the taskset-pack workflow).
 pub enum PackResult {
-    Ready(crucible_core::TaskSet),
+    Ready(Box<crucible_core::TaskSet>),
     Failed(String),
 }
 
@@ -456,7 +456,7 @@ pub fn parse_pack_result(body: &[u8], id: &str) -> Result<PackResult, ApiError> 
                     "scorer not offered for uploaded tasksets",
                 ));
             }
-            Ok(PackResult::Ready(ts))
+            Ok(PackResult::Ready(Box::new(ts)))
         }
         (TS_FAILED, None, Some(e)) => Ok(PackResult::Failed(e.chars().take(500).collect())),
         _ => Err(ApiError::bad_request(
@@ -829,9 +829,9 @@ mod tests {
         v2["schema"] = 2.into();
         v2["replicas"][0]["stages"][0]["score"] =
             serde_json::json!({"status": "scored", "score": 4458.556});
-        v2["replicas"][0]["stages"][1]["score"] =
-            serde_json::json!({"status": "scored", "score": -8.5, "items": [{"name": "x", "score": -8.5}]});
-        v2["replicas"][1]["stages"][0]["score"] = serde_json::json!({"status": "error", "error": "system"});
+        v2["replicas"][0]["stages"][1]["score"] = serde_json::json!({"status": "scored", "score": -8.5, "items": [{"name": "x", "score": -8.5}]});
+        v2["replicas"][1]["stages"][0]["score"] =
+            serde_json::json!({"status": "error", "error": "system"});
         v2["scoring"] = serde_json::json!({"aggregate": {"stages": "sum"},
             "display": {"stage": {"name": "观测得分"}, "total": {"name": "总分", "decimals": 2}},
             "plugins": [{"kind": "scorer", "name": "astro-survey", "version": "2"}]});

@@ -240,7 +240,9 @@ pub fn build_manifest(m: &ManifestInputs) -> Result<Manifest> {
         for st in stages_iter {
             let sdir = rdir.join(&st.id);
             let score = match m.scores {
-                Some(dir) => crate::score::read_score(dir, r, &st.id)?.map(|s| StageScore::from(&s)),
+                Some(dir) => {
+                    crate::score::read_score(dir, r, &st.id)?.map(|s| StageScore::from(&s))
+                }
                 None => None,
             };
             let (usage_raw, timing_raw) = stage_numbers(&sdir, m.keys)?;

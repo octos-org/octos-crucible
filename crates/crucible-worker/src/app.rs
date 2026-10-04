@@ -106,10 +106,7 @@ fn user_taskset_info(u: &UserTaskset) -> TasksetInfo {
                 .collect()
         })
         .unwrap_or_default();
-    let display = u
-        .parsed()
-        .map(|ts| ts.display)
-        .filter(|d| !d.is_empty());
+    let display = u.parsed().map(|ts| ts.display).filter(|d| !d.is_empty());
     TasksetInfo {
         display,
         name: u.id.clone(),

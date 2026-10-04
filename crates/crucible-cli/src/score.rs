@@ -312,21 +312,48 @@ mod tests {
     fn normalise_against_expected_total() {
         use crucible_core::ScoreStatus::{Error, Scored};
         let agg = Aggregate::default();
-        let n = normalise(old(r#"{"status":"failed","passed":27,"total":30}"#), Some(30), &agg);
+        let n = normalise(
+            old(r#"{"status":"failed","passed":27,"total":30}"#),
+            Some(30),
+            &agg,
+        );
         assert_eq!((n.status, n.score, n.max), (Scored, Some(27.0), Some(30.0)));
         // Build failed: no test ran, the stage still counts out of 30.
-        let n = normalise(old(r#"{"status":"failed","passed":0,"total":0}"#), Some(30), &agg);
+        let n = normalise(
+            old(r#"{"status":"failed","passed":0,"total":0}"#),
+            Some(30),
+            &agg,
+        );
         assert_eq!((n.score, n.max), (Some(0.0), Some(30.0)));
         // A pack that collected a different number of tests is flagged.
-        let n = normalise(old(r#"{"status":"passed","passed":29,"total":29}"#), Some(30), &agg);
+        let n = normalise(
+            old(r#"{"status":"passed","passed":29,"total":29}"#),
+            Some(30),
+            &agg,
+        );
         assert_eq!((n.status, n.score, n.max), (Error, None, None));
         assert!(n.detail.contains("expects 30"));
-        let n = normalise(old(r#"{"status":"system_error","passed":3,"total":4}"#), Some(30), &agg);
+        let n = normalise(
+            old(r#"{"status":"system_error","passed":3,"total":4}"#),
+            Some(30),
+            &agg,
+        );
         assert_eq!((n.status, n.score), (Error, None));
-        let n = normalise(old(r#"{"status":"passed","passed":4,"total":4}"#), None, &agg);
-        assert_eq!((n.score, n.max, n.passed), (Some(4.0), Some(4.0), Some(true)));
+        let n = normalise(
+            old(r#"{"status":"passed","passed":4,"total":4}"#),
+            None,
+            &agg,
+        );
+        assert_eq!(
+            (n.score, n.max, n.passed),
+            (Some(4.0), Some(4.0), Some(true))
+        );
         // A continuous score, negative, no max; written as v2.
-        let n = normalise(old(r#"{"schema":2,"status":"scored","score":-3.25}"#), None, &agg);
+        let n = normalise(
+            old(r#"{"schema":2,"status":"scored","score":-3.25}"#),
+            None,
+            &agg,
+        );
         assert_eq!((n.status, n.score, n.max), (Scored, Some(-3.25), None));
         let json = serde_json::to_string(&n).unwrap();
         assert!(json.contains(r#""schema":2"#) && !json.contains("total"));
@@ -386,9 +413,15 @@ printf '{"visibility":"hidden","status":"failed","passed":1,"total":2,"detail":"
         .unwrap();
         assert_eq!(done.len(), 2);
         let s1 = read_score(&out, 1, "stage-1").unwrap().unwrap();
-        assert_eq!((s1.score, s1.max, s1.passed), (Some(1.0), Some(2.0), Some(false)));
+        assert_eq!(
+            (s1.score, s1.max, s1.passed),
+            (Some(1.0), Some(2.0), Some(false))
+        );
         let s2 = read_score(&out, 1, "stage-2").unwrap().unwrap();
-        assert_eq!((s2.status.is_scored(), s2.score, s2.max), (true, Some(0.0), Some(2.0)));
+        assert_eq!(
+            (s2.status.is_scored(), s2.score, s2.max),
+            (true, Some(0.0), Some(2.0))
+        );
         assert!(read_score(&out, 2, "stage-1").unwrap().is_none());
 
         // Hand off to a machine without the platform key: same scores with

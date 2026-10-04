@@ -42,36 +42,56 @@ score.sh --artifact FILE --tests DIR --out result.json
 
 ## 4. 输出：`result.json`
 
-格式即 `crucible-core` 的 `ScoreResult`（`crates/crucible-core/src/score.rs`），与原型评分器的 result.json 相同：
+格式是 result v2，即 `crucible-core` 的 `ScoreResult`（`crates/crucible-core/src/score.rs`；设计见 `docs/plugins.md` §7）：
 
 ```json
 {
-  "submission_id": "可选",
+  "schema": 2,
+  "status": "scored",
+  "score": 4458.556,
+  "max": null,
+  "passed": null,
+  "detail": "survey_complete",
+  "items": [
+    {"name": "sum_best_scores", "score": 4820.1},
+    {"name": "required_penalty", "score": -361.5}
+  ],
+  "visibility": "hidden",
   "task_id": "可选",
-  "visibility": "public",
-  "status": "passed | failed | system_error | rejected",
-  "passed": 27,
-  "total": 30,
-  "detail": "3/30 tests failed",
-  "tests": [
-    {"title": "…", "ok": false, "error": "…（≤2000 字符）", "screenshot": "output/…/test-failed-1.png"}
-  ]
+  "submission_id": "可选"
 }
 ```
 
-`status` 的含义：
+| 字段 | 含义 |
+|---|---|
+| `schema` | 固定 `2` |
+| `status` | `scored`：分数说明了 agent 的水平，计入汇总（agent 没交出可用产出、构建失败、应用起不来也是 `scored`，分数按打分器规则，通常为 0）。`error`：打分基础设施的问题（镜像拉不到、测试浏览器起不来、跑完没有报告），不计分，可重试 |
+| `error` | `status: error` 时的类别：`system`（打分器自身问题）或 `rejected`（请求本身无效，留给调用方用） |
+| `score` | 连续分数，有限数，可为负，绝对值 ≤ 1e12。`scored` 时必填，除非给了 `items` |
+| `max` | 可选，本阶段满分 |
+| `passed` | 可选，是否"通过"（全部用例通过、达到阈值等），只用于展示 |
+| `detail` | 打分器自己的固定文案，≤ 300 字符，不含测试内容 |
+| `items` | 可选明细，≤ 100 项，每项 `{"name", "score"?, "max"?, "passed"?}`，`name` ≤ 100 字符 |
 
-| status | 含义 | 计分 |
-|---|---|---|
-| `passed` | 全部用例通过 | 计 |
-| `failed` | agent 的问题：产出格式不对、构建失败/超时、应用起不来、用例失败、测试整体超时 | 计（未跑测试时 passed/total 为 0/0） |
-| `system_error` | 打分器自身的问题：镜像拉不到、测试浏览器起不来、跑完没有报告 | 不计，可重试 |
-| `rejected` | 请求本身不是一次有效提交（留给调用方，例如签名校验失败）；打分器自己不产生 | 不计 |
+按用例计数是其中的特例：`items` 每项只给 `passed` 时，每项按 1 / 0 分、满分 1 计；没给 `score` 时由 `crucible score` 按题目包的 `aggregate.items`（缺省求和）算出，于是 `score` = 通过数，`max` = 用例数。
+
+`crucible score` 对每个结果做同样的收尾（`ScoreResult::finish` 与 `normalise`）：没有分数或越界 → `error`（system）；题目包给了 `expected_total` 的阶段，`scored` 但没有用例结果时记 `score = 0`、`max = expected_total`，用例数与 `expected_total` 不符时改为 `error`。它写出的 `score.json` 总是 v2。
+
+旧格式（`status: passed | failed | system_error | rejected` 加整数 `passed / total`、`tests[]`）仍被接受，按固定表换算，Playwright 打分器目前就输出旧格式：
+
+| 旧 `status` | 新 `status` | `score` | `max` | `passed` |
+|---|---|---|---|---|
+| `passed` | `scored` | 旧 `passed` | 旧 `total` | `true` |
+| `failed` | `scored` | 旧 `passed` | 旧 `total` | `false` |
+| `system_error` | `error`（`system`） | — | — | — |
+| `rejected` | `error`（`rejected`） | — | — | — |
+
+旧 `tests[]` 换算成 `items`：`{"name": title, "passed": ok}`。同一张表也用于读取旧 manifest（crucible-core、Worker、网页一致），旧数据不改写。
 
 `visibility`：
 
-- `public`：带 `tests` 明细。
-- `hidden`：只保留 `status`、`passed`、`total`、`detail` 和 `submission_id`/`task_id`/`visibility`；不含用例标题、错误文本、截图。`detail` 只会是打分器自己的固定文案（如 `3/30 tests failed`、`app build failed`），不含测试内容。
+- `public`：可以带完整明细（Playwright 的 `tests`：用例标题、错误文本、截图）。
+- `hidden`（正式评测一律如此）：`items` 只能保留名字由打分器代码固定的项（例如巡天的五个分项）；名字或内容来自测试材料的项（例如 Playwright 的用例标题）必须去掉。`detail` 只会是打分器自己的固定文案（如 `3/30 tests failed`、`app build failed`）。
 
 `screenshot` 是相对 `--artifacts` 目录的路径；没给 `--artifacts` 时该路径不可取用。
 
@@ -114,7 +134,7 @@ score.sh --artifact FILE --tests DIR --out result.json
 
 ### 6.2 计分
 
-每个阶段的分数固定为 **passed / total**：`total` 是 Playwright 报告里收集到的用例数，`passed` 是通过数。构建失败、应用没就绪、测试整体超时等情况下没有用例结果，`passed = total = 0`，该阶段记 0 分（展示时分母用题目包的 `expected_total`）。`system_error` 不计分，应重试。
+每个阶段的分数固定为 **passed / total**（打分器仍输出旧格式，`crucible score` 换算成 `score` = 通过数、`max` = 用例数）：`total` 是 Playwright 报告里收集到的用例数，`passed` 是通过数。构建失败、应用没就绪、测试整体超时等情况下没有用例结果，`passed = total = 0`，该阶段记 0 分（`max` 取题目包的 `expected_total`）。`system_error` 不计分，应重试。
 
 环境变量：`CRUCIBLE_SCORER_IMAGE`（用预构建镜像，默认现场构建 `image/`）、`CRUCIBLE_SCORER_FIREWALL=1`（见 §5）、`CRUCIBLE_PRUNE_BUILD_CACHE=1`（一次性 CI 机器上打完清 build cache；默认关，因为会清掉整个 daemon 的缓存）。
 

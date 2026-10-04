@@ -4,8 +4,8 @@
 use serde::{Deserialize, Serialize};
 
 pub use crate::blob::BlobRef;
-pub use crate::score::StageScore;
 use crate::score::ScoreStatus;
+pub use crate::score::StageScore;
 use crate::taskset::{Aggregate, Scoring, StagesAgg};
 
 /// `schema` of manifests written now: stage scores in the v2 result
@@ -96,7 +96,8 @@ pub fn total_score(agg: &Aggregate, replicas: &[ReplicaEntry]) -> Option<f64> {
     let per: Vec<f64> = replicas
         .iter()
         .filter_map(|r| {
-            let scores: Vec<&StageScore> = r.stages.iter().filter_map(|s| s.score.as_ref()).collect();
+            let scores: Vec<&StageScore> =
+                r.stages.iter().filter_map(|s| s.score.as_ref()).collect();
             if scores.iter().any(|s| s.status == ScoreStatus::Error) {
                 return None;
             }
@@ -302,7 +303,10 @@ mod tests {
         ));
         assert_eq!(app.compute_total_score(), Some(1.0));
         let s = app.replicas[0].stages[0].score.as_ref().unwrap();
-        assert_eq!((s.status, s.score, s.max, s.passed), (ScoreStatus::Scored, Some(1.0), Some(1.0), Some(true)));
+        assert_eq!(
+            (s.status, s.score, s.max, s.passed),
+            (ScoreStatus::Scored, Some(1.0), Some(1.0), Some(true))
+        );
         let agent = legacy(&format!(
             r#"{{{head},"replicas":[{{"replica":1,"stages":[{{"stage":"stage-1","score":{{"status":"failed","passed":0,"total":1}},{usage}}},{{"stage":"stage-2","score":{{"status":"failed","passed":0,"total":1}},{usage}}}]}}],"total_score":0.0}}"#
         ));
@@ -312,9 +316,14 @@ mod tests {
         ));
         assert_eq!(astro.compute_total_score(), Some(0.4459));
         // Written back, it is the new format; read again, the same total.
-        let again: Manifest = serde_json::from_str(&serde_json::to_string(&astro).unwrap()).unwrap();
+        let again: Manifest =
+            serde_json::from_str(&serde_json::to_string(&astro).unwrap()).unwrap();
         assert_eq!(again.compute_total_score(), Some(0.4459));
-        assert!(serde_json::to_string(&again).unwrap().contains(r#""status":"error","error":"system""#));
+        assert!(
+            serde_json::to_string(&again)
+                .unwrap()
+                .contains(r#""status":"error","error":"system""#)
+        );
     }
 
     #[test]
@@ -323,7 +332,11 @@ mod tests {
         let st = |id: &str, score: Option<f64>, max: Option<f64>, error: bool| StageEntry {
             stage: id.into(),
             score: Some(StageScore {
-                status: if error { ScoreStatus::Error } else { ScoreStatus::Scored },
+                status: if error {
+                    ScoreStatus::Error
+                } else {
+                    ScoreStatus::Scored
+                },
                 error: None,
                 score,
                 max,
@@ -346,21 +359,51 @@ mod tests {
             stages,
         };
         let reps = vec![
-            rep(1, vec![st("l1", Some(4458.556), None, false), st("l2", Some(-100.0), None, false)]),
-            rep(2, vec![st("l1", Some(1000.0), None, false), st("l2", None, None, true)]),
+            rep(
+                1,
+                vec![
+                    st("l1", Some(4458.556), None, false),
+                    st("l2", Some(-100.0), None, false),
+                ],
+            ),
+            rep(
+                2,
+                vec![
+                    st("l1", Some(1000.0), None, false),
+                    st("l2", None, None, true),
+                ],
+            ),
         ];
         let agg = |j: &str| -> Aggregate { serde_json::from_str(j).unwrap() };
         // The error replica is left out.
-        assert_eq!(total_score(&agg(r#"{"stages":"sum"}"#), &reps), Some(4358.556));
-        assert_eq!(total_score(&agg(r#"{"stages":"mean"}"#), &reps), Some(2179.278));
+        assert_eq!(
+            total_score(&agg(r#"{"stages":"sum"}"#), &reps),
+            Some(4358.556)
+        );
+        assert_eq!(
+            total_score(&agg(r#"{"stages":"mean"}"#), &reps),
+            Some(2179.278)
+        );
         assert_eq!(
             total_score(&agg(r#"{"stages":"weighted","weights":{"l1":2}}"#), &reps),
             Some(8917.112)
         );
         assert_eq!(total_score(&agg(r#"{"stages":"ratio"}"#), &reps), None);
         let counted = vec![
-            rep(1, vec![st("a", Some(1.0), Some(2.0), false), st("b", Some(3.0), Some(4.0), false)]),
-            rep(2, vec![st("a", Some(2.0), Some(2.0), false), st("b", Some(0.0), Some(4.0), false)]),
+            rep(
+                1,
+                vec![
+                    st("a", Some(1.0), Some(2.0), false),
+                    st("b", Some(3.0), Some(4.0), false),
+                ],
+            ),
+            rep(
+                2,
+                vec![
+                    st("a", Some(2.0), Some(2.0), false),
+                    st("b", Some(0.0), Some(4.0), false),
+                ],
+            ),
         ];
         assert_eq!(total_score(&agg(r#""sum""#), &counted), Some(0.5));
         assert_eq!(
@@ -378,7 +421,9 @@ mod tests {
                 }],
             }),
             replicas: reps,
-            ..legacy(r#"{"schema":2,"eval_id":"e","created_at":"t","taskset":"t","agent":{"name":"a","version":"1"},"model":"m","replicas":[]}"#)
+            ..legacy(
+                r#"{"schema":2,"eval_id":"e","created_at":"t","taskset":"t","agent":{"name":"a","version":"1"},"model":"m","replicas":[]}"#,
+            )
         };
         assert_eq!(m.compute_total_score(), Some(4358.556));
     }
