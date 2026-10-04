@@ -7,7 +7,7 @@ name: score
 #             sealed upload and the stage's tests blob and re-seals both to a
 #             one-run key (`crucible score-handoff`) for score-tests.
 #   score-tests  (score-tests.yml) holds no secret: runs
-#             scorers/<scorer>/score.sh (hidden visibility) on the handoff and
+#             the stage's scorer plugin (plugins.json; hidden visibility) on the handoff and
 #             checks total == expected_total. Only score.json leaves it.
 #   publish   the only job with contents: write: builds the manifest
 #             (mode app), archives it sealed, commits it in clear to the data

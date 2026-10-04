@@ -83,11 +83,11 @@ crucible submit agent --agent-dir ./my-agent --taskset github-full \
     "scorer": {"name": "playwright"}, "aggregate": "sum", "total_time_limit_s": 1200,
     "stages": [
       {"id": "stage-1", "dir": "stage-1", "inputs": ["requirements.yaml"], "tests": ["tests"],
-       "output": "web-app", "time_limit_s": 600, "expected_total": 1}
+       "packager": "web-app", "time_limit_s": 600, "expected_total": 1}
     ]
   }
   ```
-- **限制**：各阶段限时之和 ≤ `total_time_limit_s` ≤ 18000 秒；打分器目前只能是 `playwright`（产出类型 `web-app`）；给 agent 的文件和测试文件不能重叠；不能有符号链接；加密后不超过 25 MB。
+- **限制**：各阶段限时之和 ≤ `total_time_limit_s` ≤ 18000 秒；只能引用插件注册表 `plugins.json` 里标为 `user: true` 的插件，目前打分器只有 `playwright`（打包器 `web-app`；旧写法 `"output": "web-app"` 同样有效）；给 agent 的文件和测试文件不能重叠；不能有符号链接；加密后不超过 25 MB。
 - **先在本地检查**：`crucible taskset validate my-tasks.zip`（也可以传目录或 `source.json`），和平台用的是同一套检查。
 - **登记**：文件在浏览器里用平台公钥加密后上传。平台解密、检查、按阶段拆成“给 agent 的输入”和“测试”两份分别加密保存，几分钟后状态变为“可用”；没通过时页面上显示原因。
 - **可见性**：默认私有，只有你能看到和使用（提交页的题目包列表、命令行 `--taskset u-…`）；管理员可以把它设为公开。仓库内置的题目包不受影响。

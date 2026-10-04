@@ -9,6 +9,7 @@ pub mod blob;
 pub mod envelope;
 pub mod manifest;
 pub mod netpolicy;
+pub mod plugins;
 pub mod score;
 pub mod taskset;
 pub mod usage;

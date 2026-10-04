@@ -16,7 +16,7 @@ use crucible_crypto::{PrivateKey, PublicKey};
 use crucible_metering::{Price, Pricing};
 use serde::Deserialize;
 
-use crate::run::Timing;
+use crate::runners::workdir::Timing;
 use crate::zipdir::{self, ZipStats};
 
 pub const LOG_FILES: [&str; 4] = ["agent.log", "egress.jsonl", "usage.jsonl", "timing.json"];

@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "plugins": [
+    {"kind": "runner", "name": "workdir", "version": "1", "impl": "builtin"},
+    {"kind": "packager", "name": "web-app", "version": "1", "impl": "builtin", "user": true},
+    {"kind": "packager", "name": "files", "version": "1", "impl": "builtin", "user": true},
+    {"kind": "scorer", "name": "playwright", "version": "1", "impl": "scorers/playwright",
+     "user": true, "runs_taskset_code": true, "model": false, "accepts": ["web-app"]},
+    {"kind": "scorer", "name": "arcbench-official", "version": "1", "impl": "scorers/arcbench-official",
+     "runs_taskset_code": true, "model": false, "accepts": ["web-app"]},
+    {"kind": "scorer", "name": "astro-survey", "version": "2", "impl": "scorers/astro-survey",
+     "runs_taskset_code": false, "model": false, "accepts": ["files"]}
+  ]
+}
