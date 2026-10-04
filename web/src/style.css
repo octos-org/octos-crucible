@@ -710,3 +710,89 @@ td.num {
     display: none;
   }
 }
+
+/* --- compare --- */
+
+.compare-bar {
+  gap: 8px;
+}
+
+.compare-bar .row {
+  gap: 12px;
+}
+
+.pick-row {
+  display: flex;
+  align-items: stretch;
+}
+
+.pick-row .item {
+  flex: 1;
+  min-width: 0;
+}
+
+.pick {
+  display: flex;
+  align-items: center;
+  padding: 0 0 0 14px;
+  cursor: pointer;
+}
+
+.pick input {
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.pick:has(input:disabled) {
+  cursor: default;
+  opacity: 0.35;
+}
+
+table.compare th[scope="col"] {
+  vertical-align: top;
+  min-width: 130px;
+}
+
+table.compare tbody th {
+  position: sticky;
+  left: 0;
+  background: var(--surface);
+  z-index: 1;
+}
+
+table.compare td {
+  vertical-align: top;
+}
+
+.col-meta {
+  margin-top: 4px;
+  font-weight: 400;
+  line-height: 1.5;
+}
+
+.base-tag {
+  margin-left: 6px;
+  padding: 0 6px;
+  border-radius: 999px;
+  font-size: 11px;
+  background: var(--wait-bg);
+  color: var(--wait);
+}
+
+.delta {
+  font-size: 12px;
+}
+
+.delta.good {
+  color: var(--ok);
+}
+
+.delta.bad {
+  color: var(--bad);
+}
+
+.delta.same {
+  color: var(--muted);
+}

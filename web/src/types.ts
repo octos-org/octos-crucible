@@ -101,7 +101,7 @@ export interface Manifest {
   eval_id: string;
   created_at: string;
   taskset: string;
-  agent: { name: string; version: string; package?: BlobRef | null };
+  agent: { name: string; version: string; package?: BlobRef | null; commit?: string | null };
   model: string;
   public: boolean;
   replicas: ReplicaEntry[];

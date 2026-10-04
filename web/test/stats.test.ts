@@ -92,6 +92,9 @@ describe("formatting", () => {
     expect(fmtCount(4_120_000)).toBe("4.12M");
     expect(fmtCount(61_200)).toBe("61.2K");
     expect(fmtCount(233)).toBe("233");
+    expect(fmtCount(159_500)).toBe("160K");
+    expect(fmtCount(100_000)).toBe("100K");
+    expect(fmtCount(10_000_000)).toBe("10M");
     expect(fmtUsd(2.314)).toBe("$2.31");
     expect(fmtUsd(0.0012)).toBe("$0.0012");
     expect(fmtDuration(1712)).toBe("28 分 32 秒");

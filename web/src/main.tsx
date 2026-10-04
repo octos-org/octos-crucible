@@ -6,6 +6,8 @@ import { Submit } from "./pages/Submit";
 import { EvalList } from "./pages/EvalList";
 import { EvalDetailPage } from "./pages/EvalDetail";
 import { Tasksets } from "./pages/Tasksets";
+import { ComparePage } from "./pages/Compare";
+import { parseIds } from "./compare";
 import "./style.css";
 
 consumeTokenFromHash();
@@ -14,12 +16,15 @@ type Route =
   | { page: "submit" }
   | { page: "evals" }
   | { page: "eval"; id: string }
-  | { page: "tasksets" };
+  | { page: "tasksets" }
+  | { page: "compare"; ids: string[] };
 
 function parseRoute(hash: string): Route {
   const path = hash.replace(/^#/, "");
   const m = path.match(/^\/evals\/([\w-]+)$/);
   if (m) return { page: "eval", id: m[1] };
+  const c = path.match(/^\/compare(?:\?(.*))?$/);
+  if (c) return { page: "compare", ids: parseIds(c[1] ?? "") };
   if (path === "/submit") return { page: "submit" };
   if (path === "/tasksets") return { page: "tasksets" };
   return { page: "evals" };
@@ -102,7 +107,7 @@ function Shell() {
         </a>
         <nav>
           {token && nav("#/submit", "提交", route.page === "submit")}
-          {token && nav("#/evals", "我的评测", route.page === "evals" || route.page === "eval")}
+          {token && nav("#/evals", "我的评测", route.page === "evals" || route.page === "eval" || route.page === "compare")}
           {nav("#/tasksets", "题目包", route.page === "tasksets")}
         </nav>
         <div class="who">
@@ -131,6 +136,7 @@ function Shell() {
         {route.page === "evals" && <EvalList />}
         {route.page === "eval" && <EvalDetailPage id={route.id} />}
         {route.page === "tasksets" && <Tasksets />}
+        {route.page === "compare" && <ComparePage ids={route.ids} />}
       </main>
     </>
   );
