@@ -53,6 +53,9 @@ struct Mock {
     now: Cell<u64>,
     logs: RefCell<Vec<String>>,
     rng: Cell<u8>,
+    /// Keys whose reads return an old value (KV is eventually consistent:
+    /// a read can miss a recent write). See [`Mock::freeze`].
+    stale: RefCell<BTreeMap<String, Option<Vec<u8>>>>,
 }
 
 impl Mock {
@@ -63,7 +66,19 @@ impl Mock {
             now: Cell::new(NOW),
             logs: RefCell::default(),
             rng: Cell::new(7),
+            stale: RefCell::default(),
         }
+    }
+
+    /// Until [`Mock::thaw`], reads of `key` return its current value, while
+    /// writes still land.
+    fn freeze(&self, key: &str) {
+        let v = self.kv.borrow().get(key).map(|(v, _, _)| v.clone());
+        self.stale.borrow_mut().insert(key.into(), v);
+    }
+
+    fn thaw(&self, key: &str) {
+        self.stale.borrow_mut().remove(key);
     }
 
     fn github(&self, r: &HttpRequest) -> HttpResponse {
@@ -233,6 +248,9 @@ fn run_json(r: &(u64, String, String, Option<String>)) -> Value {
 
 impl Backend for Mock {
     async fn kv_get(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
+        if let Some(old) = self.stale.borrow().get(key) {
+            return Ok(old.clone());
+        }
         let now = self.now.get();
         Ok(self
             .kv
@@ -950,6 +968,87 @@ fn success_without_results_fails_after_grace() {
     assert_eq!(status(), "queued");
     t.mock.now.set(NOW + 601);
     assert_eq!(status(), "failed");
+}
+
+/// A refresh that read the record before the results were written, and
+/// wrote it back after, must not lose them; nor may reads that miss the
+/// results write for a while (KV is eventually consistent).
+#[test]
+fn results_survive_stale_refresh() {
+    let t = T::new();
+    let alice = token(42, "octocat");
+    let art = sealed(b"site");
+    let r = t.call(
+        "POST",
+        "/uploads",
+        &[
+            ("Authorization", &format!("Bearer {alice}")),
+            ("X-Upload-Kind", "app"),
+        ],
+        &art,
+    );
+    let hash = json_of(&r)["hash"].as_str().unwrap().to_string();
+    let eval = json!({
+        "mode": "app", "eval_id": EID, "upload_hash": hash, "taskset": "github-full",
+        "stages": 1, "score_public": false, "consent": true
+    });
+    let r = t.as_user(
+        "POST",
+        "/evals",
+        &alice,
+        &serde_json::to_vec(&eval).unwrap(),
+    );
+    assert_eq!(r.status, 201);
+    let detail = || json_of(&t.as_user("GET", &format!("/evals/{EID}"), &alice, b""));
+    t.mock.gh.borrow_mut().runs[0].2 = "in_progress".into();
+    assert_eq!(detail()["status"], "running:stage-1");
+
+    // Reads of the record and the results now miss later writes.
+    let (rec_key, res_key) = (format!("evals/{EID}"), format!("results/{EID}"));
+    t.mock.freeze(&rec_key);
+    t.mock.freeze(&res_key);
+    t.mock.gh.borrow_mut().runs[0].2 = "completed".into();
+    t.mock.gh.borrow_mut().runs[0].3 = Some("success".into());
+    let manifest = json!({
+        "schema": 1, "eval_id": EID, "created_at": "2026-10-03T00:00:00Z",
+        "taskset": "github-full", "agent": {"name": "uploaded", "version": "1"},
+        "model": "app", "public": false,
+        "replicas": [{"replica": 1, "stages": [
+            {"stage": "stage-1", "score": {"status": "passed", "passed": 1, "total": 1},
+             "usage": {"requests": 0, "prompt_tokens": 0, "cached_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0}}
+        ]}]
+    });
+    let r = t.as_user(
+        "POST",
+        &format!("/internal/results/{EID}"),
+        WORKER_TOKEN,
+        &serde_json::to_vec(&manifest).unwrap(),
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    // This refresh read the record from before the results and writes it
+    // back after them.
+    assert_ne!(detail()["status"], "done");
+    // Long enough later, a refresh that still misses the results gives up
+    // on them and writes `failed`.
+    t.mock.thaw(&rec_key);
+    t.mock.now.set(NOW + 601);
+    assert_eq!(detail()["status"], "failed");
+
+    // Once the results are visible, they win, and the list follows.
+    t.mock.thaw(&res_key);
+    let r = detail();
+    assert_eq!(r["status"], "done");
+    assert_eq!(r["total_score"], 1.0);
+    assert_eq!(
+        r["manifest"]["replicas"][0]["stages"][0]["score"]["passed"],
+        1
+    );
+    let list = json_of(&t.as_user("GET", "/evals", &alice, b""));
+    assert_eq!(list[0]["status"], "done");
+    assert_eq!(list[0]["total_score"], 1.0);
+    // A late refresh from a stale record cannot undo it either.
+    t.mock.now.set(NOW + 2000);
+    assert_eq!(detail()["status"], "done");
 }
 
 #[test]

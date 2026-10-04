@@ -504,6 +504,19 @@ pub struct EvalRecord {
     pub updated_at: String,
 }
 
+/// KV `results/<eval_id>`: what the workflow posted to
+/// `POST /internal/results`. Only that endpoint writes this key; refreshing
+/// from GitHub writes `evals/<eval_id>` and never touches it, so a refresh
+/// that read a stale record cannot erase results.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredResults {
+    pub manifest: Value,
+    #[serde(default)]
+    pub download_sha256: Option<String>,
+    pub status: String,
+    pub updated_at: String,
+}
+
 /// Shown by `GET /evals` and kept as KV key metadata (< 1 KiB) so the list
 /// needs a single KV call.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -525,6 +538,27 @@ pub struct EvalSummary {
 impl EvalRecord {
     fn parsed_manifest(&self) -> Option<Manifest> {
         serde_json::from_value::<Manifest>(self.manifest.clone()?).ok()
+    }
+
+    /// The eval as shown: posted results win over the record. A terminal
+    /// results status is final; otherwise a failed record (the run died
+    /// after partial results) stays failed, and anything else takes the
+    /// further of the two.
+    pub fn with_results(mut self, r: Option<&StoredResults>) -> EvalRecord {
+        let Some(r) = r else { return self };
+        self.manifest = Some(r.manifest.clone());
+        if r.download_sha256.is_some() {
+            self.download_sha256.clone_from(&r.download_sha256);
+        }
+        if is_terminal(&r.status)
+            || (!is_terminal(&self.status) && status_rank(&r.status) > status_rank(&self.status))
+        {
+            self.status.clone_from(&r.status);
+        }
+        if r.updated_at > self.updated_at {
+            self.updated_at.clone_from(&r.updated_at);
+        }
+        self
     }
 
     pub fn total_score(&self) -> Option<f64> {
