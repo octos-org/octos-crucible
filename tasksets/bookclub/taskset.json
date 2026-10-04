@@ -1,0 +1,57 @@
+{
+  "schema": 1,
+  "name": "bookclub",
+  "description": "Public tuning task, harder than todo-mini: a small book club web app built over 3 stages on the same code (accounts and sign-in with a seeded user; books with list and detail pages; reviews, average ratings and a personal page). Exact accessible names, redirects, seeded data and cross-stage behaviour are tested. Requirements and tests are public (source/), written for this platform (not from ARC). Scored with Playwright browser tests (5 / 6 / 6).",
+  "scorer": {
+    "name": "playwright"
+  },
+  "aggregate": {
+    "items": "sum",
+    "stages": "ratio"
+  },
+  "total_time_limit_s": 3600,
+  "stages": [
+    {
+      "id": "stage-1",
+      "inputs_blob": {
+        "sha256": "db77f65f1b97debead752d5ee445beb7218a5acdac228b20ddad5448b3006357",
+        "key_id": "1ffa702796eb5ee8"
+      },
+      "tests_blob": {
+        "sha256": "f4b7e80868ad1ca6abcd69118fc30253c838650e4aff1c39f4dcd81fdbaa8106",
+        "key_id": "1ffa702796eb5ee8"
+      },
+      "output": "web-app",
+      "time_limit_s": 1200,
+      "expected_total": 5
+    },
+    {
+      "id": "stage-2",
+      "inputs_blob": {
+        "sha256": "faf519013435062b5c8a1ce75bc9e692d230cd08e794d08a5a35459a2edf4811",
+        "key_id": "1ffa702796eb5ee8"
+      },
+      "tests_blob": {
+        "sha256": "f1bb1e03305ce8b49765012277d4bf21eadf42a8363811c534f149333f1a4711",
+        "key_id": "1ffa702796eb5ee8"
+      },
+      "output": "web-app",
+      "time_limit_s": 1200,
+      "expected_total": 6
+    },
+    {
+      "id": "stage-3",
+      "inputs_blob": {
+        "sha256": "a733cfe726dbc0f100ccccb47a8c7715c15ae5c7dee59f84e79568094a3da107",
+        "key_id": "1ffa702796eb5ee8"
+      },
+      "tests_blob": {
+        "sha256": "59ca5c5275b134dd0273e041f9a89d0b4ae34d7d8e7359ce0b0250ec8654271c",
+        "key_id": "1ffa702796eb5ee8"
+      },
+      "output": "web-app",
+      "time_limit_s": 1200,
+      "expected_total": 6
+    }
+  ]
+}

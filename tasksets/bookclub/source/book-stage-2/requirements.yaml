@@ -1,0 +1,52 @@
+id: ROOT
+name: Book Club - Stage 2
+type: FOLDER
+dependencies: []
+description: |-
+  The book club application already exists from the previous stage: the home page `/` with the heading "Book Club", sign-in at `/login` (the account "alice" / "alice123" exists from the start), sign-out, and account creation at `/register`. Everything it does must keep working. This stage adds books: a list of books, adding books and a page per book.
+children:
+- id: REQ-4
+  name: Book List
+  type: ATOMIC
+  dependencies: []
+  description: |-
+    The home page has a link named "Books" leading to `/books`, whether or not the visitor is signed in. The page `/books` shows a level-1 heading "Books" and lists every stored book as a list item containing a link whose name is the book's title and which leads to that book's page `/books/<id>`. The book "Dune" by "Frank Herbert", added by "alice", exists from the start. Anyone can see the list, signed in or not.
+  scenarios:
+  - name: 'REQ-4: Book List - Scenario 1'
+    steps:
+    - keyword: GIVEN
+      content: 'A visitor who is not signed in is on the home page.'
+    - keyword: WHEN
+      content: 'They follow the "Books" link.'
+    - keyword: THEN
+      content: 'The page `/books` shows the heading "Books" and a link "Dune".'
+- id: REQ-5
+  name: Add Book
+  type: ATOMIC
+  dependencies: [REQ-4]
+  description: |-
+    A signed-in user sees on `/books` a text input labelled "Title", a text input labelled "Author" and a button named "Add book". Pressing "Add book" stores a new book with that title and author, added by the signed-in user, and the list then includes a link with the new title. If the title or the author is empty the page shows "Title and author are required" and nothing is stored. A visitor who is not signed in does not see the form or the "Add book" button.
+  scenarios:
+  - name: 'REQ-5: Add Book - Scenario 1'
+    steps:
+    - keyword: GIVEN
+      content: 'The user "alice" is signed in and on `/books`.'
+    - keyword: WHEN
+      content: 'She enters the title "Emma" and the author "Jane Austen" and presses "Add book".'
+    - keyword: THEN
+      content: 'The list includes a link "Emma".'
+- id: REQ-6
+  name: Book Page
+  type: ATOMIC
+  dependencies: [REQ-4]
+  description: |-
+    The page `/books/<id>` of a book shows a level-1 heading with exactly the book's title, the text "Author: <author>", the text "Added by: <username>" and a link named "All books" leading to `/books`. Anyone can open it. For an id that does not exist the server answers with HTTP status 404 and a page showing "Book not found".
+  scenarios:
+  - name: 'REQ-6: Book Page - Scenario 1'
+    steps:
+    - keyword: GIVEN
+      content: 'A visitor is on `/books`.'
+    - keyword: WHEN
+      content: 'They follow the link "Dune".'
+    - keyword: THEN
+      content: 'The page shows the heading "Dune", "Author: Frank Herbert" and "Added by: alice"; the "All books" link returns to `/books`.'
