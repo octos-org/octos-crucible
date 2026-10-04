@@ -19,7 +19,6 @@
 # Host requirements: bash (3.2+), docker, timeout (coreutils).
 # Environment (optional):
 #   CRUCIBLE_SCORER_IMAGE        prebuilt scorer image (default: build ./image)
-#   CHROMIUM_SANDBOX             1 (default) or 0 = launch Chromium with --no-sandbox
 #   CRUCIBLE_PRUNE_BUILD_CACHE   1 = `docker builder prune` after the run
 #                                (for throwaway CI machines; off by default
 #                                because it wipes the whole daemon's cache)
@@ -213,8 +212,11 @@ fi
 
 # 4. Playwright runner: sees only the tests (read-only) and the app's URL.
 # The tests may be untrusted (uploaded tasksets): no environment beyond the
-# three variables below, non-root, no capabilities, no-new-privileges, on
-# the internal network only (plus the firewall above on CI).
+# three variables below, non-root, no capabilities, no-new-privileges,
+# Docker's default seccomp profile, on the internal network only (plus the
+# firewall above on CI). The container is the boundary: test code runs in it
+# directly, so Chromium's own sandbox (which needs user namespaces, i.e.
+# capabilities and a looser seccomp profile) would add nothing and is off.
 # Retried once if the harness itself died without a report (scorer fault);
 # never retried once the app was ready and tests ran or timed out.
 if [ -z "$STATUS" ]; then
@@ -228,10 +230,9 @@ if [ -z "$STATUS" ]; then
       --label "$LABEL" --user "$RUN_AS" \
       -e "BASE_URL=http://app:$APP_PORT" \
       -e "READY_TIMEOUT=$READY_TIMEOUT_S" \
-      -e "CHROMIUM_SANDBOX=${CHROMIUM_SANDBOX:-1}" \
+      -e "CHROMIUM_SANDBOX=0" \
       --memory=2g --cpus=2.0 --pids-limit=1024 \
       --cap-drop ALL --security-opt no-new-privileges \
-      --security-opt "seccomp=$HERE/seccomp_profile.json" \
       --shm-size=1g \
       -v "$TESTS:/pack:ro" \
       -v "$RESULTS:/results" \

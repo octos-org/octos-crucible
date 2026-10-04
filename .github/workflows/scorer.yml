@@ -49,10 +49,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # Chromium's own sandbox needs unprivileged user namespaces, which
-      # ubuntu-24.04 restricts via AppArmor. Throwaway VM, this job only.
-      - name: allow unprivileged user namespaces
-        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - name: build scorer image
         run: docker build -t crucible-scorer-playwright:ci scorers/playwright/image
       - name: score fixture app
