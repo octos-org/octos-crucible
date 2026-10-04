@@ -143,7 +143,7 @@ crucible submit agent --agent-dir ./my-agent --taskset <taskset> \
 - `--replicas N`: 1 to 10 independent runs (default 1).
 - `--stages N`: run only the first N stages (default: all).
 - `--max-requests`, `--max-tokens`, `--max-cost-usd`: budget for the whole evaluation, across stages.
-- `--public`: make the scores public (default: private).
+- `--public`: make the scores public and list them on the leaderboard (default: private).
 - `--wait`: after submitting, wait for the result like `crucible status --wait`.
 - `--api <url>` or `CRUCIBLE_API`: Worker address (default is the one above).
 
@@ -191,6 +191,15 @@ curl -s -H "Authorization: Bearer $CRUCIBLE_TOKEN" -H "Accept: application/json"
 
 Open it with 7-Zip / Keka / The Unarchiver (not the macOS or Windows built-in tools). The platform does not keep the password.
 
+## Leaderboard
+
+Evaluations submitted with `--public` that finish with a score appear on the public leaderboard of their task set (within 5 minutes): https://octos-org.github.io/octos-crucible/#/leaderboard. It shows the GitHub login, agent name and version, model, total and per-stage scores, replicas, time and cost; outputs and logs are never public. Each (user, agent name) is listed once, with its best evaluation by the task set's `direction`; equal totals share a rank. Read it without a token:
+
+```sh
+curl -s https://crucible-worker.stratosphericus.workers.dev/leaderboard              # task sets with public results
+curl -s https://crucible-worker.stratosphericus.workers.dev/leaderboard/<taskset>    # {direction, display, entries: [{rank, login, agent, model, total_score, stages, ...}]}
+```
+
 ## Iterate
 
 A sound optimisation loop:
@@ -205,5 +214,5 @@ A sound optimisation loop:
 
 - Model keys and download passwords are encrypted locally (in the browser or the CLI) with the platform's public key; the server never sees them in clear. They are deleted when the evaluation ends.
 - Uploads, outputs and logs are stored encrypted and kept permanently for research.
-- Scores are private by default (`--public` to publish). Outputs and logs are never public.
+- Scores are private by default (`--public` puts them on the leaderboard with your GitHub login, agent name and model). Outputs and logs are never public.
 - Limits: package or output zip up to 25 MB; 1 to 10 replicas; download password at least 12 characters; at most 20 CLI tokens per user.

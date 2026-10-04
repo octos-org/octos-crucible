@@ -10,6 +10,7 @@ use crate::github::{GitHub, RunView, TasksetInfo, UploadOutcome, view_run};
 use crate::http::Stmt;
 use crate::http::{ApiError, Backend, PutOptions, Req, Resp};
 use crate::keys;
+use crate::leaderboard;
 use crate::model::{
     BUILDING, CRED_TTL_S, DONE, EvalRecord, EvalRequest, FAILED, MAX_UPLOAD, Mode, QUEUED,
     StoredResults, UploadRecord, ValidEval, is_login, is_status, is_terminal, is_uuid_v4,
@@ -29,6 +30,7 @@ const OAUTH_COOKIE: &str = "crucible_oauth";
 const TASKSETS_CACHE: &str = "tasksets";
 const TASKSETS_TTL_S: u64 = 300;
 const LIST_LIMIT: usize = 1000;
+const LEADERBOARD_TTL_S: u64 = 300;
 const MAX_LISTED_USER_TASKSETS: usize = 50;
 /// How long a run may be finished before missing results count as failure.
 const RESULTS_GRACE_S: u64 = 600;
@@ -152,6 +154,8 @@ impl<'a, B: Backend> App<'a, B> {
                 ))
             }
             ("GET", ["pubkey"]) => Ok(Resp::json(200, keys::current())),
+            ("GET", ["leaderboard"]) => self.leaderboards().await,
+            ("GET", ["leaderboard", ts]) => self.leaderboard(ts).await,
             ("GET", ["tasksets"]) => self.list_tasksets(req).await,
             ("POST", ["tasksets"]) => self.create_taskset(req).await,
             ("GET", ["tasksets", id]) => self.get_taskset(req, id).await,
@@ -419,6 +423,79 @@ impl<'a, B: Backend> App<'a, B> {
             )
             .await;
         Ok(list)
+    }
+
+    // ---- leaderboard ----------------------------------------------------
+
+    /// A JSON value from the D1 cache, or computed and cached for
+    /// [`LEADERBOARD_TTL_S`].
+    async fn cached<F: std::future::Future<Output = Result<serde_json::Value>>>(
+        &self,
+        key: &str,
+        compute: F,
+    ) -> Result<Resp> {
+        let now = self.b.now_s();
+        if let Ok(Some(raw)) = self.db().cache_get(key, now).await
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw)
+        {
+            return Ok(Resp::json(200, &v));
+        }
+        let v = compute.await?;
+        let _ = self
+            .db()
+            .cache_put(key, &v.to_string(), Some(now + LEADERBOARD_TTL_S))
+            .await;
+        Ok(Resp::json(200, &v))
+    }
+
+    /// `GET /leaderboard`: tasksets that have public results.
+    async fn leaderboards(&self) -> Result<Resp> {
+        self.cached("leaderboard", async {
+            let list = self
+                .db()
+                .leaderboards()
+                .await
+                .map_err(|e| self.storage_err(e))?;
+            Ok(json!(list))
+        })
+        .await
+    }
+
+    /// `GET /leaderboard/:taskset`: the best public eval of each (owner,
+    /// agent), see `crate::leaderboard`.
+    async fn leaderboard(&self, taskset: &str) -> Result<Resp> {
+        if !crate::model::is_slug(taskset) {
+            return Err(ApiError::not_found("no such taskset"));
+        }
+        self.cached(&format!("leaderboard/{taskset}"), async {
+            let db = self.db();
+            let (cands, display, stage_display) = db
+                .leaderboard_candidates(taskset, leaderboard::MAX_CANDIDATES)
+                .await
+                .map_err(|e| self.storage_err(e))?;
+            let direction = display.as_ref().map(|d| d.direction).unwrap_or_default();
+            let ranked = leaderboard::rank(cands, direction);
+            let ids: Vec<&str> = ranked.iter().map(|(_, c)| c.eval_id.as_str()).collect();
+            let manifests = db.manifests(&ids).await.map_err(|e| self.storage_err(e))?;
+            let entries = ranked
+                .into_iter()
+                .map(|(r, c)| {
+                    let m = manifests
+                        .iter()
+                        .find(|(id, _)| *id == c.eval_id)
+                        .and_then(|(_, m)| serde_json::from_value(m.clone()).ok());
+                    leaderboard::entry(r, c, m.as_ref())
+                })
+                .collect();
+            Ok(json!(leaderboard::Board {
+                taskset: taskset.to_owned(),
+                direction,
+                display,
+                stage_display,
+                entries,
+            }))
+        })
+        .await
     }
 
     // ---- user tasksets --------------------------------------------------

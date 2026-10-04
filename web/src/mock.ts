@@ -233,6 +233,50 @@ export const mockBackend: Backend = {
     if (!s) return Promise.reject(new ApiError(404, "not_found", "评测不存在"));
     return delay({ eval_id: id, status: s.status });
   },
+  leaderboards: () => delay([{ taskset: "github-full", evals: 3, latest_at: "2026-10-02T08:12:00Z" }]),
+  leaderboard: (taskset) =>
+    delay({
+      taskset,
+      direction: "higher" as const,
+      entries: [
+        {
+          rank: 1,
+          login: "demo-user",
+          agent: "my-agent",
+          agent_version: "0.3.0",
+          model: "glm-5.3",
+          total_score: 0.7746,
+          stages: [
+            { stage: "stage-1", score: 28, max: 30 },
+            { stage: "stage-2", score: 33, max: 42 },
+            { stage: "stage-3", score: 34.5, max: 55 },
+          ],
+          replicas: 2,
+          wall_s: 9120,
+          cost_usd: 3.42,
+          created_at: "2026-10-02T08:12:00Z",
+          eval_id: "7c1e2f5a-0b8d-4e57-9a51-3f2c1d0e9b11",
+        },
+        {
+          rank: 2,
+          login: "octocat",
+          agent: "baseline",
+          agent_version: "1.0",
+          model: "glm-5.3",
+          total_score: 0.5,
+          stages: [
+            { stage: "stage-1", score: 20, max: 30 },
+            { stage: "stage-2", score: 21, max: 42 },
+            { stage: "stage-3", score: null, max: null },
+          ],
+          replicas: 1,
+          wall_s: 6000,
+          cost_usd: null,
+          created_at: "2026-10-01T10:00:00Z",
+          eval_id: "2b7e6a52-1f3c-4d2a-9e8b-7c6d5e4f3a21",
+        },
+      ],
+    }),
   tokens: () => delay(TOKENS),
   async createToken(name) {
     const id = toHex(crypto.getRandomValues(new Uint8Array(8)));

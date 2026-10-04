@@ -74,6 +74,31 @@ GitHub 回调。换取 token、读取用户之后，用户的 GitHub token 立�
 之后是用户上传的题目包（见下节），按上传时间倒序，最多 50 个：匿名只看到已公开且可用的；带令牌时另有自己上传的（任何状态）；管理员加 `?all=1` 看到全部。令牌无效时按匿名处理。上传的题目包多几个字段：
 `{"name": "u-0123456789abcdef", "version": "upload", "stages": [...], "title": "<source.json 里的 name>", "owner_login": "...", "public": false, "status": "packing|ready|failed", "error"?: "..."}`。`stages` 在 `ready` 之前为空。
 
+## 排行榜
+
+两个接口都无需登录，结果在 D1 表 `cache` 中缓存 5 分钟（键 `leaderboard`、`leaderboard/<题目包>`），所以新成绩最多 5 分钟后出现。
+
+只有同时满足下面几条的评测才会上榜：提交时 `score_public = true`、结果状态 `done` 且有总分、提交者未被封禁、题目包是内置的或已公开的用户题目包。私有评测不在查询范围内（查询走只包含公开评测的部分索引 `evals_public_taskset`，不扫全表）。榜上只有下面列出的字段；产出、日志、下载地址始终不公开。
+
+### `GET /leaderboard`
+→ 有公开成绩的题目包，最近有成绩的在前：`[{"taskset": "hello-world", "evals": 3, "latest_at": "<最近一次公开评测的时间>"}]`（`evals` 是公开且完成的评测数）。
+
+### `GET /leaderboard/:taskset`
+```json
+{"taskset": "hello-world", "direction": "higher",
+ "display": {"decimals": 1, "format": "percent", ...}, "stage_display": {...},
+ "entries": [{"rank": 1, "login": "octocat", "agent": "my-agent", "agent_version": "0.3.0",
+   "model": "glm-5.3", "total_score": 0.9,
+   "stages": [{"stage": "stage-1", "score": 27, "max": 30}],
+   "replicas": 3, "wall_s": 1834.5, "cost_usd": 0.42,
+   "created_at": "...", "eval_id": "..."}]}
+```
+- 候选为该题目包最近 2000 次公开完成的评测。每个（用户, agent 名）只取最好的一次：方向 `direction` 取最近一次公开评测快照里总分的 `display.direction`（没有快照时为 `higher`），`higher` 取总分最大、`lower` 取最小；总分相同取更早的那次。最多 100 行。
+- 排序同上；总分相同的名次并列（1, 1, 3），更早的排前。
+- `total_score` 即结果表里按快照 aggregate 算出的总分（同 `GET /evals`）；`display` / `stage_display` 是最近一次公开评测快照里的总分与阶段分展示方式（没有快照的旧评测不带，按百分比与 `通过数/总数` 显示）。
+- `stages`：每阶段在各遍之间的平均分（没有一遍打出分时为 `null`）和满分；`replicas` 为遍数；`wall_s` / `cost_usd` 为每遍各阶段之和的平均，有一遍价格未知时 `cost_usd` 为 `null`。`model` 在 app 模式未填时为 `null`。
+- 名称不合法 → 404；没有公开成绩 → `entries: []`。
+
 ## 用户上传的题目包
 
 zip 的格式同 `tasksets/hello-world/source`（`source.json` + 各阶段目录），检查规则即 `crucible taskset validate`：格式（未知字段拒绝）、阶段 id、每阶段的输入与测试都存在且不重叠、无符号链接、各阶段限时之和 ≤ 总限时 ≤ 18000 s、打分器只能是 `playwright`（产出 `web-app`）。
@@ -223,19 +248,19 @@ workflow 通过 `/internal/status` 上报的精确状态优先。估计值只能
 
 ### D1（绑定名 `CRUCIBLE_DB`，数据库 `octos-crucible`）
 
-表结构见 `crates/crucible-worker/migrations/0001_init.sql`（`wrangler d1 migrations apply` 执行）。
+表结构见 `crates/crucible-worker/migrations/`（`0001_init.sql`、`0002_leaderboard.sql`，`wrangler d1 migrations apply` 按序执行）。
 
 | 表 | 内容 | 索引 |
 |---|---|---|
 | `uploads` | 主键 `hash`；`owner_id, kind, size, created_at` | 主键 |
-| `evals` | 主键 `eval_id`；提交参数、`status`、`run_id`、`run_url`、`run_completed_s`、时间 | `(owner_id, created_s DESC)`（本人列表）、`(created_s DESC)`（管理员 `?all=1`） |
+| `evals` | 主键 `eval_id`；提交参数、`status`、`run_id`、`run_url`、`run_completed_s`、时间 | `(owner_id, created_s DESC)`（本人列表）、`(created_s DESC)`（管理员 `?all=1`）、`(taskset, created_s DESC) WHERE score_public = 1`（排行榜） |
 | `results` | 主键 `eval_id`；`manifest`（JSON）、`download_sha256`、`status`、`total_score`、`display`、`updated_at` | 主键（列表 JOIN） |
 | `user_tasksets` | 主键 `id`；用户题目包 | `(owner_id)`、`(public, status)` |
 | `tokens` | 主键 `id`；`owner_id, login, name, hash, created_at`（hash = SHA-256(令牌)） | `(owner_id)` |
 | `bans` | 主键 `github_id`；`by_id, at, reason` | 主键 |
-| `cache` | 主键 `key`；`tasksets`（5 分钟）、`release/<tag>`（不过期） | 主键 |
+| `cache` | 主键 `key`；`tasksets`、`leaderboard`、`leaderboard/<题目包>`（5 分钟）、`release/<tag>`（不过期） | 主键 |
 
-常用查询都走主键或索引：详情 2 次主键查询，列表按 `owner_id` 索引取最多 1000 行并按主键 JOIN `results`。
+常用查询都走主键或索引：详情 2 次主键查询，列表按 `owner_id` 索引取最多 1000 行并按主键 JOIN `results`；排行榜只读公开评测的部分索引，再按主键 JOIN `results`，最后按主键取上榜的至多 100 份 manifest。
 
 一次评测的写入（行数，不含索引）：上传 1、提交 1、每个存下来的进度上报 1（agent 模式 `running:<阶段>` × 阶段数 + `scoring`；app 模式 `scoring`）、结果 1。2 个阶段的 agent 评测共 6 行，app 评测 4 行。查询详情/列表不写（只在发现 run 已失败时写 1 行）。
 

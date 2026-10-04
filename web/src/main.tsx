@@ -7,6 +7,7 @@ import { EvalList } from "./pages/EvalList";
 import { EvalDetailPage } from "./pages/EvalDetail";
 import { Tasksets } from "./pages/Tasksets";
 import { ComparePage } from "./pages/Compare";
+import { LeaderboardPage } from "./pages/Leaderboard";
 import { parseIds } from "./compare";
 import "./style.css";
 
@@ -17,6 +18,7 @@ type Route =
   | { page: "evals" }
   | { page: "eval"; id: string }
   | { page: "tasksets" }
+  | { page: "leaderboard"; taskset: string | null }
   | { page: "compare"; ids: string[] };
 
 function parseRoute(hash: string): Route {
@@ -25,6 +27,8 @@ function parseRoute(hash: string): Route {
   if (m) return { page: "eval", id: m[1] };
   const c = path.match(/^\/compare(?:\?(.*))?$/);
   if (c) return { page: "compare", ids: parseIds(c[1] ?? "") };
+  const l = path.match(/^\/leaderboard(?:\/([\w-]+))?$/);
+  if (l) return { page: "leaderboard", taskset: l[1] ?? null };
   if (path === "/submit") return { page: "submit" };
   if (path === "/tasksets") return { page: "tasksets" };
   return { page: "evals" };
@@ -75,7 +79,7 @@ function Login() {
       {!mock && !API_BASE && <p class="notice bad">未配置后端地址（VITE_API_BASE）。</p>}
       <p class="muted small">
         只读取你的 GitHub 用户名。不限次数使用。
-        <a href="#/tasksets" class="link">查看题目包</a>
+        <a href="#/leaderboard" class="link">排行榜</a> · <a href="#/tasksets" class="link">查看题目包</a>
       </p>
     </main>
   );
@@ -97,8 +101,8 @@ function Shell() {
       });
   }, [token]);
 
-  // Task sets are public; everything else needs a session.
-  if (!token && route.page !== "tasksets") return <Login />;
+  // Task sets and leaderboards are public; everything else needs a session.
+  if (!token && route.page !== "tasksets" && route.page !== "leaderboard") return <Login />;
 
   const nav = (href: string, label: string, active: boolean) => (
     <a href={href} class={active ? "active" : ""} aria-current={active ? "page" : undefined}>
@@ -115,6 +119,7 @@ function Shell() {
         <nav>
           {token && nav("#/submit", "提交", route.page === "submit")}
           {token && nav("#/evals", "我的评测", route.page === "evals" || route.page === "eval" || route.page === "compare")}
+          {nav("#/leaderboard", "排行榜", route.page === "leaderboard")}
           {nav("#/tasksets", "题目包", route.page === "tasksets")}
         </nav>
         <div class="who">
@@ -144,6 +149,7 @@ function Shell() {
         {route.page === "eval" && <EvalDetailPage id={route.id} />}
         {route.page === "tasksets" && <Tasksets />}
         {route.page === "compare" && <ComparePage ids={route.ids} />}
+        {route.page === "leaderboard" && <LeaderboardPage taskset={route.taskset} />}
       </main>
     </>
   );

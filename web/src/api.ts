@@ -7,6 +7,8 @@ import type {
   CreateEval,
   EvalDetail,
   EvalSummary,
+  Leaderboard,
+  LeaderboardInfo,
   Me,
   NewApiToken,
   TaskSet,
@@ -91,6 +93,9 @@ export interface Backend {
   evalDetail(id: string): Promise<EvalDetail>;
   /** Start the download of the password zip. */
   download(id: string): Promise<void>;
+  /** Public: tasksets with public results, and one taskset's board. */
+  leaderboards(): Promise<LeaderboardInfo[]>;
+  leaderboard(taskset: string): Promise<Leaderboard>;
   /** Personal API tokens for `crucible submit` (session only). */
   tokens(): Promise<ApiToken[]>;
   createToken(name: string): Promise<NewApiToken>;
@@ -162,6 +167,8 @@ export const httpBackend: Backend = {
     }),
   evals: () => json("/evals"),
   evalDetail: (id) => json(`/evals/${enc(id)}`),
+  leaderboards: () => json("/leaderboard"),
+  leaderboard: (ts) => json(`/leaderboard/${enc(ts)}`),
   tokens: () => json("/tokens"),
   createToken: (name) =>
     json("/tokens", {
