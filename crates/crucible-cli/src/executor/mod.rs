@@ -96,8 +96,9 @@ pub trait Executor {
     fn caps(&self) -> Caps;
 
     /// A sandbox network whose containers reach only `ports` on
-    /// [`Sandbox::host`], checked by probes before it is returned.
-    fn sandbox(&self, ports: &[u16]) -> Result<Sandbox>;
+    /// [`Sandbox::host`], checked by probes before it is returned; it
+    /// carries the run label (see [`Executor::cleanup`]).
+    fn sandbox(&self, ports: &[u16], label: &str) -> Result<Sandbox>;
 
     /// Start a container; returns its id.
     async fn start(&self, c: &ContainerSpec) -> Result<String>;
@@ -108,6 +109,8 @@ pub trait Executor {
     async fn logs(&self, id: &str, tail: usize, to: &Path) -> Result<()>;
     async fn remove(&self, id: &str);
 
-    /// Remove every container labelled `crucible.run=<label>`.
+    /// Remove what the run labelled `crucible.run=<label>` left: its
+    /// containers and its sandbox (network and rules). Scoped: other runs
+    /// on the same machine are never touched.
     fn cleanup(&self, label: &str);
 }

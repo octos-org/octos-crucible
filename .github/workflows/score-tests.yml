@@ -76,14 +76,13 @@ jobs:
           name: ${{ inputs.handoff }}
           path: ${{ github.workspace }}/handoff
 
-      # Check the machine and remove what an earlier job may have left
-      # (no-op on a fresh GitHub-hosted machine).
-      - name: Machine preflight and cleanup
+      # Check the machine. Cleanup is scoped to this job's run label (in
+      # `step score-tests`); other evaluations on the machine are untouched.
+      - name: Machine preflight
         run: |
           set -euo pipefail
           echo "runner: $RUNNER_NAME ($RUNNER_ENVIRONMENT)"
           bash "$H/tools/sandbox-net.sh" preflight
-          bash "$H/tools/sandbox-net.sh" clean
 
       # `crucible step score-tests`: builds the plugin images the taskset
       # uses (plugins.json), brings up the sandbox network when the handoff
@@ -100,7 +99,8 @@ jobs:
         run: |
           set -euo pipefail
           chmod 0755 "$H/bin/crucible"
-          "$H/bin/crucible" step score-tests --handoff "$H" --replica "$REPLICA" --out "$RUNNER_TEMP/scores"
+          "$H/bin/crucible" step score-tests --handoff "$H" --replica "$REPLICA" \
+            --run-label "score-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-r$REPLICA" --out "$RUNNER_TEMP/scores"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -112,5 +112,4 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          if [ -f "$H/tools/sandbox-net.sh" ]; then bash "$H/tools/sandbox-net.sh" clean || true; fi
           rm -rf "$H"

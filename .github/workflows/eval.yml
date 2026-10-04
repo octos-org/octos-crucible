@@ -243,14 +243,14 @@ jobs:
           name: taskset
           path: tasksets/${{ needs.setup.outputs.taskset }}
 
-      # A self-hosted machine is reused: check it, and remove what an
-      # earlier job may have left (no-op on a fresh GitHub-hosted machine).
-      - name: Machine preflight and cleanup
+      # Check the machine. Cleanup is scoped: `step generate` removes what
+      # carries this replica's run label (an earlier attempt's leftovers)
+      # and never touches other evaluations on the same machine.
+      - name: Machine preflight
         run: |
           set -euo pipefail
           echo "runner: $RUNNER_NAME ($RUNNER_ENVIRONMENT)"
           tools/sandbox-net.sh preflight
-          tools/sandbox-net.sh clean
 
       # `crucible step generate` (docs/executors.md): fetch + build the
       # agent, fetch the stage inputs (never the tests; it refuses test
@@ -276,15 +276,14 @@ jobs:
             --stages "$STAGES" --replica "$REPLICA" --cred-source "$CRED_SOURCE" \
             --eval-id "$EVAL_ID" --worker-url "$WORKER_URL" "${progress[@]}" \
             --store "$STORE" --run-timeout-min "$RUN_TIMEOUT_MIN" \
+            --image-tag "crucible-agent-$EVAL_ID:r$REPLICA" \
             --work "$RUNNER_TEMP/work" --out "$RUNNER_TEMP/results"
 
-      - name: Machine cleanup
+      # The step empties its work dir and removes its image and containers
+      # itself; this only covers a step that was killed.
+      - name: Remove the work dir
         if: always()
-        run: |
-          tools/sandbox-net.sh clean || true
-          docker image rm -f crucible-agent:run >/dev/null 2>&1 || true
-          # Inputs and the work tree are not needed once sealed.
-          rm -rf "$RUNNER_TEMP/work" 2>/dev/null || true
+        run: rm -rf "$RUNNER_TEMP/work" 2>/dev/null || true
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()

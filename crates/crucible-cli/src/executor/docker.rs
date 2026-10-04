@@ -117,7 +117,7 @@ impl DockerExecutor {
     }
 
     /// Run tools/sandbox-net.sh `verb` for `slot`; its exit code.
-    fn script(slot: &Slot, ports: &str, verb: &str) -> Result<Option<i32>> {
+    fn script(slot: &Slot, ports: &str, label: &str, verb: &str) -> Result<Option<i32>> {
         let f = tempfile::NamedTempFile::new()?;
         std::fs::write(f.path(), SCRIPT)?;
         let status = Command::new("bash")
@@ -128,6 +128,7 @@ impl DockerExecutor {
             .env("SANDBOX_BRIDGE", &slot.bridge)
             .env("SANDBOX_SUBNET", &slot.subnet)
             .env("SANDBOX_GW", &slot.gateway)
+            .env("SANDBOX_LABEL", label)
             .stdin(Stdio::null())
             .status()
             .with_context(|| format!("sandbox-net.sh {verb}"))?;
@@ -171,7 +172,7 @@ impl Executor for DockerExecutor {
         }
     }
 
-    fn sandbox(&self, ports: &[u16]) -> Result<Sandbox> {
+    fn sandbox(&self, ports: &[u16], label: &str) -> Result<Sandbox> {
         let ports = ports
             .iter()
             .map(u16::to_string)
@@ -179,25 +180,25 @@ impl Executor for DockerExecutor {
             .join(",");
         for k in 0..MAX_SLOTS {
             let slot = Slot::new(k);
-            match Self::script(&slot, &ports, "up")? {
+            match Self::script(&slot, &ports, label, "up")? {
                 Some(0) => {}
                 // The network exists (another evaluation's) or its subnet
                 // is in use: the next slot.
                 Some(3) => continue,
                 other => {
-                    let _ = Self::script(&slot, &ports, "down");
+                    let _ = Self::script(&slot, &ports, label, "down");
                     bail!("sandbox network up failed (exit {other:?})");
                 }
             }
-            let (s2, p2) = (slot.clone(), ports.clone());
+            let (s2, p2, l2) = (slot.clone(), ports.clone(), label.to_owned());
             let sb = Sandbox::new(
                 slot.network.clone(),
                 slot.gateway.clone(),
                 Box::new(move || {
-                    let _ = Self::script(&s2, &p2, "down");
+                    let _ = Self::script(&s2, &p2, &l2, "down");
                 }),
             );
-            if Self::script(&slot, &ports, "check")? != Some(0) {
+            if Self::script(&slot, &ports, label, "check")? != Some(0) {
                 bail!("sandbox network check failed: refusing to run");
             }
             eprintln!(
@@ -234,13 +235,32 @@ impl Executor for DockerExecutor {
 
     fn cleanup(&self, label: &str) {
         let filter = format!("label={RUN_LABEL}={label}");
-        if let Ok(out) = docker().args(["ps", "-aq", "--filter", &filter]).output() {
-            for id in String::from_utf8_lossy(&out.stdout).split_whitespace() {
-                let _ = docker()
-                    .args(["rm", "-f", id])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
+        let ids = |what: &[&str]| -> Vec<String> {
+            docker()
+                .args(what)
+                .args(["--filter", &filter])
+                .output()
+                .map(|o| {
+                    String::from_utf8_lossy(&o.stdout)
+                        .split_whitespace()
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        for id in ids(&["ps", "-aq"]) {
+            let _ = docker()
+                .args(["rm", "-f", &id])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        // A sandbox this run left (killed before it could take it down):
+        // its slot's network and rules.
+        for name in ids(&["network", "ls", "--format", "{{.Name}}"]) {
+            if let Some(slot) = (0..MAX_SLOTS).map(Slot::new).find(|s| s.network == name) {
+                let _ = Self::script(&slot, "8787,3128", label, "down");
+                let _ = Self::script(&slot, "8787", label, "down");
             }
         }
     }

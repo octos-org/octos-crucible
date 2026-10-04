@@ -23,6 +23,10 @@ pub struct Args {
     /// Score only this replica.
     #[arg(long)]
     pub replica: Option<u32>,
+    /// Label of this step's sandbox (`crucible.run=<label>`); what an
+    /// earlier attempt with the same label left is removed first.
+    #[arg(long)]
+    pub run_label: Option<String>,
     /// `<out>/<replica>/<stage>/score.json`.
     #[arg(long)]
     pub out: PathBuf,
@@ -69,9 +73,14 @@ pub async fn run(a: Args, s: &Secrets) -> Result<()> {
         eprintln!("{} {} ready", v.kind, p.name);
     }
 
+    let label = match &a.run_label {
+        Some(l) if !l.is_empty() => l.clone(),
+        _ => format!("score-{}", std::process::id()),
+    };
+    DockerExecutor.cleanup(&label);
     let cred = h.join("cred.sealed");
     let net = if cred.is_file() {
-        Some(DockerExecutor.sandbox(&[METER_PORT])?)
+        Some(DockerExecutor.sandbox(&[METER_PORT], &label)?)
     } else {
         eprintln!("no model credential in the handoff");
         None
@@ -107,6 +116,7 @@ pub async fn run(a: Args, s: &Secrets) -> Result<()> {
     .await;
     drop(model);
     drop(net);
+    DockerExecutor.cleanup(&label);
     eprintln!("scored {} stage checkpoints", done?.len());
     Ok(())
 }

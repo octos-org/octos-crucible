@@ -65,9 +65,15 @@ pub struct Args {
     pub run_timeout_min: u64,
     #[arg(long, default_value = "crucible-agent:run")]
     pub image_tag: String,
-    /// Scratch directory (agent package, inputs, work dir); default: a temp dir.
+    /// Scratch directory (agent package, inputs, work dir; emptied at the
+    /// end); default: a temp dir.
     #[arg(long)]
     pub work: Option<PathBuf>,
+    /// Label of everything this step starts (`crucible.run=<label>`); what
+    /// an earlier attempt with the same label left is removed first.
+    /// Default: `<eval id>-r<replica>`.
+    #[arg(long)]
+    pub run_label: Option<String>,
     /// Output bundle: `<out>/<replica>/...`, sealed files only.
     #[arg(long)]
     pub out: PathBuf,
@@ -87,7 +93,17 @@ pub async fn run(a: Args, s: &Secrets) -> Result<()> {
     };
     let rdir = work.join("run").join(a.replica.to_string());
     std::fs::create_dir_all(&rdir)?;
-    let result = generate(&a, s, &work, &rdir).await;
+    let label = run_label(&a);
+    let exec = DockerExecutor;
+    // Scoped: only what carries this run's label.
+    exec.cleanup(&label);
+    let result = generate(&a, s, &work, &rdir, &label).await;
+    exec.cleanup(&label);
+    let _ = crate::build::docker()
+        .args(["image", "rm", "-f", &a.image_tag])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
     if let Err(e) = &result {
         eprintln!("generate r{}: {e:#}", a.replica);
     }
@@ -104,10 +120,24 @@ pub async fn run(a: Args, s: &Secrets) -> Result<()> {
     }
     // Only sealed files leave this machine.
     super::sealed_only(&a.out, true)?;
+    // Inputs and the work tree are not needed once sealed.
+    if a.work.is_some() {
+        for e in std::fs::read_dir(&work)?.flatten() {
+            let _ = std::fs::remove_dir_all(e.path()).or_else(|_| std::fs::remove_file(e.path()));
+        }
+    }
     result
 }
 
-async fn generate(a: &Args, s: &Secrets, work: &Path, rdir: &Path) -> Result<()> {
+fn run_label(a: &Args) -> String {
+    match &a.run_label {
+        Some(l) if !l.is_empty() => l.clone(),
+        _ if crate::plan::eval_id_ok(&a.eval_id) => format!("{}-r{}", a.eval_id, a.replica),
+        _ => format!("gen-{}-r{}", std::process::id(), a.replica),
+    }
+}
+
+async fn generate(a: &Args, s: &Secrets, work: &Path, rdir: &Path, label: &str) -> Result<()> {
     if super::has_test_material(&a.root)? {
         bail!("test material present in the generation step's root");
     }
@@ -194,7 +224,7 @@ async fn generate(a: &Args, s: &Secrets, work: &Path, rdir: &Path) -> Result<()>
 
     let exec = DockerExecutor;
     super::check_caps(super::spec("generate"), exec.caps())?;
-    let net = exec.sandbox(&[8787, 3128])?;
+    let net = exec.sandbox(&[8787, 3128], label)?;
 
     // The model credential: opened here, kept in this process only.
     let src = CredSource::parse(&a.cred_source)?;
@@ -216,7 +246,6 @@ async fn generate(a: &Args, s: &Secrets, work: &Path, rdir: &Path) -> Result<()>
     let cred = crucible_meter::read_credential(&mut line.as_bytes()).map_err(|e| anyhow!("{e}"))?;
     drop(line);
 
-    let label = format!("gen-{}-r{}", std::process::id(), a.replica);
     let args = runners::RunArgs {
         image: a.image_tag.clone(),
         agent_json: pkg.join("agent.json"),
@@ -237,7 +266,7 @@ async fn generate(a: &Args, s: &Secrets, work: &Path, rdir: &Path) -> Result<()>
         snapshot_interval_s: 900,
         grace_s: 30,
         user: None,
-        run_label: label.clone(),
+        run_label: label.to_owned(),
     };
     // Progress: replica 1 reports running:<stage> as each stage starts.
     let reporter = match (a.report_progress && a.replica == 1, a.worker_url.is_empty()) {
@@ -261,7 +290,7 @@ async fn generate(a: &Args, s: &Secrets, work: &Path, rdir: &Path) -> Result<()>
     )
     .await;
     drop(cred);
-    exec.cleanup(&label);
+    exec.cleanup(label);
     drop(net);
     match r {
         Ok(r) => r,

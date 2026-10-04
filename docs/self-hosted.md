@@ -82,11 +82,11 @@ no_proxy=localhost,127.0.0.1,::1,172.31.250.1
 
 ## 每个 job 的清理
 
-托管机一次性使用，自托管机不是，所以两步都在开头和结尾清理：
+托管机一次性使用，自托管机不是，所以两步都在开头和结尾清理。一台机器可以同时跑多个评测（沙箱按槽位分配，见 `docs/executors.md`），所以清理**按作用域**：只删带本步运行标签（`crucible.run=<标签>`，`generate` 是 `<eval_id>-r<N>`，`score-tests` 是 `score-<run id>-<attempt>-r<N>`）的东西，绝不碰同机器上别的评测。
 
-- 开头：`sandbox-net.sh preflight`，再 `sandbox-net.sh clean`；`score-tests` 先删掉工作区里旧的 `handoff/`。
-- 结尾（总会执行）：`sandbox-net.sh down` 与 `clean`，删掉 agent 镜像 `crucible-agent:run`、阶段输入和工作目录；`score-tests` 删掉 `handoff/`。
-- `clean` 删的是：名字以 `crucible-` 开头的容器和卷、带 `crucible.scorer.run` 标签的容器、打分器网络（`crucible-net-*`、`crucible-bnet-*`）、沙箱网络 `crucible-sbx`，以及 `INPUT`、`DOCKER-USER` 链里指向坩埚网桥（`crucible0`、`crs*`、`crb*`）的规则。不碰 Docker 自己的链。
+- 开头：`sandbox-net.sh preflight`（只检查）；步骤自己先删掉同一标签上一次尝试留下的容器和沙箱（网络与 iptables 规则）；`score-tests` 先删掉工作区里旧的 `handoff/`。
+- 结尾（总会执行）：步骤删掉本标签的容器和沙箱、本评测的 agent 镜像（`crucible-agent-<eval_id>:r<N>`）、清空工作目录（阶段输入、agent 包、工作区）；`score-tests` 删掉 `handoff/`。打分器脚本自己的容器和网络按每次运行的名字在退出时自删。
+- `sandbox-net.sh clean` 只作手动兜底：它删整台机器上所有坩埚容器和卷、带 `crucible.scorer.run` 标签的容器、打分器网络（`crucible-net-*`、`crucible-bnet-*`）、所有沙箱网络（`crucible-sbx*`），以及 `INPUT`、`DOCKER-USER` 链里指向坩埚网桥（`crucible<k>`、`crs*`、`crb*`）的规则，不碰 Docker 自己的链。**有评测在跑时不要执行**，工作流不调用它。
 - `CRUCIBLE_PRUNE_BUILD_CACHE` 只在托管机上开，自托管机保留构建缓存（否则会清掉整台机器的缓存）。
 - `$RUNNER_TEMP` 由运行器在每个 job 开始时清空。
 
