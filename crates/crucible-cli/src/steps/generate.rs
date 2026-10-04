@@ -98,11 +98,7 @@ pub async fn run(a: Args, s: &Secrets) -> Result<()> {
     exec.cleanup(&label);
     let result = generate(&a, s, &work, &rdir, &label).await;
     exec.cleanup(&label);
-    let _ = crate::build::docker()
-        .args(["image", "rm", "-f", &a.image_tag])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+    exec.image_rm(&a.image_tag).await;
     if let Err(e) = &result {
         eprintln!("generate r{}: {e:#}", a.replica);
     }
@@ -196,8 +192,13 @@ async fn generate(a: &Args, s: &Secrets, work: &Path, rdir: &Path, label: &str) 
         opts.expect_commit = Some(commit);
     }
     let tag = a.image_tag.clone();
-    let pkg2 = pkg.clone();
-    let built = tokio::task::spawn_blocking(move || build::build(&pkg2, &tag, &opts)).await?;
+    let built = match crate::executor::backend()? {
+        crate::executor::Backend::K8s(k) => build::build_k8s(&k, &pkg, &tag, &opts).await,
+        crate::executor::Backend::Docker(_) => {
+            let pkg2 = pkg.clone();
+            tokio::task::spawn_blocking(move || build::build(&pkg2, &tag, &opts)).await?
+        }
+    };
     let facts = match built {
         Ok(f) => f,
         Err(e) => {

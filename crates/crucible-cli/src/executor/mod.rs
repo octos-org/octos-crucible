@@ -1,7 +1,7 @@
 //! The execution backend (docs/executors.md §2.3): how a step starts the
 //! containers it needs. Steps, runners and the plugin scripts (through
-//! `crucible ctr`) only use [`Executor`]; Docker ([`docker::DockerExecutor`])
-//! is the first backend.
+//! `crucible ctr`) only use [`Executor`]: Docker ([`docker::DockerExecutor`])
+//! or native Kubernetes ([`k8s::K8sExecutor`], Pods + NetworkPolicy).
 //!
 //! Deliberately absent: privileged mode, host paths other than the step's
 //! own directories, host networking. Steps cannot express them, so no
@@ -13,6 +13,7 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 
 pub mod docker;
+pub mod k8s;
 
 /// What a backend can do; a step checks its needs against this and refuses
 /// to start rather than run with weaker isolation.
@@ -244,12 +245,15 @@ pub trait Executor {
 /// default).
 pub enum Backend {
     Docker(docker::DockerExecutor),
+    /// `CRUCIBLE_EXECUTOR=k8s`: inside a step Pod (docs/kubernetes.md).
+    K8s(Box<k8s::K8sExecutor>),
 }
 
 pub fn backend() -> Result<Backend> {
     match std::env::var("CRUCIBLE_EXECUTOR").as_deref() {
         Err(_) | Ok("") | Ok("docker") => Ok(Backend::Docker(docker::DockerExecutor)),
-        Ok(other) => bail!("CRUCIBLE_EXECUTOR={other}: unknown backend (docker)"),
+        Ok("k8s") => Ok(Backend::K8s(Box::new(k8s::K8sExecutor::from_env()?))),
+        Ok(other) => bail!("CRUCIBLE_EXECUTOR={other}: unknown backend (docker, k8s)"),
     }
 }
 
@@ -257,6 +261,7 @@ macro_rules! each {
     ($self:ident, $e:ident => $body:expr) => {
         match $self {
             Backend::Docker($e) => $body,
+            Backend::K8s($e) => $body,
         }
     };
 }

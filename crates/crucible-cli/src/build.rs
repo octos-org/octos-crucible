@@ -165,6 +165,57 @@ pub fn build(pkg: &Path, tag: &str, opts: &BuildOpts) -> Result<BuildFacts> {
     })
 }
 
+/// The same build on the Kubernetes backend: BuildKit, pushed to the
+/// cluster registry; size and `/agent-build.json` read from the registry.
+pub async fn build_k8s(
+    exec: &crate::executor::k8s::K8sExecutor,
+    pkg: &Path,
+    tag: &str,
+    opts: &BuildOpts,
+) -> Result<BuildFacts> {
+    use crate::executor::Executor;
+    crate::agentpkg::validate(pkg)?;
+    check_opts(opts)?;
+    let b = crate::executor::BuildSpec {
+        dir: pkg.to_path_buf(),
+        tag: tag.to_owned(),
+        build_args: opts.build_args.clone(),
+        labels: vec![("crucible.agent".into(), "1".into())],
+        plain_progress: true,
+        ..Default::default()
+    };
+    let log = match &opts.log {
+        Some(p) => p.clone(),
+        None => std::env::temp_dir().join(format!("build-{}.log", std::process::id())),
+    };
+    let fut = exec.build(&b, &log);
+    match opts.timeout {
+        Some(t) => tokio::time::timeout(t, fut)
+            .await
+            .map_err(|_| anyhow::anyhow!("image build timed out"))??,
+        None => fut.await?,
+    }
+    let image = exec.image_ref(tag);
+    let (size_bytes, agent_build) = crate::executor::k8s::image_facts(&exec.conf, &image).await?;
+    if size_bytes > MAX_IMAGE_BYTES {
+        bail!("agent image is {size_bytes} bytes, more than {MAX_IMAGE_BYTES}");
+    }
+    if let Some(want) = &opts.expect_commit {
+        let got = agent_build["commit"].as_str().unwrap_or("");
+        if got != want {
+            bail!(
+                "the image was built from commit {got:?}, not the pinned {want} (/agent-build.json)"
+            );
+        }
+    }
+    Ok(BuildFacts {
+        image,
+        size_bytes,
+        agent_build,
+        expected_commit: opts.expect_commit.clone(),
+    })
+}
+
 /// `docker create` + `docker cp` (the image is not run), at most 2000 bytes.
 fn agent_build_json(tag: &str) -> serde_json::Value {
     let Ok(out) = docker().args(["create", tag]).output() else {
