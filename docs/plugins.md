@@ -36,7 +36,7 @@ P3 起 `score-tests` 按遍拆成矩阵（每遍一个 job），因为交互运�
 
 ## 3. 插件注册表
 
-注册表是仓库根目录的 `plugins.json`，只有维护者能改（与改代码一样走 PR 评审）。核心、Worker、`taskset-pack` job 都只认这张表里的名字。
+注册表是仓库根目录的 `plugins.json`，只有维护者能改（与改代码一样走 PR 评审）。它编译进 `crucible-core`，命令行、Worker、`taskset-pack` job 都只认这张表里的名字。
 
 ```json
 {
@@ -62,7 +62,7 @@ P3 起 `score-tests` 按遍拆成矩阵（每遍一个 job），因为交互运�
 | `version` | 插件的版本号，改变打分行为时必须加一；记入 manifest |
 | `impl` | `builtin`（编译进 `crucible` 的 Rust 实现）或仓库内目录 |
 | `interactive` | 仅 runner：`true` 表示交互运行器（插槽 3），否则是产出运行器（插槽 1） |
-| `user` | 用户上传的题目包能否引用它。缺省 `false`。取代 user-tasksets 分支里的常量 `USER_SCORERS` |
+| `user` | 用户上传的题目包能否引用它。缺省 `false`。取代 `crucible-core` 里的常量 `USER_SCORERS`（用户题目包登记时的打分器白名单） |
 | `runs_taskset_code` | 它是否把题目包里的文件当代码执行（Playwright 执行测试文件，是 `true`；巡天引擎只读卡片数据，是 `false`）。缺省 `true`（保守） |
 | `model` | 它能否被题目包声明为需要模型（§10）。`runs_taskset_code: true` 的插件不得为 `true`，注册表校验时检查 |
 
@@ -372,7 +372,7 @@ trait Packager {
 | `crates/crucible-cli/src/run.rs` → `runners/{mod,workdir}.rs` | 抽出 `workdir` 运行器，`crucible run` 按题目包的 `runner` 名调用 |
 | `crates/crucible-cli/src/plan.rs`、`taskset_cmd.rs`、`score.rs` | 按注册表校验插件名；打分器路径来自注册表 `impl` |
 | `.github/workflows/score-tests.yml` | "Prepare the scorer" 从注册表取打分器目录，不再拼 `scorers/$name` |
-| user-tasksets 引入的 `USER_SCORERS` 与 Worker 侧检查 | 改为读注册表的 `user` 字段（Worker 从 `EVAL_REF` 读 `plugins.json`，与读 `tasksets/` 相同的缓存方式） |
+| `crucible-core` 的 `USER_SCORERS`，及使用它的 `taskset validate`、`taskset-pack`、Worker `model.rs` | 改为查注册表的 `user` 字段。`plugins.json` 用 `include_str!` 编译进 `crucible-core`，命令行和 Worker 用同一份；加插件后 Worker 需重新部署才认 |
 | `docs/agent-contract.md`（产出一节）、`docs/scorer-contract.md` | 指向本文 |
 
 验证：hello-world agent 模式真跑，产出 zip 的哈希规则和分数与 P1 相同；旧 `"output": "web-app"` 的题目包照常解析；注册表里没有的名字、用户题目包引用 `user: false` 的插件都被拒绝。
