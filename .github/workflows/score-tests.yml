@@ -85,33 +85,11 @@ jobs:
           bash "$H/tools/sandbox-net.sh" preflight
           bash "$H/tools/sandbox-net.sh" clean
 
-      - name: Prepare the plugins
-        run: |
-          set -euo pipefail
-          chmod 0755 "$H/bin/crucible"
-          # The container plugins the taskset uses, from the registry
-          # compiled into crucible (plugins.json): `<kind> <name> <dir>`.
-          # `crucible score` hands each its image (crucible-<kind>-<name>:run).
-          "$H/bin/crucible" plugins --taskset "$H/taskset.json" > "$RUNNER_TEMP/plugins.txt"
-          while read -r kind name dir; do
-            [ -f "$H/$dir/score.sh" ] || [ -f "$H/$dir/run.sh" ] || { echo "::error::$kind $name missing in the handoff"; exit 1; }
-            if [ -d "$H/$dir/image" ]; then
-              docker build -q -t "crucible-$kind-$name:run" "$H/$dir/image" >/dev/null
-            fi
-            echo "$kind $name ready"
-          done < "$RUNNER_TEMP/plugins.txt"
-
-      - name: Sandbox network for the meter
-        run: |
-          set -euo pipefail
-          if [ -f "$H/cred.sealed" ]; then
-            chmod 0755 "$H/tools/sandbox-net.sh"
-            SANDBOX_PORTS=8787 "$H/tools/sandbox-net.sh" up
-            SANDBOX_PORTS=8787 "$H/tools/sandbox-net.sh" check
-          else
-            echo "no model credential in the handoff"
-          fi
-
+      # `crucible step score-tests`: builds the plugin images the taskset
+      # uses (plugins.json), brings up the sandbox network when the handoff
+      # carries a model credential (meter port only), and scores. Its step
+      # spec lists only the one-run key: it reads nothing else and removes
+      # every secret variable from its environment first.
       - name: Run the tests
         env:
           RUN_KEY: ${{ secrets.run_key }}
@@ -121,21 +99,8 @@ jobs:
           CRUCIBLE_PRUNE_BUILD_CACHE: ${{ runner.environment == 'github-hosted' && '1' || '0' }}
         run: |
           set -euo pipefail
-          mkdir -p "$H/results" "$RUNNER_TEMP/scores"
-          model=()
-          if [ -f "$H/cred.sealed" ]; then
-            model=(--cred "$H/cred.sealed" --model-plan "$H/model.json" --pricing "$H/pricing.json")
-          fi
-          "$H/bin/crucible" score --taskset "$H/taskset.json" --replica "$REPLICA" \
-            --results "$H/results" --tests-dir "$H/tests" --out "$RUNNER_TEMP/scores" \
-            --identity-env RUN_KEY --plugins-root "$H" "${model[@]}"
-
-      - name: Stop the sandbox network
-        if: always()
-        run: |
-          if [ -f "$H/tools/sandbox-net.sh" ] && [ -f "$H/cred.sealed" ]; then
-            SANDBOX_PORTS=8787 "$H/tools/sandbox-net.sh" down || true
-          fi
+          chmod 0755 "$H/bin/crucible"
+          "$H/bin/crucible" step score-tests --handoff "$H" --replica "$REPLICA" --out "$RUNNER_TEMP/scores"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

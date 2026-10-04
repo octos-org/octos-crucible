@@ -29,6 +29,11 @@ pub struct BuildOpts {
     pub build_args: Vec<String>,
     /// Fail unless the image's `/agent-build.json` records this commit.
     pub expect_commit: Option<String>,
+    /// Write docker's build output here instead of stderr (it is the
+    /// package's output: kept off public logs).
+    pub log: Option<std::path::PathBuf>,
+    /// Kill the build after this long.
+    pub timeout: Option<std::time::Duration>,
 }
 
 fn check_opts(o: &BuildOpts) -> Result<()> {
@@ -103,13 +108,33 @@ pub fn build(pkg: &Path, tag: &str, opts: &BuildOpts) -> Result<BuildFacts> {
     check_opts(opts)?;
     // DOCKER_BUILDKIT=0 only for local smoke tests on hosts without buildx.
     let buildkit = std::env::var("DOCKER_BUILDKIT").map_or(true, |v| v != "0");
-    let status = docker()
-        .args(build_args(pkg, tag, buildkit, opts))
+    let mut cmd = docker();
+    cmd.args(build_args(pkg, tag, buildkit, opts))
         .env("DOCKER_BUILDKIT", if buildkit { "1" } else { "0" })
+        .stdin(Stdio::null());
+    match &opts.log {
+        Some(p) => {
+            let f = std::fs::File::create(p)?;
+            cmd.stdout(f.try_clone()?).stderr(f);
+        }
         // Build output goes to stderr so stdout stays machine-readable.
-        .stdout(Stdio::from(std::io::stderr()))
-        .status()
-        .context("running docker build")?;
+        None => {
+            cmd.stdout(Stdio::from(std::io::stderr()));
+        }
+    }
+    let mut child = cmd.spawn().context("running docker build")?;
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(s) = child.try_wait()? {
+            break s;
+        }
+        if opts.timeout.is_some_and(|t| started.elapsed() > t) {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("docker build timed out");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    };
     if !status.success() {
         bail!("docker build failed ({status})");
     }
@@ -195,6 +220,7 @@ mod tests {
         let o = BuildOpts {
             build_args: vec!["AGENT_REF=0123456789abcdef0123456789abcdef01234567".into()],
             expect_commit: Some("0123456789abcdef0123456789abcdef01234567".into()),
+            ..Default::default()
         };
         check_opts(&o).unwrap();
         let a = build_args(Path::new("/tmp/pkg"), "t", true, &o);
@@ -209,15 +235,15 @@ mod tests {
     fn opts_rejected() {
         let arg = |s: &str| BuildOpts {
             build_args: vec![s.into()],
-            expect_commit: None,
+            ..Default::default()
         };
         for o in [arg("x=1"), arg("A=$(id)"), arg("A"), arg("A=")] {
             assert!(check_opts(&o).is_err(), "{o:?}");
         }
         for c in ["main", "0123", &"A".repeat(40)] {
             let o = BuildOpts {
-                build_args: vec![],
                 expect_commit: Some(c.into()),
+                ..Default::default()
             };
             assert!(check_opts(&o).is_err(), "{c}");
         }

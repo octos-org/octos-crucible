@@ -3,7 +3,11 @@ name: eval
 # One evaluation: an agent package x a model x a taskset, N replicas, the
 # stages of the taskset run back to back on one machine per replica.
 #
-#   setup     validate inputs (crucible plan), build crucible once
+# Each job is a step of the step layer (docs/executors.md): it prepares the
+# input directories, passes its secrets, calls `crucible step <name>`, and
+# hands the output directory on. The logic lives in crucible, not here.
+#
+#   setup     validate inputs (crucible step plan), build crucible once
 #   generate  per replica: fetch + docker build the agent (no secret on the
 #             machine yet) -> fetch the stage inputs (never the tests) ->
 #             sandbox network -> crucible run (credential on stdin; meter +
@@ -11,7 +15,7 @@ name: eval
 #             seal checkpoints and logs to the platform key -> artifact
 #   score     holds the platform key, runs no agent or test code: re-seals
 #             each stage's tests blob and every replica's checkpoint to a
-#             one-run key (`crucible score-handoff`) for score-tests.
+#             one-run key (`crucible step handoff`) for score-tests.
 #   score-tests  (score-tests.yml, one job per replica) holds no platform
 #             secret: per stage runs the interactive runner (if any) and the
 #             scorer plugin (plugins.json; hidden visibility) on the handoff.
@@ -164,7 +168,7 @@ jobs:
         run: |
           set -euo pipefail
           # The agent source may be a signed URL: keep it out of the log.
-          "$RUNNER_TEMP/bin/crucible" plan --root . 2>&1 | grep -v '^agent_source=' || exit 1
+          "$RUNNER_TEMP/bin/crucible" step plan --root . 2>&1 | grep -v '^agent_source=' || exit 1
 
       - name: Report status (building)
         if: steps.plan.outputs.results_url != ''
@@ -239,18 +243,6 @@ jobs:
           name: taskset
           path: tasksets/${{ needs.setup.outputs.taskset }}
 
-      - name: Prepare
-        run: |
-          set -euo pipefail
-          chmod 0755 "$RUNNER_TEMP/bin/crucible"
-          echo "CRUCIBLE=$RUNNER_TEMP/bin/crucible" >> "$GITHUB_ENV"
-          # Test material only ever exists inside sealed tests blobs, which
-          # this job never downloads.
-          if find . -name '*.spec.ts' -o -name 'e2e.ts' | grep -q .; then
-            echo "::error::test material present in the generation job"
-            exit 1
-          fi
-
       # A self-hosted machine is reused: check it, and remove what an
       # earlier job may have left (no-op on a fresh GitHub-hosted machine).
       - name: Machine preflight and cleanup
@@ -260,133 +252,39 @@ jobs:
           tools/sandbox-net.sh preflight
           tools/sandbox-net.sh clean
 
-      - name: Fetch agent package
-        if: needs.setup.outputs.agent_kind != 'blob'
-        run: |
-          set -euo pipefail
-          "$CRUCIBLE" fetch --source "$AGENT_SOURCE" --out "$RUNNER_TEMP/agent-pkg" --builtin-dir agents > "$RUNNER_TEMP/facts.json"
-          jq -c '{source_kind, name: .agent.name, version: .agent.version, commit}' "$RUNNER_TEMP/facts.json"
-
-      - name: Fetch agent package (sealed blob)
-        if: needs.setup.outputs.agent_kind == 'blob'
-        env:
-          CRUCIBLE_AGE_KEY: ${{ secrets.CRUCIBLE_AGE_KEY }}
-          GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          "$CRUCIBLE" fetch --source "$AGENT_SOURCE" --out "$RUNNER_TEMP/agent-pkg" \
-            --store "$STORE" --identity-env CRUCIBLE_AGE_KEY > "$RUNNER_TEMP/facts.json"
-          echo "agent package fetched"
-
-      - name: Build agent image (no secret on this machine)
-        timeout-minutes: 60
-        env:
-          AGENT_KIND: ${{ needs.setup.outputs.agent_kind }}
-          AGENT_REF: ${{ needs.setup.outputs.agent_ref }}
-        run: |
-          set -euo pipefail
-          # Nothing from the package runs on the host: it is the build
-          # context, RUN steps execute in BuildKit containers.
-          opts=()
-          up="$RUNNER_TEMP/agent-pkg/upstream.json"
-          if [ "$AGENT_KIND" = builtin ] && [ -f "$up" ]; then
-            # A builtin agent built from another repo: resolve its branch to
-            # a full commit now and build exactly that (never a moving
-            # "main"); `crucible build` checks the image's
-            # /agent-build.json against it and build.json records it.
-            # options.agent_ref (validated by `crucible plan`) overrides the ref.
-            repo=$(jq -r .repo "$up"); ref=${AGENT_REF:-$(jq -r .ref "$up")}; arg=$(jq -r .build_arg "$up")
-            commit=$(git ls-remote "$repo" "$ref" | head -n1 | cut -f1)
-            [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::cannot resolve $ref of $repo"; exit 1; }
-            echo "agent source: $repo $ref = $commit"
-            opts=(--build-arg "$arg=$commit" --expect-commit "$commit")
-          fi
-          "$CRUCIBLE" build --pkg "$RUNNER_TEMP/agent-pkg" --tag crucible-agent:run "${opts[@]}" 2> "$RUNNER_TEMP/build.log" > "$RUNNER_TEMP/build.json" \
-            || { echo "::error::agent image build failed"; tail -c 3000 "$RUNNER_TEMP/build.log"; exit 1; }
-          jq -c '{size_bytes, commit: .agent_build.commit}' "$RUNNER_TEMP/build.json"
-
-      - name: Fetch stage inputs (never the tests)
-        env:
-          CRUCIBLE_AGE_KEY: ${{ secrets.CRUCIBLE_AGE_KEY }}
-          GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          "$CRUCIBLE" taskset inputs --taskset "$TASKSET_PATH" --store "$STORE" \
-            --identity-env CRUCIBLE_AGE_KEY --stages "$STAGES" --out "$RUNNER_TEMP/inputs"
-          if find "$RUNNER_TEMP/inputs" -name '*.spec.ts' -o -name 'e2e.ts' | grep -q .; then
-            echo "::error::test material in the stage inputs"
-            exit 1
-          fi
-
-      - name: Sandbox network up and check
-        run: |
-          set -euo pipefail
-          tools/sandbox-net.sh up
-          tools/sandbox-net.sh check
-
+      # `crucible step generate` (docs/executors.md): fetch + build the
+      # agent, fetch the stage inputs (never the tests; it refuses test
+      # material in the checkout or the inputs), sandbox network up and
+      # checked, the credential opened in its own process only, the stages,
+      # then every output sealed; only sealed files are left in results/.
       - name: Run agent stages
-        timeout-minutes: ${{ fromJSON(needs.setup.outputs.run_timeout_min) }}
         env:
           DEV_MODEL_CRED: ${{ secrets.DEV_MODEL_CRED }}
           CRUCIBLE_AGE_KEY: ${{ secrets.CRUCIBLE_AGE_KEY }}
           CRUCIBLE_WORKER_TOKEN: ${{ secrets.CRUCIBLE_WORKER_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+          AGENT_REF: ${{ needs.setup.outputs.agent_ref }}
+          RUN_TIMEOUT_MIN: ${{ needs.setup.outputs.run_timeout_min }}
         run: |
           set -euo pipefail
-          ep=()
-          if [ -n "$ENDPOINT" ]; then ep=(--endpoint "$ENDPOINT"); fi
-          src=(--source "$CRED_SOURCE")
-          if [ "$CRED_SOURCE" = workers-kv ]; then
-            # The envelope's eval_id must equal this run's.
-            src+=(--worker-url "$WORKER_URL" --eval-id "$EVAL_ID")
-          fi
-          # Progress: replica 1 reports running:<stage> as each stage starts
-          # (`crucible run` logs "[<stage>] start, ..." on stderr).
-          progress() {
-            while IFS= read -r line; do
-              printf '%s\n' "$line" >&2
-              if [ "$REPLICA" = 1 ] && [ -n "$RESULTS_URL" ] && [[ "$line" =~ ^\[([a-z0-9-]+)\]\ start, ]]; then
-                "$CRUCIBLE" worker --worker-url "$WORKER_URL" --eval-id "$EVAL_ID" \
-                  status "running:${BASH_REMATCH[1]}" >&2 || true
-              fi
-            done
-          }
-          # The opened credential goes through this pipe only: never a file,
-          # never an env var. `crucible run` itself gets no secret.
-          "$CRUCIBLE" cred open "${src[@]}" --sealed-env DEV_MODEL_CRED \
-              --identity-env CRUCIBLE_AGE_KEY "${ep[@]}" \
-            | env -u DEV_MODEL_CRED -u CRUCIBLE_AGE_KEY -u CRUCIBLE_WORKER_TOKEN "$CRUCIBLE" run \
-              --image crucible-agent:run \
-              --agent-json "$RUNNER_TEMP/agent-pkg/agent.json" \
-              --taskset "$TASKSET_PATH" --stages "$STAGES" \
-              --inputs-dir "$RUNNER_TEMP/inputs" \
-              --model "$MODEL" --budget "$BUDGET" \
-              --out-dir "$RUNNER_TEMP/run/$REPLICA" --scratch-dir "$RUNNER_TEMP/scratch" \
-              --pricing config/pricing.json --egress-allow config/egress.json \
-              2> >(progress)
+          chmod 0755 "$RUNNER_TEMP/bin/crucible"
+          progress=()
+          if [ -n "$RESULTS_URL" ]; then progress=(--report-progress); fi
+          "$RUNNER_TEMP/bin/crucible" step generate --root . --taskset "$TASKSET_PATH" \
+            --agent-source "$AGENT_SOURCE" --agent-ref "$AGENT_REF" \
+            --model "$MODEL" --endpoint "$ENDPOINT" --budget "$BUDGET" \
+            --stages "$STAGES" --replica "$REPLICA" --cred-source "$CRED_SOURCE" \
+            --eval-id "$EVAL_ID" --worker-url "$WORKER_URL" "${progress[@]}" \
+            --store "$STORE" --run-timeout-min "$RUN_TIMEOUT_MIN" \
+            --work "$RUNNER_TEMP/work" --out "$RUNNER_TEMP/results"
 
-      - name: Stop containers and sandbox network
+      - name: Machine cleanup
         if: always()
         run: |
-          docker ps -aq --filter name=crucible- | xargs -r docker rm -f >/dev/null 2>&1 || true
-          tools/sandbox-net.sh down || true
           tools/sandbox-net.sh clean || true
           docker image rm -f crucible-agent:run >/dev/null 2>&1 || true
-          # Inputs and the work tree are not needed once sealed below.
-          rm -rf "$RUNNER_TEMP/inputs" "$RUNNER_TEMP/scratch" "$RUNNER_TEMP/agent-pkg" 2>/dev/null || true
-
-      - name: Seal checkpoints and logs
-        if: always()
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/run/$REPLICA" "$RUNNER_TEMP/results/$REPLICA"
-          extra=()
-          for f in facts.json build.json; do
-            if [ -f "$RUNNER_TEMP/$f" ]; then extra+=(--extra "$RUNNER_TEMP/$f"); fi
-          done
-          "$CRUCIBLE" seal-outputs --replica-dir "$RUNNER_TEMP/run/$REPLICA" --keys config/keys.json \
-            --out "$RUNNER_TEMP/results/$REPLICA" "${extra[@]}"
-          # Only sealed files leave this machine.
-          find "$RUNNER_TEMP/results" -type f ! -name '*.sealed' -delete
+          # Inputs and the work tree are not needed once sealed.
+          rm -rf "$RUNNER_TEMP/work" 2>/dev/null || true
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
@@ -452,6 +350,9 @@ jobs:
           chmod 0755 "$RUNNER_TEMP/bin/crucible"
           "$RUNNER_TEMP/bin/crucible" worker --worker-url "$WORKER_URL" --eval-id "$EVAL_ID" status scoring
 
+      # `crucible step handoff`: tests, checkpoints and (when a scoring slot
+      # uses a model) the credential re-sealed to a one-run key, plus what
+      # score-tests runs (crucible, plugins, prices).
       - name: Hand off the stages to score-tests
         id: handoff
         env:
@@ -462,29 +363,10 @@ jobs:
         run: |
           set -euo pipefail
           chmod 0755 "$RUNNER_TEMP/bin/crucible"
-          C="$RUNNER_TEMP/bin/crucible"
-          h="$RUNNER_TEMP/handoff"
-          mkdir -p "$RUNNER_TEMP/results" "$h/bin" "$h/tools"
-          args=(--taskset "$TASKSET_PATH" --stages "$STAGES" --results "$RUNNER_TEMP/results"
-            --store "$STORE" --identity-env CRUCIBLE_AGE_KEY --out "$h" --key-out "$RUNNER_TEMP/run.key")
-          # A taskset that gives a scoring slot a model (docs/plugins.md §10):
-          # the opened credential goes through this pipe only and is sealed
-          # to the one-run key inside score-handoff.
-          if jq -e '(.model // {}) | ((.interactive // "none") != "none" or (.scorer // "none") != "none")' "$TASKSET_PATH" >/dev/null; then
-            ep=()
-            if [ -n "$ENDPOINT" ]; then ep=(--endpoint "$ENDPOINT"); fi
-            src=(--source "$CRED_SOURCE")
-            if [ "$CRED_SOURCE" = workers-kv ]; then src+=(--worker-url "$WORKER_URL" --eval-id "$EVAL_ID"); fi
-            "$C" cred open "${src[@]}" --sealed-env DEV_MODEL_CRED --identity-env CRUCIBLE_AGE_KEY "${ep[@]}" \
-              | env -u DEV_MODEL_CRED -u CRUCIBLE_WORKER_TOKEN "$C" score-handoff "${args[@]}" \
-                  --cred-stdin --model "$MODEL" --budget "$BUDGET"
-          else
-            "$C" score-handoff "${args[@]}"
-          fi
-          cp "$C" "$h/bin/crucible"
-          cp -R scorers runners "$h/"
-          cp tools/sandbox-net.sh "$h/tools/"
-          cp config/pricing.json "$h/pricing.json"
+          "$RUNNER_TEMP/bin/crucible" step handoff --root . --taskset "$TASKSET_PATH" --stages "$STAGES" \
+            --results "$RUNNER_TEMP/results" --store "$STORE" --key-out "$RUNNER_TEMP/run.key" \
+            --cred-source "$CRED_SOURCE" --model "$MODEL" --endpoint "$ENDPOINT" --budget "$BUDGET" \
+            --eval-id "$EVAL_ID" --worker-url "$WORKER_URL" --out "$RUNNER_TEMP/handoff"
           echo "run_key=$(cat "$RUNNER_TEMP/run.key")" >> "$GITHUB_OUTPUT"
           rm -f "$RUNNER_TEMP/run.key"
 
@@ -566,68 +448,27 @@ jobs:
           merge-multiple: true
           path: ${{ runner.temp }}/scores
 
-      - name: Store sealed outputs as blobs
+      # `crucible step publish`: sealed outputs stored as blobs, the
+      # manifest (wall times from GitHub's own job and step timestamps), the
+      # download zip (workers-kv), the sealed archive, the data branch (only
+      # if score_public) and the Worker.
+      - name: Publish
         env:
+          CRUCIBLE_AGE_KEY: ${{ secrets.CRUCIBLE_AGE_KEY }}
+          CRUCIBLE_WORKER_TOKEN: ${{ secrets.CRUCIBLE_WORKER_TOKEN }}
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           chmod 0755 "$RUNNER_TEMP/bin/crucible"
-          echo "CRUCIBLE=$RUNNER_TEMP/bin/crucible" >> "$GITHUB_ENV"
-          mkdir -p "$RUNNER_TEMP/results"
-          "$RUNNER_TEMP/bin/crucible" put-sealed --store "$STORE" "$RUNNER_TEMP/results"
-
-      - name: Build the manifest
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CRUCIBLE_AGE_KEY: ${{ secrets.CRUCIBLE_AGE_KEY }}
-        run: |
-          set -euo pipefail
-          # Wall times come from GitHub's own job and step timestamps.
-          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" \
-            > "$RUNNER_TEMP/jobs.json"
-          replicas=$(jq '.replica | length' <<< "$MATRIX")
-          price=()
-          if [ -n "$BUDGET" ] && jq -e '.price' <<< "$BUDGET" >/dev/null; then
-            price=(--price-json "$(jq -c '.price' <<< "$BUDGET")")
-          fi
-          mkdir -p "$RUNNER_TEMP/scores"
-          "$CRUCIBLE" manifest --eval-id "$EVAL_ID" --taskset "$TASKSET_PATH" --stages "$STAGES" \
-            --model "$MODEL" --results "$RUNNER_TEMP/results" --replicas "$replicas" \
-            --scores "$RUNNER_TEMP/scores" \
-            --jobs "$RUNNER_TEMP/jobs.json" --identity-env CRUCIBLE_AGE_KEY \
-            --owner "$OWNER" --score-public "$SCORE_PUBLIC" \
-            --pricing config/pricing.json "${price[@]}" --out "$RUNNER_TEMP/manifest.json"
-          jq -c '{eval_id, stages_run, total_score, replicas: [.replicas[] | {replica, failure, stages: [.stages[] | {stage, score, wall_s, ended, checkpoint_source}]}]}' "$RUNNER_TEMP/manifest.json"
-
-      # The submitter's download: an AES-256 zip under the download
-      # password from the credential (workers-kv only; dev credentials have
-      # none). Recorded as `download` in the manifest for the Worker.
-      - name: Pack the download zip
-        if: needs.setup.outputs.cred_source == 'workers-kv'
-        env:
-          CRUCIBLE_AGE_KEY: ${{ secrets.CRUCIBLE_AGE_KEY }}
-          CRUCIBLE_WORKER_TOKEN: ${{ secrets.CRUCIBLE_WORKER_TOKEN }}
-          GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          "$CRUCIBLE" download-zip --worker-url "$WORKER_URL" --eval-id "$EVAL_ID" \
-            --results "$RUNNER_TEMP/results" --identity-env CRUCIBLE_AGE_KEY \
-            --store "$STORE" --manifest "$RUNNER_TEMP/manifest.json"
-
-      # Results sinks (a) sealed archive, always; (b) data branch, only if
-      # score_public.
-      - name: Archive and publish the manifest
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: tools/publish-manifest.sh "$RUNNER_TEMP/manifest.json"
-
-      # Results sink (c): the Worker (KV), for the submitter.
-      - name: Deliver the manifest to the Worker
-        if: needs.setup.outputs.results_url != ''
-        env:
-          CRUCIBLE_WORKER_TOKEN: ${{ secrets.CRUCIBLE_WORKER_TOKEN }}
-        run: |
-          "$CRUCIBLE" worker --worker-url "$WORKER_URL" --eval-id "$EVAL_ID" \
-            results --manifest "$RUNNER_TEMP/manifest.json"
+          extra=()
+          if [ "$CRED_SOURCE" = workers-kv ]; then extra+=(--download-zip "$WORKER_URL"); fi
+          if [ -n "$RESULTS_URL" ]; then extra+=(--deliver "$WORKER_URL"); fi
+          "$RUNNER_TEMP/bin/crucible" step publish --root . --mode agent --eval-id "$EVAL_ID" \
+            --taskset "$TASKSET_PATH" --stages "$STAGES" --model "$MODEL" \
+            --replicas "$(jq '.replica | length' <<< "$MATRIX")" \
+            --results "$RUNNER_TEMP/results" --scores "$RUNNER_TEMP/scores" \
+            --owner "$OWNER" --score-public "$SCORE_PUBLIC" --budget "$BUDGET" \
+            --store "$STORE" --github-jobs --data-branch "${extra[@]}" --out "$RUNNER_TEMP/publish"
 
       - name: Report failure to the Worker
         if: failure() && needs.setup.outputs.results_url != ''

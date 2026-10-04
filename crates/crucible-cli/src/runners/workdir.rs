@@ -92,6 +92,10 @@ pub struct RunArgs {
     /// uid:gid for the container; default: this process's.
     #[arg(long)]
     pub user: Option<String>,
+    /// Label value `crucible.run=<this>` on every container of the run, so
+    /// whoever started it can remove exactly its containers.
+    #[arg(long, default_value = "")]
+    pub run_label: String,
 }
 
 /// `timing.json`.
@@ -126,7 +130,12 @@ pub struct ContainerSpec {
     pub model: String,
     pub deadline_s: u64,
     pub entrypoint: Option<Vec<String>>,
+    /// `crucible.run=<label>`.
+    pub label: String,
 }
+
+/// The label key every container of a run carries.
+pub const RUN_LABEL: &str = "crucible.run";
 
 pub const CONTAINER_HOME: &str = "/home/agent";
 
@@ -147,6 +156,8 @@ pub fn docker_run_args(c: &ContainerSpec) -> Vec<String> {
         "--init".into(),
         "--name".into(),
         c.name.clone(),
+        "--label".into(),
+        format!("{RUN_LABEL}={}", c.label),
         "--network".into(),
         c.network.clone(),
         "--dns".into(),
@@ -385,6 +396,11 @@ pub(super) async fn run_stage(
         model: a.model.clone(),
         deadline_s: stage.time_limit_s,
         entrypoint: env.agent.entrypoint.clone(),
+        label: if a.run_label.is_empty() {
+            format!("pid-{}", std::process::id())
+        } else {
+            a.run_label.clone()
+        },
     };
     let snapshot = env.snaps.join(format!("{}.zip", stage.id));
     let _ = std::fs::remove_file(&snapshot);
@@ -530,6 +546,7 @@ mod tests {
             name: "crucible-stage-1-1".into(),
             image: "crucible-agent:run".into(),
             network: "crucible-sbx".into(),
+            label: "t".into(),
             user: "1001:118".into(),
             req: "/r/inputs/stage-1".into(),
             work: "/r/work".into(),

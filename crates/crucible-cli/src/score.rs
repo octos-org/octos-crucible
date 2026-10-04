@@ -41,7 +41,7 @@ use crucible_core::plugins::Kind;
 use crucible_core::score::ErrorKind;
 use crucible_core::taskset::{Aggregate, ModelUse, Stage};
 use crucible_core::{ScoreResult, TaskSet};
-use crucible_crypto::PrivateKey;
+use crucible_crypto::{PrivateKey, PublicKey};
 use crucible_meter::{Credential, Limits, MeterConfig, Upstream};
 use crucible_metering::{Price, Pricing};
 use serde::{Deserialize, Serialize};
@@ -735,9 +735,8 @@ pub async fn handoff(
     store: &Store,
     keys: &[PrivateKey],
     out: &Path,
-) -> Result<PrivateKey> {
-    let run_key = PrivateKey::generate();
-    let to = run_key.public();
+    to: &PublicKey,
+) -> Result<()> {
     let reps = replicas(results)?;
     std::fs::create_dir_all(out.join("tests"))?;
     for &i in stages {
@@ -753,7 +752,7 @@ pub async fn handoff(
         let plain = store.get_sealed(&stage.tests_blob, keys).await?;
         std::fs::write(
             out.join("tests").join(format!("{}.sealed", stage.id)),
-            crucible_crypto::seal(&to, &plain)?,
+            crucible_crypto::seal(to, &plain)?,
         )?;
         drop(plain);
         for r in todo {
@@ -768,12 +767,125 @@ pub async fn handoff(
                     .with_context(|| format!("opening {}", ckpt.display()))?;
                 std::fs::write(
                     dir.join("checkpoint.sealed"),
-                    crucible_crypto::seal(&to, &zip)?,
+                    crucible_crypto::seal(to, &zip)?,
                 )?;
             }
         }
     }
-    Ok(run_key)
+    Ok(())
+}
+
+/// The whole handoff for `crucible score --tests-dir`: [`handoff`], the
+/// taskset, and, when a scoring slot of the taskset uses a model and a
+/// credential is given, the credential sealed to `to` (`cred.sealed`) with
+/// the model and each replica's remaining budget (`model.json`).
+#[allow(clippy::too_many_arguments)]
+pub async fn write_handoff(
+    ts: &TaskSet,
+    taskset_path: &Path,
+    stages: &[usize],
+    results: &Path,
+    store: &Store,
+    keys: &[PrivateKey],
+    out: &Path,
+    to: &PublicKey,
+    cred: Option<Credential>,
+    model: &str,
+    budget: &str,
+) -> Result<()> {
+    handoff(ts, stages, results, store, keys, out, to).await?;
+    std::fs::copy(taskset_path, out.join("taskset.json"))?;
+    let (mi, ms) = ts.model_use();
+    let wants_model = mi != ModelUse::None || ms != ModelUse::None;
+    let had_cred = cred.is_some();
+    if let (Some(cred), true) = (cred, wants_model) {
+        let model = ts
+            .model
+            .as_ref()
+            .and_then(|m| m.name.clone())
+            .unwrap_or_else(|| model.trim().to_owned());
+        if !crucible_core::taskset::model_name_ok(&model) {
+            bail!("a model name is needed (taskset model.name or --model)");
+        }
+        let budget = Budget::parse(budget)?;
+        let mut budgets = BTreeMap::new();
+        for r in replicas(results)? {
+            let mut u = Used::default();
+            for st in &ts.stages {
+                let sdir = results.join(r.to_string()).join(&st.id);
+                if let (Some(raw), _) = crate::publish::stage_numbers(&sdir, keys)? {
+                    add_used(
+                        &mut u,
+                        used(&crucible_report::usage::parse_jsonl(
+                            &String::from_utf8_lossy(&raw),
+                        )),
+                    );
+                }
+            }
+            let l = remaining(&budget, u);
+            budgets.insert(
+                r,
+                Budget {
+                    max_requests: l.max_requests,
+                    max_tokens: l.max_tokens,
+                    max_cost_usd: l.max_cost_usd,
+                    price: None,
+                },
+            );
+        }
+        let line = serde_json::to_vec(&serde_json::json!({
+            "api_key": cred.api_key,
+            "endpoint": cred.endpoint,
+        }))?;
+        std::fs::write(out.join("cred.sealed"), crucible_crypto::seal(to, &line)?)?;
+        drop(line);
+        let plan = ModelPlan {
+            model,
+            budgets,
+            price: budget.price.clone(),
+        };
+        std::fs::write(out.join("model.json"), serde_json::to_vec_pretty(&plan)?)?;
+        eprintln!("model credential handed off (sealed to the one-run key)");
+    } else if had_cred {
+        eprintln!("the taskset gives no scoring slot a model: credential not handed off");
+    }
+    eprintln!("handoff written for {} stage(s)", stages.len());
+    Ok(())
+}
+
+/// The model setup of a scoring job from a handoff's `cred.sealed` and
+/// `model.json`; the credential is opened only in this process.
+pub fn model_setup(
+    cred: &Path,
+    model_plan: &Path,
+    pricing: &Path,
+    keys: &[PrivateKey],
+    network: &str,
+    bind: &str,
+    port: u16,
+) -> Result<ModelSetup> {
+    let plain = crucible_crypto::open(keys, &std::fs::read(cred)?)
+        .context("opening the model credential")?;
+    let cred: Credential = serde_json::from_slice(&plain)
+        .map_err(|_| anyhow::anyhow!("model credential is not {{api_key, endpoint}}"))?;
+    drop(plain);
+    let plan: ModelPlan = serde_json::from_slice(&std::fs::read(model_plan)?)?;
+    let pricing = Pricing::from_json(&std::fs::read_to_string(pricing)?)?;
+    let user_price = match &plan.price {
+        Some(p) => crucible_metering::parse_price(p)?,
+        None => None,
+    };
+    eprintln!("model credential present: slots that use a model get the meter");
+    Ok(ModelSetup {
+        cred,
+        model: plan.model,
+        pricing,
+        user_price,
+        network: network.to_owned(),
+        bind: bind.to_owned(),
+        port,
+        budgets: plan.budgets,
+    })
 }
 
 /// `<scores>/<replica>/<stage>/score.json`, if present.
@@ -940,13 +1052,15 @@ printf '{"visibility":"hidden","status":"failed","passed":1,"total":2,"detail":"
         // Hand off to a machine without the platform key: same scores with
         // only the one-run key, and the scorer never sees the key variable.
         let hand = d.path().join("handoff");
-        let run_key = handoff(
+        let run_key = PrivateKey::generate();
+        handoff(
             &ts,
             &[0, 1],
             &results,
             &store,
             std::slice::from_ref(&sk),
             &hand,
+            &run_key.public(),
         )
         .await
         .unwrap();

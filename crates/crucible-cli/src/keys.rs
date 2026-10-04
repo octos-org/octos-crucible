@@ -76,6 +76,23 @@ impl Store {
         }
     }
 
+    /// Like [`Store::parse`], with the `github:` token given instead of
+    /// read from `GITHUB_TOKEN`.
+    pub fn with_token(spec: &str, token: Option<&str>) -> Result<Store> {
+        match spec.split_once(':') {
+            Some(("github", repo)) => {
+                let token = token
+                    .filter(|t| !t.is_empty())
+                    .ok_or_else(|| anyhow!("the github: store needs its token"))?;
+                Ok(Store::Github(GithubReleaseStore::new(
+                    repo,
+                    token.to_owned(),
+                )?))
+            }
+            _ => Store::parse(spec),
+        }
+    }
+
     pub async fn put(&self, data: &[u8]) -> Result<String> {
         Ok(match self {
             Store::Dir(s) => s.put(data).await?,

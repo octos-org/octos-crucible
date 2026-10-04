@@ -238,16 +238,19 @@ pub async fn pack(
     user: bool,
     key: &PublicKey,
     store: &Store,
+    verbose: bool,
 ) -> Result<TaskSet> {
     let p = prepare(source, src_dir, user)?;
     let mut blobs = Vec::new();
     for (s, (inputs_zip, tests_zip, ni, nt)) in p.src.stages.iter().zip(&p.zips) {
         let inputs_blob = store.put_sealed(key, inputs_zip).await?;
         let tests_blob = store.put_sealed(key, tests_zip).await?;
-        eprintln!(
-            "stage {}: inputs {ni} files -> {}, tests {nt} files -> {}",
-            s.id, inputs_blob.sha256, tests_blob.sha256
-        );
+        if verbose {
+            eprintln!(
+                "stage {}: inputs {ni} files -> {}, tests {nt} files -> {}",
+                s.id, inputs_blob.sha256, tests_blob.sha256
+            );
+        }
         blobs.push((inputs_blob, tests_blob));
     }
     let ts = p.taskset(blobs);
@@ -345,7 +348,7 @@ mod tests {
         std::fs::write(&source, SOURCE).unwrap();
         let store = Store::parse(&format!("dir:{}", work.path().join("store").display())).unwrap();
         let sk = PrivateKey::generate();
-        let ts = pack(&source, src.path(), false, &sk.public(), &store)
+        let ts = pack(&source, src.path(), false, &sk.public(), &store, true)
             .await
             .unwrap();
         assert_eq!(ts.stages.len(), 2);
@@ -379,7 +382,7 @@ mod tests {
         ] {
             assert_ne!(bad, SOURCE, "{why}");
             std::fs::write(&source, bad).unwrap();
-            assert!(pack(&source, src.path(), false, &key, &store).await.is_err(), "{why}");
+            assert!(pack(&source, src.path(), false, &key, &store, true).await.is_err(), "{why}");
         }
     }
 
