@@ -29,6 +29,8 @@ export interface FormInput {
   password2: string;
   scorePublic: boolean;
   consent: boolean;
+  /** app mode: the taskset scores with a model, so a credential is needed. */
+  needsModel?: boolean;
 }
 
 export type Errors = Partial<Record<keyof FormInput, string>>;
@@ -98,21 +100,25 @@ export function validate(f: FormInput): Errors {
   else if (f.file.size > MAX_PLAIN) e.file = "文件超过 25 MB 上限";
   else if (f.fileMagic && !isZipMagic(f.fileMagic)) e.file = "文件不是有效的 zip";
 
-  if (f.mode === "app") {
-    if (!positiveInt(f.stage)) e.stage = "请选择阶段";
-  } else {
+  const cred = () => {
     if (!f.model.trim()) e.model = "请填写模型名";
     else if (f.model.trim().length > 200) e.model = "模型名过长";
     const ep = checkEndpoint(f.endpoint);
     if (ep) e.endpoint = ep;
     if (!f.apiKey.trim()) e.apiKey = "请填写 API key";
+    if ([...f.password].length < MIN_PASSWORD) e.password = `下载密码至少 ${MIN_PASSWORD} 个字符`;
+    else if (f.password !== f.password2) e.password2 = "两次输入的密码不一致";
+  };
+  if (f.mode === "app") {
+    if (!positiveInt(f.stage)) e.stage = "请选择阶段";
+    if (f.needsModel) cred();
+  } else {
+    cred();
     const r = positiveInt(f.replicas);
     if (!r || r > MAX_REPLICAS) e.replicas = `运行遍数为 1–${MAX_REPLICAS} 的整数`;
     if (f.maxRequests.trim() && !positiveInt(f.maxRequests)) e.maxRequests = "请填正整数，或留空";
     if (f.maxTokens.trim() && !positiveInt(f.maxTokens)) e.maxTokens = "请填正整数，或留空";
     if (f.maxCostUsd.trim() && !positiveNumber(f.maxCostUsd)) e.maxCostUsd = "请填正数，或留空";
-    if ([...f.password].length < MIN_PASSWORD) e.password = `下载密码至少 ${MIN_PASSWORD} 个字符`;
-    else if (f.password !== f.password2) e.password2 = "两次输入的密码不一致";
   }
   if (!f.consent) e.consent = "提交前需要同意声明";
   return e;

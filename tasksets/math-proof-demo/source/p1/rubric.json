@@ -1,0 +1,22 @@
+{
+  "problem": "Prove that the fraction (21n + 4) / (14n + 3) is irreducible for every natural number n.",
+  "reference": "Let d be a positive common divisor of 21n + 4 and 14n + 3. Then d divides 3(14n + 3) - 2(21n + 4) = 42n + 9 - 42n - 8 = 1, so d = 1. Hence gcd(21n + 4, 14n + 3) = 1 and the fraction is irreducible for every natural number n. (Equivalently, by the Euclidean algorithm: gcd(21n+4, 14n+3) = gcd(7n+1, 14n+3) = gcd(7n+1, 1) = 1.)",
+  "answer_file": "answer.md",
+  "items": [
+    {
+      "name": "linear combination",
+      "points": 4,
+      "criteria": "Exhibits a correct integer linear combination of 21n+4 and 14n+3 equal to 1 (e.g. 3(14n+3) - 2(21n+4) = 1), or carries out a correct Euclidean-algorithm reduction to gcd(7n+1, 1). Partial credit (2) for a correct reduction step that is not completed."
+    },
+    {
+      "name": "common divisor argument",
+      "points": 2,
+      "criteria": "Correctly argues that any common divisor of numerator and denominator divides that combination (or each Euclidean step preserves the gcd), hence divides 1."
+    },
+    {
+      "name": "conclusion",
+      "points": 1,
+      "criteria": "States clearly that the gcd is 1 for every natural number n, so the fraction is irreducible; no unjustified gaps."
+    }
+  ]
+}

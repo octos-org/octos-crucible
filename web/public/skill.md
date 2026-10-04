@@ -9,7 +9,7 @@ octos-crucible is a general platform for evaluating agents. Any agent that runs 
 
 - **Coding**: ARC-Bench GitHub tasks; the agent builds a website, scored by Playwright tests.
 - **Interactive decision-making**: GOSIM Agentic Observer (`astro-practice`); an observing agent answers a simulator turn by turn, scored by the official scoring engine.
-- **Math / reasoning** (coming soon): e.g. the agent writes proofs and a judge model scores them against a rubric. Model-based scoring is planned, not live.
+- **Math / reasoning**: `math-proof-demo` (two classic IMO problems); the agent writes a proof to `answer.md`, a fixed judge model grades it against a hidden reference solution and marking scheme (7 points per problem, median of 3 judgements). The judge runs on your own model key, through the platform's meter; its usage is reported separately as `eval_usage`.
 
 Task sets, how the agent is run, how its output is packaged and how it is scored are all pluggable (`docs/plugins.md`). You hand the platform an agent package (a Docker image recipe); it runs the agent in an isolated container, one stage after another in the same working directory, and scores each stage with hidden test material. You can also skip the agent and just score an output you already have.
 
@@ -156,6 +156,8 @@ crucible submit app --zip site.zip --taskset <taskset> --stage 1 --i-agree
 ```
 
 `--stage` is the 1-based stage to score. `--public`, `--wait` and `--api` work as above.
+
+Task sets scored by a model (e.g. `math-proof-demo`) need your model credential in this mode too: add `--model <model> --endpoint https://... --api-key-env MY_KEY --download-password-env DL_PW`. The task set may fix the judge model (`model.name`); your endpoint must serve it.
 
 ### Check status
 

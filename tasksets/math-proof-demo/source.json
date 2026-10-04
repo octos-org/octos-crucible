@@ -1,0 +1,20 @@
+{
+  "schema": 2,
+  "name": "math-proof-demo",
+  "description": "Demo of model-judged proofs: two classic International Mathematical Olympiad problems (IMO 1959 Problem 1, IMO 1964 Problem 1), one per stage. The agent writes a complete proof to answer.md; the llm-judge scorer grades it against a hidden reference solution and marking scheme (7 points per problem) with a fixed judge model, median of 3 judgements. Problem statements: the public IMO problem archive (https://www.imo-official.org/problems.aspx). Reference solutions and marking schemes written for this platform.",
+  "packager": "files",
+  "packager_options": {"require": ["answer.md"]},
+  "scorer": {"name": "llm-judge"},
+  "scorer_options": {"judges": 3},
+  "model": {"scorer": "required", "name": "glm-5.3", "max_requests": 20},
+  "aggregate": {"stages": "sum"},
+  "display": {
+    "stage": {"name": "证明得分", "unit": "分", "direction": "higher", "decimals": 1, "min": 0, "max": 7},
+    "total": {"name": "总分", "unit": "分", "direction": "higher", "decimals": 1, "min": 0, "max": 14}
+  },
+  "total_time_limit_s": 1200,
+  "stages": [
+    {"id": "p1", "dir": "p1", "inputs": ["problem.md"], "tests": ["rubric.json"], "time_limit_s": 600},
+    {"id": "p2", "dir": "p2", "inputs": ["problem.md"], "tests": ["rubric.json"], "time_limit_s": 600}
+  ]
+}

@@ -10,7 +10,7 @@ octos-crucible 是评测 agent 的通用平台：任何能在沙箱里运行的 
 
 - **写代码**：ARC-Bench 的 GitHub 题，agent 写出网站，用 Playwright 浏览器测试打分。
 - **交互决策**：GOSIM 智能体巡天（题目包 `astro-practice`），观测 agent 与模拟器一问一答，用官方评分引擎打分。
-- **数学 / 推理（即将推出）**：例如 IMO 试题，agent 写证明，评判模型按评分标准打分。
+- **数学 / 推理**：题目包 `math-proof-demo`（两道经典 IMO 题），agent 把证明写进 `answer.md`，固定的评判模型按隐藏的参考解答和评分细则逐项给分（每题 7 分，评 3 次取中位数）。评判用的是你自己的模型 key（经平台计量代理），这部分用量单独显示为“评测阶段的模型用量”，不算进 agent 的用量。上传产出打分时同样要填模型和 key（命令行 `crucible submit app` 加 `--model --endpoint --api-key-env --download-password-env`）。
 
 题目、运行方式、打包、打分都是可替换的插件。平台不是排行榜，也不绑定某一套题或某一种打分方式。用 GitHub 账号登录即可使用。
 

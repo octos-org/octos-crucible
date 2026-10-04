@@ -1,0 +1,22 @@
+{
+  "problem": "(a) Find all positive integers n for which 2^n - 1 is divisible by 7. (b) Prove that there is no positive integer n for which 2^n + 1 is divisible by 7.",
+  "reference": "Since 2^3 = 8 ≡ 1 (mod 7), for n = 3k + r with r in {0, 1, 2} we have 2^n = (2^3)^k · 2^r ≡ 2^r (mod 7), i.e. 2^n ≡ 1, 2, 4 (mod 7) for r = 0, 1, 2. (a) 7 | 2^n - 1 iff 2^n ≡ 1 (mod 7) iff r = 0, i.e. iff n is a multiple of 3. (b) 2^n + 1 ≡ 2, 3, 5 (mod 7), never 0, so 7 never divides 2^n + 1.",
+  "answer_file": "answer.md",
+  "items": [
+    {
+      "name": "residues of powers of 2",
+      "points": 2,
+      "criteria": "Proves that 2^n mod 7 is periodic with period 3 taking the values 1, 2, 4 (e.g. from 2^3 ≡ 1 mod 7 and writing n = 3k + r). Merely listing a few values without justifying the period earns at most 1."
+    },
+    {
+      "name": "part (a)",
+      "points": 2,
+      "criteria": "States the answer: exactly the multiples of 3, and justifies both directions (multiples of 3 work, other n do not)."
+    },
+    {
+      "name": "part (b)",
+      "points": 3,
+      "criteria": "Proves that 2^n + 1 is never divisible by 7 for any positive integer n, e.g. because 2^n + 1 ≡ 2, 3 or 5 (mod 7). A proof covering only some n, or relying on unproved claims, earns at most 1."
+    }
+  ]
+}
