@@ -10,7 +10,8 @@ export interface Me {
 export interface TaskStage {
   name: string;
   time_limit_s: number;
-  total: number;
+  /** Number of tests, for test-counting scorers; null otherwise. */
+  total?: number | null;
 }
 
 export interface TaskSet {
@@ -24,6 +25,8 @@ export interface TaskSet {
   public?: boolean | null;
   status?: "packing" | "ready" | "failed" | null;
   error?: string | null;
+  /** The taskset's own `display`, when it declares one. */
+  display?: Display | null;
 }
 
 export type UploadKind = Mode | "taskset";
@@ -58,6 +61,8 @@ export interface EvalSummary {
   created_at: string;
   status: string;
   total_score?: number | null;
+  /** How to show total_score (the manifest's snapshot); absent = old 0–1 ratio. */
+  display?: ScoreFormat | null;
 }
 
 export interface EvalDetail {
@@ -69,12 +74,61 @@ export interface EvalDetail {
 
 // --- crucible-core::manifest ---
 
-export type ScoreStatus = "passed" | "failed" | "system_error" | "rejected";
+/** Result v2 (docs/plugins.md §7). */
+export interface ScoreItem {
+  name: string;
+  score?: number | null;
+  max?: number | null;
+  passed?: boolean | null;
+}
 
-export interface StageScore {
-  status: ScoreStatus;
+export interface StageScoreV2 {
+  status: "scored" | "error";
+  error?: "system" | "rejected" | null;
+  score?: number | null;
+  max?: number | null;
+  passed?: boolean | null;
+  items?: ScoreItem[] | null;
+}
+
+/** The format before v2, still found in old manifests (read, never rewritten). */
+export interface StageScoreLegacy {
+  status: "passed" | "failed" | "system_error" | "rejected";
   passed: number;
   total: number;
+}
+
+export type StageScore = StageScoreV2 | StageScoreLegacy;
+export type ScoreStatus = StageScore["status"];
+
+export interface ScoreFormat {
+  name?: string;
+  unit?: string;
+  direction?: "higher" | "lower";
+  min?: number | null;
+  max?: number | null;
+  decimals?: number;
+  format?: "number" | "percent" | "fraction";
+}
+
+export interface Display {
+  stage?: ScoreFormat | null;
+  total?: ScoreFormat | null;
+}
+
+export interface Aggregate {
+  items?: "sum" | "mean" | "weighted";
+  item_weights?: Record<string, number>;
+  stages?: "ratio" | "sum" | "mean" | "weighted";
+  weights?: Record<string, number>;
+  normalize?: boolean;
+}
+
+/** Snapshot written by publish; absent in older manifests. */
+export interface Scoring {
+  aggregate: Aggregate;
+  display: Display;
+  plugins: { kind: string; name: string; version: string }[];
 }
 
 export interface UsageTotals {
@@ -116,6 +170,8 @@ export interface Manifest {
   model: string;
   public: boolean;
   replicas: ReplicaEntry[];
+  scoring?: Scoring | null;
+  total_score?: number | null;
 }
 
 /** A personal API token for the command line (GET /tokens). */

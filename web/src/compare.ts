@@ -3,11 +3,14 @@
 
 import {
   cacheRate,
+  formatsOf,
+  readScore,
   replicaTotals,
   stageAcross,
   stageNames,
   stageScore,
   summarize,
+  type Formats,
   type Summary,
 } from "./stats";
 import type { Manifest, ReplicaEntry } from "./types";
@@ -34,12 +37,16 @@ export function alignStages(ms: Partial<Manifest>[]): Alignment {
 }
 
 export interface StageStats {
+  /** Per replica: score / max for test counts, else the score. */
   score: Summary | null;
-  passed: number;
-  total: number;
+  /** Σscore and Σmax over replicas (tests passed / tests for counts). */
+  sum: number;
+  max: number;
 }
 
 export interface EvalStats {
+  /** Display and aggregate of this evaluation (its snapshot, or the old defaults). */
+  formats: Formats;
   replicas: number;
   score: Summary | null;
   stages: Record<string, StageStats>;
@@ -60,22 +67,25 @@ export function evalStats(m: Partial<Manifest>, stages: string[]): EvalStats {
     replica: r.replica,
     stages: (r.stages ?? []).filter((s) => stages.includes(s.stage)),
   }));
-  const totals = reps.map(replicaTotals);
+  const formats = formatsOf(m);
+  const totals = reps.map((r) => replicaTotals(r, formats.aggregate));
   const per: Record<string, StageStats> = {};
   for (const name of stages) {
     const ss = stageAcross(reps, name);
-    let passed = 0;
-    let total = 0;
+    let sum = 0;
+    let max = 0;
     for (const s of ss) {
-      if (stageScore(s) !== null) {
-        passed += s.score!.passed;
-        total += s.score!.total;
+      const r = readScore(s.score);
+      if (r?.status === "scored") {
+        sum += r.score ?? 0;
+        max += r.max ?? 0;
       }
     }
-    per[name] = { score: summarize(ss.map(stageScore)), passed, total };
+    per[name] = { score: summarize(ss.map((s) => stageScore(s, formats.stage))), sum, max };
   }
   const cost_known = totals.length > 0 && totals.every((t) => t.cost_usd !== null);
   return {
+    formats,
     replicas: reps.length,
     score: summarize(totals.map((t) => t.score)),
     stages: per,
