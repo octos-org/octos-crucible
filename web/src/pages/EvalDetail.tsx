@@ -107,7 +107,7 @@ export function EvalDetailPage({ id }: { id: string }) {
         )}
       </dl>
 
-      {d.status === "done" && (
+      {d.status === "done" && m.download && (
         <Card title="下载产出">
           <p class="muted small">
             产出和日志打包为 AES-256 加密的 zip，用提交时设置的下载密码解压。请使用 7-Zip、Keka 或 The
