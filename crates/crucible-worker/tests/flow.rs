@@ -38,7 +38,10 @@ fn block_on<F: Future>(f: F) -> F::Output {
 #[derive(Default)]
 struct FakeGitHub {
     releases: BTreeMap<String, u64>,
-    assets: BTreeMap<u64, Vec<String>>,
+    /// release id → asset name → bytes
+    assets: BTreeMap<u64, BTreeMap<String, Vec<u8>>>,
+    /// The next asset upload is stored but its answer is lost.
+    lose_upload_answer: bool,
     dispatches: Vec<Value>,
     /// (run id, eval id, status, conclusion)
     runs: Vec<(u64, String, String, Option<String>)>,
@@ -56,6 +59,10 @@ struct Mock {
     /// Keys whose reads return an old value (KV is eventually consistent:
     /// a read can miss a recent write). See [`Mock::freeze`].
     stale: RefCell<BTreeMap<String, Option<Vec<u8>>>>,
+    /// When set, every KV put fails with this error.
+    put_error: RefCell<Option<String>>,
+    /// Successful KV puts so far.
+    puts: Cell<usize>,
 }
 
 impl Mock {
@@ -67,6 +74,8 @@ impl Mock {
             logs: RefCell::default(),
             rng: Cell::new(7),
             stale: RefCell::default(),
+            put_error: RefCell::default(),
+            puts: Cell::new(0),
         }
     }
 
@@ -81,7 +90,17 @@ impl Mock {
         self.stale.borrow_mut().remove(key);
     }
 
-    fn github(&self, r: &HttpRequest) -> HttpResponse {
+    fn github(&self, r: &HttpRequest) -> Result<HttpResponse, String> {
+        let resp = self.github_answer(r);
+        let mut gh = self.gh.borrow_mut();
+        if r.url.starts_with("https://uploads.test/") && std::mem::take(&mut gh.lose_upload_answer)
+        {
+            return Err("connection reset".into());
+        }
+        Ok(resp)
+    }
+
+    fn github_answer(&self, r: &HttpRequest) -> HttpResponse {
         let ok = |status: u16, v: Value| HttpResponse {
             status,
             body: serde_json::to_vec(&v).unwrap(),
@@ -114,6 +133,22 @@ impl Mock {
             assert_eq!(auth, Some("Bearer gho_user"));
             return ok(200, json!({"id": 42, "login": "octocat"}));
         }
+        if let Some(rest) = r
+            .url
+            .strip_prefix("https://github.com/octos-org/octos-crucible/releases/download/")
+        {
+            // Public download: no token.
+            assert_eq!(auth, None);
+            let (tag, name) = rest.split_once('/').unwrap();
+            let id = gh.releases.get(tag);
+            return match id.and_then(|id| gh.assets.get(id)?.get(name)) {
+                Some(bytes) => HttpResponse {
+                    status: 200,
+                    body: bytes.clone(),
+                },
+                None => ok(404, json!({"message": "Not Found"})),
+            };
+        }
         // Everything else is repo-scoped and uses the platform token.
         assert_eq!(
             auth,
@@ -129,10 +164,10 @@ impl Mock {
         {
             let id: u64 = name.0.parse().unwrap();
             let list = gh.assets.entry(id).or_default();
-            if list.contains(&name.1.to_string()) {
+            if list.contains_key(name.1) {
                 return ok(422, json!({"errors": [{"code": "already_exists"}]}));
             }
-            list.push(name.1.to_string());
+            list.insert(name.1.to_string(), r.body.clone().unwrap());
             return ok(201, json!({"name": name.1}));
         }
         let path = r
@@ -267,6 +302,10 @@ impl Backend for Mock {
                 "KV metadata limit"
             );
         }
+        if let Some(e) = self.put_error.borrow().clone() {
+            return Err(e);
+        }
+        self.puts.set(self.puts.get() + 1);
         let exp = opts.ttl.map(|t| self.now.get() + t);
         self.kv
             .borrow_mut()
@@ -291,7 +330,7 @@ impl Backend for Mock {
             .collect())
     }
     async fn fetch(&self, req: HttpRequest) -> Result<HttpResponse, String> {
-        Ok(self.github(&req))
+        self.github(&req)
     }
     fn now_s(&self) -> u64 {
         self.now.get()
@@ -616,7 +655,10 @@ fn full_flow() {
         let id = 777;
         gh.releases
             .insert(release_tag(&sha256_hex(&foreign)).unwrap(), id);
-        gh.assets.entry(id).or_default().push(sha256_hex(&foreign));
+        gh.assets
+            .entry(id)
+            .or_default()
+            .insert(sha256_hex(&foreign), foreign.clone());
     }
     block_on(t.mock.kv_delete(&format!(
         "cache/release/{}",
@@ -1444,4 +1486,209 @@ fn user_tasksets() {
         .status,
         409
     );
+}
+
+fn upload_as(t: &T, tok: &str, body: &[u8]) -> Resp {
+    let auth = format!("Bearer {tok}");
+    t.call(
+        "POST",
+        "/uploads",
+        &[("Authorization", &auth), ("X-Upload-Kind", "app")],
+        body,
+    )
+}
+
+fn asset_count(t: &T) -> usize {
+    t.mock.gh.borrow().assets.values().map(|a| a.len()).sum()
+}
+
+/// The upload reached GitHub but its answer was lost, so the client
+/// retries the same bytes: the retry succeeds, and only its owner's does.
+#[test]
+fn upload_retry_after_lost_answer() {
+    let t = T::new();
+    let alice = token(42, "octocat");
+    let bob = token(43, "bob");
+    let blob = sealed(b"app ciphertext");
+    t.mock.gh.borrow_mut().lose_upload_answer = true;
+    let r = upload_as(&t, &alice, &blob);
+    assert_eq!(r.status, 502, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(asset_count(&t), 1); // stored nonetheless
+
+    let r = upload_as(&t, &alice, &blob);
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(json_of(&r)["hash"], sha256_hex(&blob));
+    assert_eq!(upload_as(&t, &alice, &blob).status, 200);
+    assert_eq!(asset_count(&t), 1);
+    // Someone else's retry of the same bytes is refused.
+    assert_eq!(err_code(&upload_as(&t, &bob, &blob)), "conflict");
+
+    // The hash is usable for an eval.
+    let eval = json!({
+        "mode": "app", "eval_id": EID, "upload_hash": sha256_hex(&blob),
+        "taskset": "github-full", "stages": 1, "score_public": false, "consent": true
+    });
+    let r = t.as_user(
+        "POST",
+        "/evals",
+        &alice,
+        &serde_json::to_vec(&eval).unwrap(),
+    );
+    assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+}
+
+/// A stored asset that is not what its name says is never accepted.
+#[test]
+fn upload_retry_checks_stored_bytes() {
+    let t = T::new();
+    let alice = token(42, "octocat");
+    let blob = sealed(b"app ciphertext");
+    assert_eq!(upload_as(&t, &alice, &blob).status, 201);
+    for list in t.mock.gh.borrow_mut().assets.values_mut() {
+        for bytes in list.values_mut() {
+            bytes.push(b'!');
+        }
+    }
+    assert_eq!(err_code(&upload_as(&t, &alice, &blob)), "upstream_error");
+}
+
+/// Bytes stored without anyone's upload record (e.g. workflow outputs) are
+/// not claimable, and the refused attempt leaves no claim behind.
+#[test]
+fn upload_of_unclaimed_stored_bytes_is_refused() {
+    let t = T::new();
+    let bob = token(43, "bob");
+    let foreign = sealed(b"someone's output");
+    let hash = sha256_hex(&foreign);
+    {
+        let mut gh = t.mock.gh.borrow_mut();
+        gh.releases.insert(release_tag(&hash).unwrap(), 777);
+        gh.assets
+            .entry(777)
+            .or_default()
+            .insert(hash.clone(), foreign.clone());
+    }
+    assert_eq!(err_code(&upload_as(&t, &bob, &foreign)), "conflict");
+    assert!(t.mock.kv.borrow().get(&format!("upload/{hash}")).is_none());
+    assert_eq!(err_code(&upload_as(&t, &bob, &foreign)), "conflict");
+}
+
+/// Out of KV writes: the upload fails with an explicit 503 before anything
+/// reaches GitHub, so a later retry is a clean first upload.
+#[test]
+fn upload_when_kv_quota_is_exhausted() {
+    let t = T::new();
+    let alice = token(42, "octocat");
+    let blob = sealed(b"app ciphertext");
+    // Create the release first (its cache write is best-effort anyway).
+    assert_eq!(upload_as(&t, &alice, &sealed(b"warm-up")).status, 201);
+    let before = asset_count(&t);
+    *t.mock.put_error.borrow_mut() = Some("KV put() limit exceeded for the day.".into());
+    let r = upload_as(&t, &alice, &blob);
+    assert_eq!(r.status, 503);
+    assert_eq!(err_code(&r), "storage_quota");
+    assert_eq!(asset_count(&t), before);
+    *t.mock.put_error.borrow_mut() = None;
+    assert_eq!(upload_as(&t, &alice, &blob).status, 201);
+}
+
+/// The same results posted again (an answer was lost, or a rerun posts
+/// what is stored) succeed without rewriting anything; a delivery that
+/// failed half-way is completed by the retry.
+#[test]
+fn results_repeated_delivery() {
+    let t = T::new();
+    let alice = token(42, "octocat");
+    let blob = sealed(b"site");
+    let hash = json_of(&upload_as(&t, &alice, &blob))["hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let eval = json!({
+        "mode": "app", "eval_id": EID, "upload_hash": hash, "taskset": "github-full",
+        "stages": 1, "score_public": false, "consent": true
+    });
+    let r = t.as_user(
+        "POST",
+        "/evals",
+        &alice,
+        &serde_json::to_vec(&eval).unwrap(),
+    );
+    assert_eq!(r.status, 201);
+    let status = |s: &str| {
+        t.as_user(
+            "POST",
+            &format!("/internal/status/{EID}"),
+            WORKER_TOKEN,
+            &serde_json::to_vec(&json!({"status": s})).unwrap(),
+        )
+    };
+    assert_eq!(status("scoring").status, 200);
+    let puts = t.mock.puts.get();
+    assert_eq!(status("scoring").status, 200);
+    assert_eq!(t.mock.puts.get(), puts, "a repeated status writes nothing");
+
+    let manifest = json!({
+        "schema": 1, "eval_id": EID, "created_at": "2026-10-03T00:00:00Z",
+        "taskset": "github-full", "agent": {"name": "uploaded", "version": "1"},
+        "model": "app", "public": false,
+        "replicas": [{"replica": 1, "stages": [
+            {"stage": "stage-1", "score": {"status": "passed", "passed": 10, "total": 30},
+             "usage": {"requests": 0, "prompt_tokens": 0, "cached_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0}}
+        ]}],
+        "download": {"sha256": "ab".repeat(32)}
+    });
+    let body = serde_json::to_vec(&manifest).unwrap();
+    let post = || {
+        t.as_user(
+            "POST",
+            &format!("/internal/results/{EID}"),
+            WORKER_TOKEN,
+            &body,
+        )
+    };
+
+    let results_key = format!("results/{EID}");
+    let r = post();
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let stored = t.mock.kv.borrow().get(&results_key).unwrap().0.clone();
+    // Make it a delivery whose record write failed: put the old record back.
+    let rec_key = format!("evals/{EID}");
+    let mut rec: Value =
+        serde_json::from_slice(&t.mock.kv.borrow().get(&rec_key).unwrap().0).unwrap();
+    rec["status"] = json!("scoring");
+    rec["updated_at"] = json!("2026-01-01T00:00:00Z");
+    t.mock.kv.borrow_mut().get_mut(&rec_key).unwrap().0 = serde_json::to_vec(&rec).unwrap();
+
+    // The retry completes the record but keeps the stored results.
+    t.mock.now.set(NOW + 30);
+    let r = post();
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(json_of(&r)["status"], "done");
+    assert_eq!(t.mock.kv.borrow().get(&results_key).unwrap().0, stored);
+    let detail = json_of(&t.as_user("GET", &format!("/evals/{EID}"), &alice, b""));
+    assert_eq!(detail["status"], "done");
+    assert_eq!(detail["download_available"], true);
+
+    // Once everything is in place, a further repeat writes nothing.
+    let puts = t.mock.puts.get();
+    let r = post();
+    assert_eq!(r.status, 200);
+    assert_eq!(json_of(&r)["status"], "done");
+    assert_eq!(t.mock.puts.get(), puts);
+
+    // With the quota gone, a repeat still succeeds (nothing to write)...
+    *t.mock.put_error.borrow_mut() = Some("KV put() limit exceeded for the day.".into());
+    assert_eq!(post().status, 200);
+    // ...while new results report the quota explicitly.
+    let mut changed = manifest.clone();
+    changed["replicas"][0]["stages"][0]["score"]["passed"] = json!(11);
+    let r = t.as_user(
+        "POST",
+        &format!("/internal/results/{EID}"),
+        WORKER_TOKEN,
+        &serde_json::to_vec(&changed).unwrap(),
+    );
+    assert_eq!(r.status, 503);
+    assert_eq!(err_code(&r), "storage_quota");
 }
