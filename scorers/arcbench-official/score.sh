@@ -36,11 +36,12 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # What `npm install` needs, nothing else (docs/arcbench-official.md §3):
 # - npm registries: the image's /root/.npmrc registry, and the two registry
 #   hosts that appear in submitted lockfiles (`replace-registry-host=npmjs`
-#   rewrites only registry.npmjs.org);
+#   rewrites only registry.npmjs.org); registry.npmmirror.com answers
+#   tarball requests with a redirect to cdn.npmmirror.com;
 # - native addons (sqlite3 5.x via prebuild-install, bcrypt 5.x via
 #   node-pre-gyp): prebuilt binaries from GitHub releases, and node-gyp's
 #   fallback (Node headers from nodejs.org) when no prebuilt matches.
-ALLOW_HOSTS="repo.huaweicloud.com,registry.npmjs.org,registry.npmmirror.com"
+ALLOW_HOSTS="repo.huaweicloud.com,registry.npmjs.org,registry.npmmirror.com,cdn.npmmirror.com"
 ALLOW_HOSTS="$ALLOW_HOSTS,github.com,objects.githubusercontent.com,release-assets.githubusercontent.com,nodejs.org"
 
 usage() { sed -n '2,10p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2; exit 2; }
