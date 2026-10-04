@@ -1,0 +1,52 @@
+id: ROOT
+name: Book Club - Stage 3
+type: FOLDER
+dependencies: []
+description: |-
+  The book club application already exists from the previous stages: the home page `/` with the heading "Book Club" and the "Books" link, sign-in at `/login` (the account "alice" / "alice123" exists from the start), sign-out, account creation at `/register`, the book list `/books` (the book "Dune" by "Frank Herbert" exists from the start), adding books for signed-in users and a page per book `/books/<id>`. Everything it does must keep working. This stage adds reviews with ratings, average ratings and a page listing the signed-in user's own reviews.
+children:
+- id: REQ-7
+  name: Post Review
+  type: ATOMIC
+  dependencies: []
+  description: |-
+    On a book's page a signed-in user sees a select labelled "Rating" with the options 1, 2, 3, 4 and 5, a text area labelled "Review" and a button named "Post review". Posting stores the review and the page then lists it as a list item containing "<username> rated <n>/5" and the review text. A user has at most one review per book: posting again on the same book replaces the user's earlier review. A visitor who is not signed in does not see the form and instead sees the text "Sign in to review".
+  scenarios:
+  - name: 'REQ-7: Post Review - Scenario 1'
+    steps:
+    - keyword: GIVEN
+      content: 'The user "alice" is signed in and on the page of "Dune".'
+    - keyword: WHEN
+      content: 'She chooses rating 4, writes "Great world building" and presses "Post review"; later she posts rating 2 on the same book.'
+    - keyword: THEN
+      content: 'The page lists one review by alice, "alice rated 2/5", with the latest text.'
+- id: REQ-8
+  name: Average Rating
+  type: ATOMIC
+  dependencies: [REQ-7]
+  description: |-
+    A book's page shows "Average rating: X.X", the mean of all its reviews' ratings with exactly one decimal (for example "Average rating: 4.5"), or "No ratings yet" when the book has no reviews. On `/books`, each book's list item also shows the same text ("Average rating: X.X" or "No ratings yet").
+  scenarios:
+  - name: 'REQ-8: Average Rating - Scenario 1'
+    steps:
+    - keyword: GIVEN
+      content: 'A new book has no reviews.'
+    - keyword: WHEN
+      content: 'One user rates it 4 and another user rates it 5.'
+    - keyword: THEN
+      content: 'Its page and its item on `/books` show "Average rating: 4.5"; before the reviews both showed "No ratings yet".'
+- id: REQ-9
+  name: My Reviews
+  type: ATOMIC
+  dependencies: [REQ-7]
+  description: |-
+    When a user is signed in, the home page shows a link named "My reviews" leading to `/me`. The page `/me` shows a level-1 heading "My reviews" and, for each book the signed-in user has reviewed, a list item containing a link named with the book's title (leading to its page) and the text "rated <n>/5". A visitor who is not signed in and opens `/me` is sent to `/login`.
+  scenarios:
+  - name: 'REQ-9: My Reviews - Scenario 1'
+    steps:
+    - keyword: GIVEN
+      content: 'The user "alice" is signed in and has rated "Dune" 5.'
+    - keyword: WHEN
+      content: 'She follows "My reviews" on the home page.'
+    - keyword: THEN
+      content: 'The page `/me` shows the heading "My reviews" and an item with the link "Dune" and "rated 5/5".'

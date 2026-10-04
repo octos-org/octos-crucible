@@ -1,0 +1,66 @@
+id: ROOT
+name: Book Club - Stage 1
+type: FOLDER
+dependencies: []
+description: |-
+  A small book club web application. This stage builds the home page and user accounts: signing in, signing out and creating an account. Accounts are stored by the server. Later stages extend the same application.
+children:
+- id: REQ-1
+  name: Home Page
+  type: ATOMIC
+  dependencies: []
+  description: |-
+    The home page `/` shows a level-1 heading with exactly the text "Book Club". When the visitor is not signed in, it shows a link named "Sign in" leading to `/login` and a link named "Create account" leading to `/register`.
+  scenarios:
+  - name: 'REQ-1: Home Page - Scenario 1'
+    steps:
+    - keyword: GIVEN
+      content: 'A visitor who is not signed in opens the home page.'
+    - keyword: THEN
+      content: 'The heading "Book Club" and the links "Sign in" and "Create account" are shown; following them opens `/login` and `/register`.'
+- id: REQ-2
+  name: Sign In and Sign Out
+  type: ATOMIC
+  dependencies: [REQ-1]
+  description: |-
+    The page `/login` shows a level-1 heading "Sign in", a text input labelled "Username", a password input labelled "Password" and a button named "Sign in". The account "alice" with password "alice123" exists from the start. Submitting correct credentials signs the visitor in and goes to the home page `/`, which then shows the text "Signed in as alice" (with the user's name) and a button named "Sign out", and no "Sign in" link. Wrong credentials keep the visitor on the sign-in page and show the text "Invalid username or password". The sign-in lasts across page reloads (for example a session cookie). Pressing "Sign out" signs the visitor out; the home page then shows the "Sign in" link again.
+  scenarios:
+  - name: 'REQ-2: Sign In and Sign Out - Scenario 1'
+    steps:
+    - keyword: GIVEN
+      content: 'A visitor is on `/login`.'
+    - keyword: WHEN
+      content: 'They enter "alice" and "alice123" and press "Sign in".'
+    - keyword: THEN
+      content: 'The home page shows "Signed in as alice" and a "Sign out" button, also after a reload.'
+  - name: 'REQ-2: Sign In and Sign Out - Scenario 2'
+    steps:
+    - keyword: GIVEN
+      content: 'A visitor is on `/login`.'
+    - keyword: WHEN
+      content: 'They enter "alice" and a wrong password and press "Sign in".'
+    - keyword: THEN
+      content: 'The text "Invalid username or password" is shown and they are not signed in.'
+- id: REQ-3
+  name: Create Account
+  type: ATOMIC
+  dependencies: [REQ-2]
+  description: |-
+    The page `/register` shows a level-1 heading "Create account", a text input labelled "Username", a password input labelled "Password" and a button named "Create account". Submitting a new username and a password creates the account, signs the new user in and goes to `/`, which shows "Signed in as <username>". If the username is already taken the page shows "Username already taken"; if the username or the password is empty it shows "Username and password are required". In both error cases no account is created and the visitor stays on `/register`. A created account can sign in later with its password.
+  scenarios:
+  - name: 'REQ-3: Create Account - Scenario 1'
+    steps:
+    - keyword: GIVEN
+      content: 'A visitor is on `/register`.'
+    - keyword: WHEN
+      content: 'They enter the username "carol" and the password "pw1" and press "Create account".'
+    - keyword: THEN
+      content: 'The home page shows "Signed in as carol"; after signing out, "carol" / "pw1" can sign in again.'
+  - name: 'REQ-3: Create Account - Scenario 2'
+    steps:
+    - keyword: GIVEN
+      content: 'A visitor is on `/register`.'
+    - keyword: WHEN
+      content: 'They enter the username "alice" and any password and press "Create account".'
+    - keyword: THEN
+      content: 'The text "Username already taken" is shown.'

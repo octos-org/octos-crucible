@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "name": "bookclub",
+  "description": "Public tuning task, harder than todo-mini: a small book club web app built over 3 stages on the same code (accounts and sign-in with a seeded user; books with list and detail pages; reviews, average ratings and a personal page). Exact accessible names, redirects, seeded data and cross-stage behaviour are tested. Requirements and tests are public (source/), written for this platform (not from ARC). Scored with Playwright browser tests (5 / 6 / 6).",
+  "scorer": {"name": "playwright"},
+  "aggregate": "sum",
+  "total_time_limit_s": 3600,
+  "stages": [
+    {"id": "stage-1", "dir": "book-stage-1", "inputs": ["requirements.yaml"], "tests": ["tests"], "output": "web-app", "time_limit_s": 1200, "expected_total": 5},
+    {"id": "stage-2", "dir": "book-stage-2", "inputs": ["requirements.yaml"], "tests": ["tests"], "output": "web-app", "time_limit_s": 1200, "expected_total": 6},
+    {"id": "stage-3", "dir": "book-stage-3", "inputs": ["requirements.yaml"], "tests": ["tests"], "output": "web-app", "time_limit_s": 1200, "expected_total": 6}
+  ]
+}
