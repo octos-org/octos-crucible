@@ -3,7 +3,7 @@
 //!
 //! A replica counts as failed — listed, counted, but left out of the
 //! statistics — when any stage is missing, was never scored, or was scored
-//! with an infrastructure error (`system_error`/`rejected`). An agent that
+//! with an infrastructure error (status `error`). An agent that
 //! simply fails tests is not a failed replica; that is its score.
 //!
 //! On-disk layout read by [`load_run_dir`] (written by the run step):
@@ -40,8 +40,9 @@ pub struct ReplicaInput {
 pub struct Row {
     pub stage: String,
     pub status: Option<ScoreStatus>,
-    pub passed: u32,
-    pub total: u32,
+    /// The stage score (result v2), or the sum over stages for a total.
+    pub score: Option<f64>,
+    pub max: Option<f64>,
     pub wall_s: Option<f64>,
     pub requests: u64,
     pub prompt_tokens: u64,
@@ -75,8 +76,8 @@ pub struct Stats {
 /// lacks it (e.g. unknown price): a mean over a subset would mislead.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MetricStats {
-    pub passed: Option<Stats>,
-    pub total: Option<Stats>,
+    pub score: Option<Stats>,
+    pub max: Option<Stats>,
     pub wall_s: Option<Stats>,
     pub requests: Option<Stats>,
     pub prompt_tokens: Option<Stats>,
@@ -138,8 +139,8 @@ fn stage_row(s: &StageInput, pricing: &Pricing, user_price: Option<Price>) -> Ro
     Row {
         stage: s.stage.clone(),
         status: s.score.as_ref().map(|r| r.status),
-        passed: s.score.as_ref().map_or(0, |r| r.passed),
-        total: s.score.as_ref().map_or(0, |r| r.total),
+        score: s.score.as_ref().and_then(|r| r.score),
+        max: s.score.as_ref().and_then(|r| r.max),
         wall_s: s.wall_s,
         requests: u.requests,
         prompt_tokens: u.prompt_tokens,
@@ -151,18 +152,18 @@ fn stage_row(s: &StageInput, pricing: &Pricing, user_price: Option<Price>) -> Ro
     }
 }
 
-/// Sum of a replica's stages (the `sum` aggregate).
+/// Sum of a replica's stages.
 fn total_row(rows: &[Row]) -> Row {
     let sum_opt = |f: fn(&Row) -> Option<f64>| rows.iter().map(f).sum::<Option<f64>>();
     let mut t = Row {
         stage: "total".into(),
         wall_s: sum_opt(|r| r.wall_s),
         cost_usd: sum_opt(|r| r.cost_usd),
+        score: sum_opt(|r| r.score),
+        max: sum_opt(|r| r.max),
         ..Default::default()
     };
     for r in rows {
-        t.passed += r.passed;
-        t.total += r.total;
         t.requests += r.requests;
         t.prompt_tokens += r.prompt_tokens;
         t.cached_tokens += r.cached_tokens;
@@ -180,8 +181,8 @@ fn metric_stats(rows: &[&Row]) -> MetricStats {
         stats(&v?)
     };
     MetricStats {
-        passed: all(&|r| Some(r.passed as f64)),
-        total: all(&|r| Some(r.total as f64)),
+        score: all(&|r| r.score),
+        max: all(&|r| r.max),
         wall_s: all(&|r| r.wall_s),
         requests: all(&|r| Some(r.requests as f64)),
         prompt_tokens: all(&|r| Some(r.prompt_tokens as f64)),
@@ -348,11 +349,12 @@ fn fmt_stats(s: Option<Stats>, f: impl Fn(f64) -> String) -> String {
 pub fn markdown(r: &RunReport) -> String {
     let int = |v: f64| thousands(v.round() as u64);
     let one = |v: f64| format!("{v:.1}");
+    let two = |v: f64| format!("{v:.2}");
     let pct = |v: f64| format!("{:.1}%", v * 100.0);
     let usd = |v: f64| format!("${v:.4}");
     let mut out = format!(
         "replicas: {} (ok {}, failed {})\n\n\
-         | stage | passed | total | wall s | requests | prompt | cached | completion | cache hit | equiv. cost |\n\
+         | stage | score | max | wall s | requests | prompt | cached | completion | cache hit | equiv. cost |\n\
          |---|---|---|---|---|---|---|---|---|---|\n",
         r.n_replicas, r.n_ok, r.n_failed
     );
@@ -364,8 +366,8 @@ pub fn markdown(r: &RunReport) -> String {
     for (name, m) in rows {
         out.push_str(&format!(
             "| {name} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
-            fmt_stats(m.passed, one),
-            fmt_stats(m.total, one),
+            fmt_stats(m.score, two),
+            fmt_stats(m.max, two),
             fmt_stats(m.wall_s, one),
             fmt_stats(m.requests, int),
             fmt_stats(m.prompt_tokens, int),
@@ -392,17 +394,12 @@ pub fn markdown(r: &RunReport) -> String {
 mod tests {
     use super::*;
 
-    fn score(status: ScoreStatus, passed: u32, total: u32) -> Option<ScoreResult> {
-        Some(ScoreResult {
-            submission_id: None,
-            task_id: None,
-            visibility: None,
-            status,
-            passed,
-            total,
-            detail: String::new(),
-            tests: None,
-        })
+    /// An old-format result, as the Playwright scorer still writes.
+    fn score(status: &str, passed: u32, total: u32) -> Option<ScoreResult> {
+        serde_json::from_str(&format!(
+            r#"{{"status":"{status}","passed":{passed},"total":{total}}}"#
+        ))
+        .ok()
     }
 
     fn usage(prompt: u64, cached: u64, completion: u64) -> Vec<UsageRecord> {
@@ -453,13 +450,13 @@ mod tests {
                 stages: vec![
                     stage(
                         "stage-1",
-                        score(ScoreStatus::Failed, 27, 30),
+                        score("failed", 27, 30),
                         100.0,
                         1_000_000,
                     ),
                     stage(
                         "stage-2",
-                        score(ScoreStatus::Failed, 20, 29),
+                        score("failed", 20, 29),
                         200.0,
                         2_000_000,
                     ),
@@ -470,13 +467,13 @@ mod tests {
                 stages: vec![
                     stage(
                         "stage-1",
-                        score(ScoreStatus::Passed, 30, 30),
+                        score("passed", 30, 30),
                         300.0,
                         3_000_000,
                     ),
                     stage(
                         "stage-2",
-                        score(ScoreStatus::Failed, 10, 29),
+                        score("failed", 10, 29),
                         400.0,
                         4_000_000,
                     ),
@@ -486,21 +483,21 @@ mod tests {
             ReplicaInput {
                 replica: "r3".into(),
                 stages: vec![
-                    stage("stage-1", score(ScoreStatus::Passed, 30, 30), 1.0, 1),
-                    stage("stage-2", score(ScoreStatus::SystemError, 0, 0), 1.0, 1),
+                    stage("stage-1", score("passed", 30, 30), 1.0, 1),
+                    stage("stage-2", score("system_error", 0, 0), 1.0, 1),
                 ],
             },
             // Run died before stage 2.
             ReplicaInput {
                 replica: "r4".into(),
-                stages: vec![stage("stage-1", score(ScoreStatus::Failed, 1, 30), 1.0, 1)],
+                stages: vec![stage("stage-1", score("failed", 1, 30), 1.0, 1)],
             },
         ];
         let r = aggregate(&replicas, &pricing(), None);
         assert_eq!((r.n_replicas, r.n_ok, r.n_failed), (4, 2, 2));
         assert_eq!(
             r.replicas[2].failure.as_deref(),
-            Some("stage stage-2: system_error")
+            Some("stage stage-2: error")
         );
         assert_eq!(
             r.replicas[3].failure.as_deref(),
@@ -509,7 +506,7 @@ mod tests {
 
         let s1 = &r.stages[0].stats;
         assert_eq!(r.stages[0].stage, "stage-1");
-        let p = s1.passed.unwrap();
+        let p = s1.score.unwrap();
         assert_eq!((p.n, p.mean, p.min, p.max), (2, 28.5, 27.0, 30.0));
         approx(p.std.unwrap(), (4.5f64).sqrt());
         approx(s1.wall_s.unwrap().mean, 200.0);
@@ -517,8 +514,8 @@ mod tests {
 
         let t = &r.total;
         // r1: 47/59, r2: 40/59
-        approx(t.passed.unwrap().mean, 43.5);
-        approx(t.total.unwrap().mean, 59.0);
+        approx(t.score.unwrap().mean, 43.5);
+        approx(t.max.unwrap().mean, 59.0);
         approx(t.wall_s.unwrap().min, 300.0);
         approx(t.wall_s.unwrap().max, 700.0);
         // glm-5 r1 total: prompt 3M (1.5M cached), completion 2000
@@ -527,14 +524,14 @@ mod tests {
         let md = markdown(&r);
         assert!(md.contains("replicas: 4 (ok 2, failed 2)"), "{md}");
         assert!(md.contains("- r4: stage stage-2 missing"), "{md}");
-        assert!(md.contains("| stage-1 | 28.5 ± 2.1 (27.0–30.0)"), "{md}");
+        assert!(md.contains("| stage-1 | 28.50 ± 2.12 (27.00–30.00)"), "{md}");
     }
 
     #[test]
     fn unknown_price_or_wall_gives_no_stat() {
-        let mut a = stage("s", score(ScoreStatus::Passed, 1, 1), 1.0, 10);
+        let mut a = stage("s", score("passed", 1, 1), 1.0, 10);
         a.records[0].resp_model = Some("kimi-for-coding".into());
-        let mut b = stage("s", score(ScoreStatus::Passed, 1, 1), 1.0, 10);
+        let mut b = stage("s", score("passed", 1, 1), 1.0, 10);
         b.wall_s = None;
         let r = aggregate(
             &[
@@ -552,7 +549,7 @@ mod tests {
         );
         assert!(r.total.cost_usd.is_none());
         assert!(r.total.wall_s.is_none());
-        assert_eq!(r.total.passed.unwrap().n, 2);
+        assert_eq!(r.total.score.unwrap().n, 2);
     }
 
     #[test]
@@ -575,6 +572,6 @@ mod tests {
         assert_eq!(names, ["r1", "r2", "r10"]);
         assert_eq!(reps[0].stages[0].wall_s, Some(60.0));
         let r = aggregate(&reps, &pricing(), None);
-        approx(r.total.passed.unwrap().mean, 25.0);
+        approx(r.total.score.unwrap().mean, 25.0);
     }
 }
