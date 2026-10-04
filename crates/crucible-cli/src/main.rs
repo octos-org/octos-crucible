@@ -6,7 +6,6 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
-use crucible_core::taskset::USER_SCORERS;
 use crucible_crypto::PublicKey;
 use crucible_metering::{Price, Pricing};
 
@@ -14,10 +13,10 @@ mod agentpkg;
 mod build;
 mod cred;
 mod keys;
-mod package;
+mod packagers;
 mod plan;
 mod publish;
-mod run;
+mod runners;
 mod score;
 mod submit;
 mod taskset_cmd;
@@ -154,12 +153,15 @@ enum Cmd {
         expect_commit: Option<String>,
     },
     /// Run the agent stage by stage. Reads {"api_key","endpoint"} as one JSON line on stdin.
-    Run(Box<run::RunArgs>),
+    Run(Box<runners::RunArgs>),
     /// Package a work dir as a stage output zip.
     Package {
-        /// `web-app` or `files`.
+        /// Packager plugin (`web-app` or `files`).
         #[arg(long, default_value = "web-app")]
         kind: String,
+        /// packager_options, JSON (e.g. {"require": ["answer.md"]}).
+        #[arg(long)]
+        options: Option<String>,
         #[arg(long)]
         src: PathBuf,
         #[arg(long)]
@@ -196,6 +198,12 @@ enum Cmd {
     Manifest(Box<ManifestArgs>),
     /// Score stage checkpoints with the taskset's scorer: <results>/<replica>/<stage>/checkpoint.sealed -> <out>/<replica>/<stage>/score.json.
     Score(Box<ScoreArgs>),
+    /// List the container plugins a taskset uses, one `<kind> <name> <dir>`
+    /// line each (the scoring job builds their images in advance).
+    Plugins {
+        #[arg(long)]
+        taskset: PathBuf,
+    },
     /// On the machine with the platform key: re-seal the selected stages'
     /// tests and checkpoints to a fresh one-run key for a scoring machine
     /// that holds no secret (`crucible score --tests-dir`). Writes
@@ -271,9 +279,10 @@ struct ScoreArgs {
     /// Environment variable holding a private key; removed from the scorer's environment.
     #[arg(long)]
     identity_env: Vec<String>,
-    /// Directory of scorers (`<dir>/<taskset scorer>/score.sh`).
-    #[arg(long, default_value = "scorers")]
-    scorers_dir: PathBuf,
+    /// Where the plugin directories of `plugins.json` are (the repository
+    /// root, or a handoff holding `scorers/`).
+    #[arg(long, default_value = ".")]
+    plugins_root: PathBuf,
 }
 
 #[derive(clap::Args)]
@@ -524,15 +533,20 @@ async fn run(cmd: Cmd) -> Result<()> {
             println!("{}", serde_json::to_string(&facts)?);
             Ok(())
         }
-        Cmd::Run(args) => run::run(*args).await,
+        Cmd::Run(args) => runners::run(*args).await,
         Cmd::Package {
             kind,
+            options,
             src,
             out,
             agent_json,
         } => {
-            let kind: crucible_core::taskset::OutputKind =
-                serde_json::from_value(serde_json::Value::String(kind)).context("--kind")?;
+            let opts: Option<serde_json::Value> = options
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .context("--options")?;
+            packagers::check_options(&kind, opts.as_ref())?;
             let cmd = match agent_json {
                 Some(p) => {
                     let spec: crucible_core::AgentSpec =
@@ -542,7 +556,7 @@ async fn run(cmd: Cmd) -> Result<()> {
                 }
                 None => vec!["npm".into(), "start".into()],
             };
-            let (zip, stats) = package::package(kind, &src, &cmd)?;
+            let (zip, stats) = packagers::package(&kind, &src, &cmd, opts.as_ref())?;
             std::fs::write(&out, &zip)?;
             eprintln!(
                 "packaged {} files ({} bytes), dropped {} symlinks -> {} ({} bytes)",
@@ -639,10 +653,6 @@ async fn run(cmd: Cmd) -> Result<()> {
             let ts = taskset_cmd::load(&a.taskset)?;
             ts.validate(crucible_core::taskset::MAX_TOTAL_TIME_S)?;
             let stages = stage_indices(ts.stages.len(), a.stage, a.stages)?;
-            if !crucible_core::is_slug(&ts.scorer.name, 64) {
-                bail!("bad scorer name");
-            }
-            let scorer = a.scorers_dir.join(&ts.scorer.name).join("score.sh");
             let keys = load_identities(&a.identity, &a.identity_env)?;
             let store = a.store.as_deref().map(Store::parse).transpose()?;
             let tests = match (&store, &a.tests_dir) {
@@ -657,11 +667,27 @@ async fn run(cmd: Cmd) -> Result<()> {
                 out: &a.out,
                 tests,
                 keys: &keys,
-                scorer: &scorer,
+                plugins_root: &a.plugins_root,
                 scrub_env: &a.identity_env,
             })
             .await?;
             eprintln!("scored {} stage checkpoints", done.len());
+            Ok(())
+        }
+        Cmd::Plugins { taskset } => {
+            let ts = taskset_cmd::load(&taskset)?;
+            ts.validate(crucible_core::taskset::MAX_TOTAL_TIME_S)?;
+            let reg = crucible_core::plugins::registry();
+            for v in ts.plugin_versions() {
+                let p = reg
+                    .plugins
+                    .iter()
+                    .find(|p| p.kind.as_str() == v.kind && p.name == v.name)
+                    .ok_or_else(|| anyhow!("{} {} is not registered", v.kind, v.name))?;
+                if !p.is_builtin() {
+                    println!("{} {} {}", v.kind, p.name, p.implementation);
+                }
+            }
             Ok(())
         }
         Cmd::ScoreHandoff(a) => {
@@ -826,15 +852,15 @@ enum TasksetCmd {
     /// Check a taskset. PATH is a taskset.json (format, total time <= the
     /// platform limit), or a taskset source to upload: a .zip, a directory
     /// or its source.json (format, every stage's inputs and tests present
-    /// and disjoint, total time <= 18000 s, scorer offered to users).
+    /// and disjoint, total time <= 18000 s, plugins offered to users).
     Validate {
         path: PathBuf,
         #[arg(long, default_value_t = crucible_core::taskset::MAX_TOTAL_TIME_S)]
         max_total_s: u64,
-        /// Source only: allow this scorer (repeatable; default: the scorers
-        /// offered for uploaded tasksets, i.e. playwright).
+        /// Source only: check as a built-in taskset (any registered plugin)
+        /// instead of with the rules for uploaded tasksets.
         #[arg(long)]
-        allow_scorer: Vec<String>,
+        builtin: bool,
     },
     /// Report a `taskset-pack` outcome to the Worker (token from
     /// CRUCIBLE_WORKER_TOKEN): the packed taskset.json, or a failure.
@@ -962,12 +988,12 @@ async fn taskset(cmd: TasksetCmd) -> Result<()> {
             let (source, src_dir, rules) = match zip {
                 Some(z) => {
                     let root = taskset_cmd::unpack_source_zip(&std::fs::read(&z)?, tmp.path())?;
-                    (root.join("source.json"), root, Some(USER_SCORERS))
+                    (root.join("source.json"), root, true)
                 }
                 None => (
                     source.expect("clap: required"),
                     src_dir.expect("clap: required"),
-                    None,
+                    false,
                 ),
             };
             // Errors name files relative to the upload, not this machine.
@@ -992,7 +1018,7 @@ async fn taskset(cmd: TasksetCmd) -> Result<()> {
         TasksetCmd::Validate {
             path,
             max_total_s,
-            allow_scorer,
+            builtin,
         } => {
             let is_zip = path
                 .extension()
@@ -1018,11 +1044,6 @@ async fn taskset(cmd: TasksetCmd) -> Result<()> {
             } else {
                 taskset_cmd::source_root(&path)?
             };
-            let allowed: Vec<&str> = if allow_scorer.is_empty() {
-                USER_SCORERS.to_vec()
-            } else {
-                allow_scorer.iter().map(String::as_str).collect()
-            };
             // A built-in taskset keeps its stage dirs under source/.
             let src_dir =
                 if !is_zip && root.join("taskset.json").is_file() && root.join("source").is_dir() {
@@ -1030,7 +1051,7 @@ async fn taskset(cmd: TasksetCmd) -> Result<()> {
                 } else {
                     root.clone()
                 };
-            let p = taskset_cmd::prepare(&root.join("source.json"), &src_dir, Some(&allowed))?;
+            let p = taskset_cmd::prepare(&root.join("source.json"), &src_dir, !builtin)?;
             for (s, (_, _, ni, nt)) in p.src.stages.iter().zip(&p.zips) {
                 println!(
                     "  {}: {ni} input files, {nt} test files, {}s",

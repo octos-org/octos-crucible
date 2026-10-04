@@ -4,7 +4,7 @@
 
 ## 1. 交付形式
 
-一个打分器 = **一个容器镜像 + 一个编排脚本**，放在 `scorers/<name>/`：
+一个打分器 = **一个容器镜像 + 一个编排脚本**，放在 `scorers/<name>/`，并登记在仓库根目录的插件注册表 `plugins.json`（`kind: "scorer"`，`impl: "scorers/<name>"`，以及 `user`、`runs_taskset_code`、`model`、`accepts`，见 `docs/plugins.md` §3）。没登记的名字题目包不能引用；`crucible score` 按注册表找到 `score.sh`，打分前先用该阶段打分器对应的镜像（`score-tests` 预先构建为 `crucible-scorer-<name>:run`，经 `CRUCIBLE_SCORER_IMAGE` 传入）。
 
 | 文件 | 作用 |
 |---|---|
@@ -15,7 +15,7 @@ agent 的产出和测试材料**只在容器里**处理；宿主机脚本只做�
 
 ## 2. 输入
 
-1. **agent 产出**（`--artifact`）：一个文件。格式由题目包声明的产出类型决定：
+1. **agent 产出**（`--artifact`）：一个文件。格式由该阶段的打包器（`packager`）决定；上传的产出先经打包器的格式检查（`docs/plugins.md` §5），不符合的直接记 0 分，打分器不运行：
    - `web-app`：zip，**根目录**带 `Dockerfile`；容器监听 `PORT` 环境变量指定的端口（默认 3000），`GET /` 返回 200 即视为就绪。
 2. **测试材料**（`--tests`）：已解密的目录，只读挂载给打分器。打分器不得把其中内容写进日志或公开输出。
 
@@ -146,7 +146,7 @@ score.sh --artifact FILE --tests DIR --out result.json
 
 | job | 持有 | 运行 |
 |---|---|---|
-| `score`（eval.yml / score.yml） | 平台私钥 `CRUCIBLE_AGE_KEY`、Worker 令牌 | 只跑平台自己的 `crucible score-handoff`：解开所选阶段的 tests 块和各副本的 checkpoint，**用一把本次新生成的一次性钥匙重新封好**，连同 `taskset.json`、`crucible`、`scorers/` 作为 artifact `score-handoff`（保留 1 天）交出；一次性钥匙作为 job output 交出。不跑任何测试或 agent 代码。 |
+| `score`（eval.yml / score.yml） | 平台私钥 `CRUCIBLE_AGE_KEY`、Worker 令牌 | 只跑平台自己的 `crucible score-handoff`：解开所选阶段的 tests 块和各副本的 checkpoint，**用一把本次新生成的一次性钥匙重新封好**，连同 `taskset.json`、`crucible`、插件目录（`scorers/`）作为 artifact `score-handoff`（保留 1 天）交出；一次性钥匙作为 job output 交出。不跑任何测试或 agent 代码。 |
 | `score-tests`（`score-tests.yml`，`workflow_call`） | 只有一次性钥匙（以 workflow_call secret 传入，GitHub 自动打码）；`permissions: {}`；不 checkout | `crucible score --tests-dir`：用一次性钥匙解开 handoff，调用打分器（打分器进程的环境里删掉了这把钥匙）。只输出 `score.json`（artifact `scores`）。 |
 | `publish` | 平台私钥、写仓库权限 | 收尾：读 `scores`，生成清单、回传 Worker。 |
 

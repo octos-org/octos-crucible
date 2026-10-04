@@ -153,15 +153,18 @@ fn safe_name(name: &str) -> Option<PathBuf> {
     Some(p.to_path_buf())
 }
 
-/// Check a zip and extract it into `dest` (created if missing).
-pub fn safe_extract<R: Read + Seek>(
-    reader: R,
-    dest: &Path,
-    limits: ExtractLimits,
-) -> Result<usize> {
+/// Check a zip's names, entry types and declared sizes without extracting
+/// it; returns the names of its files (not directories).
+pub fn check_names<R: Read + Seek>(reader: R, limits: ExtractLimits) -> Result<Vec<String>> {
     let mut archive = ZipArchive::new(reader).context("not a zip file")?;
-    // Pass 1: names, types and declared sizes, before writing anything.
-    let mut files = 0usize;
+    check_archive(&mut archive, limits)
+}
+
+fn check_archive<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    limits: ExtractLimits,
+) -> Result<Vec<String>> {
+    let mut names = Vec::new();
     let mut declared = 0u64;
     for i in 0..archive.len() {
         let f = archive.by_index_raw(i)?;
@@ -173,16 +176,28 @@ pub fn safe_extract<R: Read + Seek>(
             bail!("symlink not allowed in zip: {name:?}");
         }
         if !f.is_dir() {
-            files += 1;
             declared = declared.saturating_add(f.size());
+            names.push(name);
         }
-        if files > limits.max_files {
+        if names.len() > limits.max_files {
             bail!("zip has more than {} files", limits.max_files);
         }
         if declared > limits.max_bytes {
             bail!("zip expands to more than {} bytes", limits.max_bytes);
         }
     }
+    Ok(names)
+}
+
+/// Check a zip and extract it into `dest` (created if missing).
+pub fn safe_extract<R: Read + Seek>(
+    reader: R,
+    dest: &Path,
+    limits: ExtractLimits,
+) -> Result<usize> {
+    let mut archive = ZipArchive::new(reader).context("not a zip file")?;
+    // Pass 1: names, types and declared sizes, before writing anything.
+    let files = check_archive(&mut archive, limits)?.len();
     std::fs::create_dir_all(dest)?;
     let mut written = 0u64;
     for i in 0..archive.len() {

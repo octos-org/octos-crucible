@@ -434,11 +434,7 @@ pub fn parse_pack_result(body: &[u8], id: &str) -> Result<PackResult, ApiError> 
             if ts.name != id {
                 return Err(ApiError::bad_request("taskset.name must be the taskset id"));
             }
-            if !crucible_core::taskset::USER_SCORERS.contains(&ts.scorer.name.as_str()) {
-                return Err(ApiError::bad_request(
-                    "scorer not offered for uploaded tasksets",
-                ));
-            }
+            ts.check_user_plugins().map_err(ApiError::bad_request)?;
             Ok(PackResult::Ready(Box::new(ts)))
         }
         (TS_FAILED, None, Some(e)) => Ok(PackResult::Failed(e.chars().take(500).collect())),

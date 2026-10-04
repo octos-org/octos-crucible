@@ -1,6 +1,6 @@
 # 插件接口规范
 
-本文是插件化设计的接口细节，总览与原则见 `docs/DESIGN.md`。P1（§7–§9 的结果格式、汇总与展示）已落地。本文描述的是目标形态，按 §13 的三个阶段（P1–P3）落地；某一部分落地之前，现行行为以 `docs/scorer-contract.md`、`docs/agent-contract.md` 为准，落地时这两份文档同步改写。
+本文是插件化设计的接口细节，总览与原则见 `docs/DESIGN.md`。P1（§7–§9 的结果格式、汇总与展示）和 P2（§3 注册表、§4.1 `workdir` 运行器、§5 打包器）已落地。本文描述的是目标形态，按 §13 的三个阶段（P1–P3）落地；某一部分落地之前，现行行为以 `docs/scorer-contract.md`、`docs/agent-contract.md` 为准，落地时这两份文档同步改写。
 
 ## 1. 核心与插件的分工
 
@@ -43,17 +43,17 @@ P3 起 `score-tests` 按遍拆成矩阵（每遍一个 job），因为交互运�
   "schema": 1,
   "plugins": [
     {"kind": "runner",   "name": "workdir",      "version": "1", "impl": "builtin"},
-    {"kind": "runner",   "name": "astro-v4",     "version": "1", "impl": "runners/astro-v4",
-     "interactive": true, "user": true, "runs_taskset_code": false, "model": true},
     {"kind": "packager", "name": "web-app",      "version": "1", "impl": "builtin", "user": true},
     {"kind": "packager", "name": "files",        "version": "1", "impl": "builtin", "user": true},
     {"kind": "scorer",   "name": "playwright",   "version": "1", "impl": "scorers/playwright",
-     "user": true, "runs_taskset_code": true, "model": false},
+     "user": true, "runs_taskset_code": true, "model": false, "accepts": ["web-app"]},
     {"kind": "scorer",   "name": "astro-survey", "version": "2", "impl": "scorers/astro-survey",
-     "user": true, "runs_taskset_code": false, "model": false}
+     "runs_taskset_code": false, "model": false, "accepts": ["files"]}
   ]
 }
 ```
+
+（节选；完整内容以仓库里的 `plugins.json` 为准。P3 加入交互运行器 `astro-v4` 和模型评判打分器。）
 
 | 字段 | 含义 |
 |---|---|
@@ -65,6 +65,9 @@ P3 起 `score-tests` 按遍拆成矩阵（每遍一个 job），因为交互运�
 | `user` | 用户上传的题目包能否引用它。缺省 `false`。取代 `crucible-core` 里的常量 `USER_SCORERS`（用户题目包登记时的打分器白名单） |
 | `runs_taskset_code` | 它是否把题目包里的文件当代码执行（Playwright 执行测试文件，是 `true`；巡天引擎只读卡片数据，是 `false`）。缺省 `true`（保守） |
 | `model` | 它能否被题目包声明为需要模型（§10）。`runs_taskset_code: true` 的插件不得为 `true`，注册表校验时检查 |
+| `accepts` | 仅 scorer：它能打分的打包器（例如 Playwright 只收 `web-app`）；缺省不限。题目包登记时检查 |
+
+注册表本身的规则由单元测试保证（名字唯一、打包器只能是 builtin、执行题目包代码的插件不能有模型等），所以编译出的程序里注册表总是合法的。`crucible plugins --taskset FILE` 列出一个题目包用到的容器插件，`score-tests` 据此预先构建镜像（`crucible-<kind>-<name>:run`）。
 
 目录约定：容器形式的插件放在 `runners/<name>/`、`scorers/<name>/`（打分器保持现有位置），目录里有入口脚本和 `image/`（镜像构建目录，版本全部钉死）。打包器只有 `builtin` 一种形式（§5 说明原因）。
 
@@ -337,7 +340,7 @@ trait Packager {
 }
 ```
 
-插槽字段写在题目包级，阶段可以逐项覆盖。
+插槽字段写在题目包级，阶段可以逐项覆盖（`runner`、`packager`、`packager_options`、`scorer`）。`crucible taskset pack` 把题目包级的缺省值落到每个阶段，登记后的 `taskset.json` 里每个阶段都写明 `packager`；`runner` 为缺省 `workdir`、`scorer` 与题目包级相同时不写。
 
 ## 13. 分阶段实施
 

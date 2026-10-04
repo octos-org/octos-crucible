@@ -10,6 +10,7 @@ on:
       - "crates/crucible-worker/**"
       - "crates/crucible-core/**"
       - "config/keys.json"
+      - "plugins.json"
       - "Cargo.lock"
       - ".github/workflows/worker.yml"
   workflow_dispatch:
@@ -24,6 +25,7 @@ on:
       - "crates/crucible-worker/**"
       - "crates/crucible-core/**"
       - "config/keys.json"
+      - "plugins.json"
       - "Cargo.lock"
       - ".github/workflows/worker.yml"
 

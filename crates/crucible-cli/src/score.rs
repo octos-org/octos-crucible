@@ -10,10 +10,16 @@
 //! on a machine that holds no secret. `handoff` (on the machine with the
 //! platform key) re-seals the selected tests blobs and checkpoints to a
 //! fresh one-run key; `score` then runs elsewhere with only that key, read
-//! from `TestsFrom::Dir`, and the scorer process never sees it. The scorer (`scorers/<name>/score.sh`, see
-//! docs/scorer-contract.md) runs with `--visibility hidden`, so its
+//! from `TestsFrom::Dir`, and the scorer process never sees it. Each
+//! stage's scorer is looked up in the plugin registry (`plugins.json`):
+//! `<plugins root>/<impl>/score.sh` (docs/scorer-contract.md), run with
+//! `--visibility hidden`, so its
 //! result.json holds only the score, fixed-name items and a fixed detail text:
 //! nothing of the tests leaves this job.
+//!
+//! Before the scorer runs, the output is checked against the stage's
+//! packager format (an uploaded output may be anything); one that does not
+//! match scores 0.
 //!
 //! Output: `<out>/<replica>/<stage>/score.json`, always result v2 (an old
 //! format result is converted), normalised for the manifest:
@@ -59,8 +65,8 @@ pub struct ScoreOpts<'a> {
     pub out: &'a Path,
     pub tests: TestsFrom<'a>,
     pub keys: &'a [PrivateKey],
-    /// `score.sh` of the taskset's scorer.
-    pub scorer: &'a Path,
+    /// Where the registry's plugin directories are (`scorers/<name>/`).
+    pub plugins_root: &'a Path,
     /// Environment variables never passed to the scorer (the key names).
     pub scrub_env: &'a [String],
 }
@@ -123,9 +129,49 @@ fn replicas(results: &Path) -> Result<Vec<u32>> {
     Ok(out)
 }
 
+/// A container plugin: its entry script, and the image the scoring job
+/// built for it in advance (`crucible-<kind>-<name>:run`), if any.
+pub struct ContainerPlugin {
+    pub entry: PathBuf,
+    pub image: Option<String>,
+}
+
+/// Resolve a container plugin of the registry under `root`.
+pub fn container_plugin(
+    root: &Path,
+    kind: crucible_core::plugins::Kind,
+    reference: &str,
+    entry: &str,
+) -> Result<ContainerPlugin> {
+    let p = crucible_core::plugins::registry()
+        .resolve(kind, reference)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if p.is_builtin() {
+        bail!("{} {} is not a container plugin", kind.as_str(), p.name);
+    }
+    let entry = root.join(&p.implementation).join(entry);
+    if !entry.is_file() {
+        bail!(
+            "{} {} not found at {}",
+            kind.as_str(),
+            p.name,
+            entry.display()
+        );
+    }
+    let tag = format!("crucible-{}-{}:run", kind.as_str(), p.name);
+    let image = Command::new("docker")
+        .args(["image", "inspect", "--format", "x", &tag])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+        .then_some(tag);
+    Ok(ContainerPlugin { entry, image })
+}
+
 /// Run the scorer on one opened checkpoint.
 fn run_scorer(
-    scorer: &Path,
+    scorer: &ContainerPlugin,
     artifact: &Path,
     tests: &Path,
     stage: &Stage,
@@ -140,8 +186,12 @@ fn run_scorer(
     for k in scrub_env {
         cmd.env_remove(k);
     }
+    match &scorer.image {
+        Some(i) => cmd.env("CRUCIBLE_SCORER_IMAGE", i),
+        None => cmd.env_remove("CRUCIBLE_SCORER_IMAGE"),
+    };
     let status = cmd
-        .arg(scorer)
+        .arg(&scorer.entry)
         .arg("--artifact")
         .arg(artifact)
         .arg("--tests")
@@ -169,9 +219,6 @@ fn run_scorer(
 
 /// Score every replica's checkpoint of the selected stages.
 pub async fn score(o: &ScoreOpts<'_>) -> Result<Vec<(u32, String, ScoreResult)>> {
-    if !o.scorer.is_file() {
-        bail!("scorer {} not found", o.scorer.display());
-    }
     let reps = replicas(o.results)?;
     if reps.is_empty() {
         bail!("no replica directories under {}", o.results.display());
@@ -188,6 +235,12 @@ pub async fn score(o: &ScoreOpts<'_>) -> Result<Vec<(u32, String, ScoreResult)>>
         if todo.is_empty() {
             continue;
         }
+        let scorer = container_plugin(
+            o.plugins_root,
+            crucible_core::plugins::Kind::Scorer,
+            &crucible_core::taskset::scorer_spec(stage.scorer_ref(o.taskset)),
+            "score.sh",
+        )?;
         // The tests exist in clear only inside this scope.
         let tests = tempfile::tempdir()?;
         let plain = match o.tests {
@@ -208,8 +261,19 @@ pub async fn score(o: &ScoreOpts<'_>) -> Result<Vec<(u32, String, ScoreResult)>>
                 let zip = crucible_crypto::open(o.keys, &std::fs::read(&ckpt)?)
                     .with_context(|| format!("opening {}", ckpt.display()))?;
                 std::fs::write(app.path(), &zip)?;
+                let format =
+                    crate::packagers::check(&stage.packager, &zip, stage.packager_options.as_ref());
                 drop(zip);
-                run_scorer(o.scorer, app.path(), tests.path(), stage, o.scrub_env)
+                match format {
+                    Ok(()) => run_scorer(&scorer, app.path(), tests.path(), stage, o.scrub_env),
+                    Err(e) => {
+                        eprintln!(
+                            "r{r} {}: output refused by packager {}: {e:#}",
+                            stage.id, stage.packager
+                        );
+                        zero("the output is not in the format the stage asks for")
+                    }
+                }
             } else {
                 // The stage ran (it left logs) but produced nothing to score.
                 zero("the stage left no checkpoint")
@@ -372,28 +436,46 @@ mod tests {
         };
         let tests_blob = store.put_sealed(&sk.public(), &tests_zip).await.unwrap();
         let ts: TaskSet = serde_json::from_value(serde_json::json!({
-            "schema": 1, "name": "demo", "scorer": {"name": "stub"}, "total_time_limit_s": 100,
+            "schema": 1, "name": "demo", "scorer": {"name": "astro-survey"}, "total_time_limit_s": 100,
             "stages": [
-              {"id": "stage-1", "inputs_blob": tests_blob, "tests_blob": tests_blob, "output": "web-app", "time_limit_s": 50, "expected_total": 2},
-              {"id": "stage-2", "inputs_blob": tests_blob, "tests_blob": tests_blob, "output": "web-app", "time_limit_s": 50, "expected_total": 2}
+              {"id": "stage-1", "inputs_blob": tests_blob, "tests_blob": tests_blob, "output": "files", "time_limit_s": 50, "expected_total": 2},
+              {"id": "stage-2", "inputs_blob": tests_blob, "tests_blob": tests_blob, "output": "files", "time_limit_s": 50, "expected_total": 2}
             ]
         }))
         .unwrap();
-        // Stub scorer: passes 1 of 2 iff the tests and the artifact are there.
-        let scorer = d.path().join("score.sh");
+        // Stub scorer in place of astro-survey's: passes 1 of 2 iff the
+        // tests and the artifact are there.
+        let root = d.path().join("plugins");
+        std::fs::create_dir_all(root.join("scorers/astro-survey")).unwrap();
+        let scorer = root.join("scorers/astro-survey/score.sh");
         std::fs::write(
             &scorer,
             r#"while [ $# -gt 0 ]; do case "$1" in --artifact) A=$2;; --tests) T=$2;; --out) O=$2;; esac; shift 2; done
-[ -f "$T/tests/a.spec.ts" ] && grep -q PK-app "$A" || exit 1
+[ -f "$T/tests/a.spec.ts" ] && grep -q app.txt "$A" || exit 1
 printf '{"visibility":"hidden","status":"failed","passed":1,"total":2,"detail":"1/2 tests failed"}' > "$O""#,
         )
         .unwrap();
         let results = d.path().join("results");
         let s1 = results.join("1/stage-1");
         std::fs::create_dir_all(&s1).unwrap();
+        let app = {
+            let w = d.path().join("work");
+            std::fs::create_dir_all(&w).unwrap();
+            std::fs::write(w.join("app.txt"), "x").unwrap();
+            crate::packagers::package("files", &w, &[], None).unwrap().0
+        };
         std::fs::write(
             s1.join("checkpoint.sealed"),
-            crucible_crypto::seal(&sk.public(), b"PK-app").unwrap(),
+            crucible_crypto::seal(&sk.public(), &app).unwrap(),
+        )
+        .unwrap();
+        // Replica 2 uploaded something that is not a zip at all: 0, the
+        // scorer never runs.
+        let s2 = results.join("2/stage-1");
+        std::fs::create_dir_all(&s2).unwrap();
+        std::fs::write(
+            s2.join("checkpoint.sealed"),
+            crucible_crypto::seal(&sk.public(), b"not a zip").unwrap(),
         )
         .unwrap();
         // Stage 2 ran but left only logs.
@@ -406,12 +488,12 @@ printf '{"visibility":"hidden","status":"failed","passed":1,"total":2,"detail":"
             out: &out,
             tests: TestsFrom::Store(&store),
             keys: std::slice::from_ref(&sk),
-            scorer: &scorer,
+            plugins_root: &root,
             scrub_env: &[],
         })
         .await
         .unwrap();
-        assert_eq!(done.len(), 2);
+        assert_eq!(done.len(), 3);
         let s1 = read_score(&out, 1, "stage-1").unwrap().unwrap();
         assert_eq!(
             (s1.score, s1.max, s1.passed),
@@ -422,7 +504,9 @@ printf '{"visibility":"hidden","status":"failed","passed":1,"total":2,"detail":"
             (s2.status.is_scored(), s2.score, s2.max),
             (true, Some(0.0), Some(2.0))
         );
-        assert!(read_score(&out, 2, "stage-1").unwrap().is_none());
+        let bad = read_score(&out, 2, "stage-1").unwrap().unwrap();
+        assert_eq!((bad.score, bad.max), (Some(0.0), Some(2.0)));
+        assert!(read_score(&out, 3, "stage-1").unwrap().is_none());
 
         // Hand off to a machine without the platform key: same scores with
         // only the one-run key, and the scorer never sees the key variable.
@@ -466,7 +550,7 @@ printf '{"visibility":"hidden","status":"failed","passed":1,"total":2,"detail":"
             out: &out2,
             tests: TestsFrom::Dir(&hand.join("tests")),
             keys: &keys,
-            scorer: &scorer,
+            plugins_root: &root,
             scrub_env: &["PATH_CRUCIBLE_TEST_KEY".into()],
         })
         .await

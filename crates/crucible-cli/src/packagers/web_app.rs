@@ -1,5 +1,3 @@
-//! Turn a stage's work dir into the checkpoint the scorer consumes.
-//!
 //! `web-app`: a zip with a Dockerfile at its root, built by the scorer with
 //! `--network=none` (so everything the app needs at run time must be in it).
 //! - Work dir with its own root `Dockerfile`: zipped as is (minus `.git`).
@@ -8,7 +6,9 @@
 //!   (`node:24-bookworm-slim`, `WORKDIR /app/backend`, `PORT=3000`,
 //!   `CMD <agent.json app_start_cmd>`).
 //!
-//! `files`: the whole work dir minus `.git`.
+//! An uploaded output (app mode) must have a root `Dockerfile` or a root
+//! `backend/` directory (the ARC-Bench template, which the official-format
+//! scorer builds itself).
 //!
 //! The work dir was written by untrusted code: symlinks are dropped, never
 //! followed (a followed link could pack a host file).
@@ -17,12 +17,11 @@ use std::io::Cursor;
 use std::path::Path;
 
 use anyhow::{Result, bail};
-use crucible_core::taskset::OutputKind;
+use serde_json::Value;
 
 use crate::zipdir::{Entry, ZipStats, collect, write_zip};
 
-/// Upper bound on what a checkpoint may contain before compression.
-pub const MAX_CHECKPOINT_BYTES: u64 = 1 << 30;
+pub struct WebApp;
 
 pub fn dockerfile(app_start_cmd: &[String]) -> String {
     let cmd = serde_json::to_string(app_start_cmd).expect("strings serialize");
@@ -39,51 +38,61 @@ fn is_real_dir(p: &Path) -> bool {
     std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir())
 }
 
-/// Package `src` as `kind`; returns the zip bytes and what was dropped.
-pub fn package(
-    kind: OutputKind,
-    src: &Path,
-    app_start_cmd: &[String],
-) -> Result<(Vec<u8>, ZipStats)> {
-    let mut entries: Vec<Entry> = Vec::new();
-    let mut stats = ZipStats::default();
-    let mut extra: Vec<(&str, &[u8])> = Vec::new();
-    let generated;
-    match kind {
-        OutputKind::Files => collect(src, "", &is_git, &mut entries, &mut stats)?,
-        OutputKind::WebApp => {
-            let root_df = std::fs::symlink_metadata(src.join("Dockerfile"));
-            if root_df.is_ok_and(|m| m.is_file()) {
-                collect(src, "", &is_git, &mut entries, &mut stats)?;
-            } else {
-                if !is_real_dir(&src.join("backend")) {
-                    bail!("no Dockerfile and no backend/ directory in the work dir");
-                }
-                let skip = |rel: &str| is_git(rel) || rel == "frontend/node_modules";
-                collect(src, "backend", &skip, &mut entries, &mut stats)?;
-                if is_real_dir(&src.join("frontend")) {
-                    collect(src, "frontend", &skip, &mut entries, &mut stats)?;
-                }
-                generated = dockerfile(app_start_cmd);
-                extra.push(("Dockerfile", generated.as_bytes()));
+impl super::Packager for WebApp {
+    fn package(
+        &self,
+        src: &Path,
+        app_start_cmd: &[String],
+        _opts: &Value,
+    ) -> Result<(Vec<u8>, ZipStats)> {
+        let mut entries: Vec<Entry> = Vec::new();
+        let mut stats = ZipStats::default();
+        let mut extra: Vec<(&str, &[u8])> = Vec::new();
+        let generated;
+        let root_df = std::fs::symlink_metadata(src.join("Dockerfile"));
+        if root_df.is_ok_and(|m| m.is_file()) {
+            collect(src, "", &is_git, &mut entries, &mut stats)?;
+        } else {
+            if !is_real_dir(&src.join("backend")) {
+                bail!("no Dockerfile and no backend/ directory in the work dir");
             }
+            let skip = |rel: &str| is_git(rel) || rel == "frontend/node_modules";
+            collect(src, "backend", &skip, &mut entries, &mut stats)?;
+            if is_real_dir(&src.join("frontend")) {
+                collect(src, "frontend", &skip, &mut entries, &mut stats)?;
+            }
+            generated = dockerfile(app_start_cmd);
+            extra.push(("Dockerfile", generated.as_bytes()));
+        }
+        super::size_ok(&stats)?;
+        let zip = write_zip(Cursor::new(Vec::new()), &entries, &extra)?.into_inner();
+        Ok((zip, stats))
+    }
+
+    fn check_names(&self, names: &[String], _opts: &Value) -> Result<()> {
+        if names
+            .iter()
+            .any(|n| n == "Dockerfile" || n.starts_with("backend/"))
+        {
+            Ok(())
+        } else {
+            bail!("the output has neither a Dockerfile nor a backend/ directory at its root")
         }
     }
-    if stats.bytes > MAX_CHECKPOINT_BYTES {
-        bail!(
-            "output is {} bytes, more than the {} byte limit",
-            stats.bytes,
-            MAX_CHECKPOINT_BYTES
-        );
+
+    fn check_options(&self, opts: &Value) -> Result<()> {
+        super::no_options(opts)
     }
-    let zip = write_zip(Cursor::new(Vec::new()), &entries, &extra)?.into_inner();
-    Ok((zip, stats))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Read;
+
+    fn package(src: &Path, cmd: &[String]) -> Result<(Vec<u8>, ZipStats)> {
+        crate::packagers::package("web-app", src, cmd, None)
+    }
 
     fn names(zip: &[u8]) -> Vec<String> {
         let mut a = zip::ZipArchive::new(Cursor::new(zip)).unwrap();
@@ -118,7 +127,7 @@ mod tests {
         std::fs::write(w.join("backend/.git/HEAD"), "x").unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink("/etc/passwd", w.join("backend/leak")).unwrap();
-        let (zip, stats) = package(OutputKind::WebApp, w, &["npm".into(), "start".into()]).unwrap();
+        let (zip, stats) = package(w, &["npm".into(), "start".into()]).unwrap();
         assert_eq!(
             names(&zip),
             [
@@ -138,12 +147,18 @@ mod tests {
     #[test]
     fn web_app_own_dockerfile_and_missing_backend() {
         let d = tempfile::tempdir().unwrap();
-        assert!(package(OutputKind::WebApp, d.path(), &["npm".into()]).is_err());
+        assert!(package(d.path(), &["npm".into()]).is_err());
         std::fs::write(d.path().join("Dockerfile"), "FROM scratch").unwrap();
         std::fs::write(d.path().join("app.js"), "x").unwrap();
-        let (zip, _) = package(OutputKind::WebApp, d.path(), &["npm".into()]).unwrap();
+        let (zip, _) = package(d.path(), &["npm".into()]).unwrap();
         assert_eq!(names(&zip), ["Dockerfile", "app.js"]);
         assert_eq!(read(&zip, "Dockerfile"), "FROM scratch");
+        crate::packagers::check("web-app", &zip, None).unwrap();
+        let (files, _) = crate::packagers::package("files", d.path(), &[], None).unwrap();
+        std::fs::remove_file(d.path().join("Dockerfile")).unwrap();
+        let (no_df, _) = crate::packagers::package("files", d.path(), &[], None).unwrap();
+        crate::packagers::check("web-app", &files, None).unwrap();
+        assert!(crate::packagers::check("web-app", &no_df, None).is_err());
     }
 
     #[cfg(unix)]
@@ -153,6 +168,6 @@ mod tests {
         let target = tempfile::tempdir().unwrap();
         std::fs::write(target.path().join("secret"), "s").unwrap();
         std::os::unix::fs::symlink(target.path(), d.path().join("backend")).unwrap();
-        assert!(package(OutputKind::WebApp, d.path(), &["npm".into()]).is_err());
+        assert!(package(d.path(), &["npm".into()]).is_err());
     }
 }

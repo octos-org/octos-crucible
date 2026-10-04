@@ -1,12 +1,14 @@
-//! `crucible run`: run a built agent image stage by stage.
+//! The `workdir` runner (docs/plugins.md §4.1): the agent works in a shared
+//! work dir, stage by stage; at the end of a stage the stage's packager
+//! turns the work dir into the stage output.
 //!
 //! The model credential arrives once on stdin and stays in this process; for
 //! every stage a fresh in-process meter (own `usage.jsonl`) and egress proxy
 //! are started on the sandbox bridge, the agent container runs with the
 //! stage's inputs read-only at `/req`, the shared work dir at `/work` and a
 //! shared `HOME`, and is stopped at the stage's time limit. The work dir is
-//! snapshotted every `--snapshot-interval-s`; at the end of a stage it is
-//! packaged as the stage checkpoint (the last snapshot when the agent had
+//! snapshotted (packaged) every `--snapshot-interval-s`; at the end of a
+//! stage it is packaged as the stage checkpoint (the last snapshot when the agent had
 //! to be stopped).
 //!
 //! Output layout (read by `crucible report`):
@@ -26,9 +28,9 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant, SystemTime};
 
-use anyhow::{Context, Result, anyhow, bail};
-use crucible_core::taskset::{OutputKind, Stage};
-use crucible_core::{AgentSpec, TaskSet, UsageRecord};
+use anyhow::{Context, Result, bail};
+use crucible_core::taskset::Stage;
+use crucible_core::{AgentSpec, UsageRecord};
 use crucible_meter::{Credential, Limits, MeterConfig, Upstream};
 use crucible_metering::{Price, Pricing};
 use serde::{Deserialize, Serialize};
@@ -250,13 +252,13 @@ fn now_rfc3339() -> String {
     humantime::format_rfc3339_seconds(SystemTime::now()).to_string()
 }
 
-fn read_usage(p: &Path) -> Vec<UsageRecord> {
+pub(super) fn read_usage(p: &Path) -> Vec<UsageRecord> {
     std::fs::read_to_string(p)
         .map(|s| crucible_report::usage::parse_jsonl(&s))
         .unwrap_or_default()
 }
 
-fn current_user() -> Result<String> {
+pub(super) fn current_user() -> Result<String> {
     let id = |flag: &str| -> Result<String> {
         let o = std::process::Command::new("id").arg(flag).output()?;
         Ok(String::from_utf8_lossy(&o.stdout).trim().to_owned())
@@ -271,14 +273,10 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-async fn package_to(
-    kind: OutputKind,
-    work: PathBuf,
-    cmd: Vec<String>,
-    dest: PathBuf,
-) -> Result<u64> {
+async fn package_to(stage: &Stage, work: PathBuf, cmd: Vec<String>, dest: PathBuf) -> Result<u64> {
+    let (packager, opts) = (stage.packager.clone(), stage.packager_options.clone());
     tokio::task::spawn_blocking(move || -> Result<u64> {
-        let (zip, _stats) = crate::package::package(kind, &work, &cmd)?;
+        let (zip, _stats) = crate::packagers::package(&packager, &work, &cmd, opts.as_ref())?;
         write_atomic(&dest, &zip)?;
         Ok(zip.len() as u64)
     })
@@ -305,16 +303,16 @@ fn mb(b: u64) -> String {
     format!("{:.1} MB", b as f64 / 1e6)
 }
 
-struct Env<'a> {
-    args: &'a RunArgs,
-    cred: &'a Credential,
-    agent: &'a AgentSpec,
-    pricing: &'a Pricing,
-    user_price: Option<Price>,
-    user: String,
-    work: PathBuf,
-    home: PathBuf,
-    snaps: PathBuf,
+pub(super) struct Env<'a> {
+    pub args: &'a RunArgs,
+    pub cred: &'a Credential,
+    pub agent: &'a AgentSpec,
+    pub pricing: &'a Pricing,
+    pub user_price: Option<Price>,
+    pub user: String,
+    pub work: PathBuf,
+    pub home: PathBuf,
+    pub snaps: PathBuf,
 }
 
 enum Interrupt {
@@ -337,7 +335,11 @@ async fn shutdown_signal() -> Interrupt {
 }
 
 /// Run one stage; returns its timing and whether the run was interrupted.
-async fn run_stage(env: &Env<'_>, stage: &Stage, limits: Limits) -> Result<(Timing, bool)> {
+pub(super) async fn run_stage(
+    env: &Env<'_>,
+    stage: &Stage,
+    limits: Limits,
+) -> Result<(Timing, bool)> {
     let a = env.args;
     let sdir = a.out_dir.join(&stage.id);
     std::fs::create_dir_all(&sdir)?;
@@ -412,7 +414,7 @@ async fn run_stage(env: &Env<'_>, stage: &Stage, limits: Limits) -> Result<(Timi
             }
             _ = tokio::time::sleep_until(next_snap) => {
                 next_snap += interval;
-                match package_to(stage.output, env.work.clone(), cmd.clone(), snapshot.clone()).await {
+                match package_to(stage, env.work.clone(), cmd.clone(), snapshot.clone()).await {
                     Ok(n) => { snapshots += 1; eprintln!("[{}] snapshot {snapshots} at {}s: {}", stage.id, t0.elapsed().as_secs(), mb(n)); }
                     Err(_) => eprintln!("[{}] snapshot at {}s: nothing to package yet", stage.id, t0.elapsed().as_secs()),
                 }
@@ -443,14 +445,9 @@ async fn run_stage(env: &Env<'_>, stage: &Stage, limits: Limits) -> Result<(Timi
 
     let ckpt = sdir.join("checkpoint.zip");
     let final_tmp = env.snaps.join(format!("{}.final.zip", stage.id));
-    let final_ok = package_to(
-        stage.output,
-        env.work.clone(),
-        cmd.clone(),
-        final_tmp.clone(),
-    )
-    .await
-    .is_ok();
+    let final_ok = package_to(stage, env.work.clone(), cmd.clone(), final_tmp.clone())
+        .await
+        .is_ok();
     let source = choose_checkpoint(ended, final_ok, snapshot.is_file());
     match source {
         "final" => std::fs::rename(&final_tmp, &ckpt)?,
@@ -522,69 +519,6 @@ async fn write_log(cmd: std::process::Command, path: &Path) -> Result<()> {
 async fn docker_out_owned(args: Vec<String>) -> Result<String> {
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     docker_out(&refs).await
-}
-
-pub async fn run(args: RunArgs) -> Result<()> {
-    // The credential first: one line on stdin, then stdin is done.
-    let cred = crucible_meter::read_credential(&mut std::io::stdin().lock())
-        .map_err(|e| anyhow!("{e}"))?;
-    let ts: TaskSet = crate::taskset_cmd::load(&args.taskset)?;
-    ts.validate(crucible_core::taskset::MAX_TOTAL_TIME_S)?;
-    let agent: AgentSpec = serde_json::from_slice(&std::fs::read(&args.agent_json)?)
-        .map_err(|_| anyhow!("agent.json is not valid"))?;
-    agent.validate()?;
-    let n = args.stages.unwrap_or(ts.stages.len());
-    if n == 0 || n > ts.stages.len() {
-        bail!("--stages must be 1..={}", ts.stages.len());
-    }
-    if !crate::plan::model_ok(&args.model) {
-        bail!("--model has unsupported characters");
-    }
-    let budget = Budget::parse(&args.budget)?;
-    let user_price = match &budget.price {
-        Some(p) => crucible_metering::parse_price(p)?,
-        None => None,
-    };
-    let pricing = Pricing::from_json(&std::fs::read_to_string(&args.pricing)?)?;
-    let user = match &args.user {
-        Some(u) => u.clone(),
-        None => current_user()?,
-    };
-    std::fs::create_dir_all(&args.out_dir)?;
-    let scratch = std::fs::canonicalize({
-        std::fs::create_dir_all(&args.scratch_dir)?;
-        &args.scratch_dir
-    })?;
-    let env = Env {
-        args: &args,
-        cred: &cred,
-        agent: &agent,
-        pricing: &pricing,
-        user_price,
-        user,
-        work: scratch.join("work"),
-        home: scratch.join("home"),
-        snaps: scratch.join("snapshots"),
-    };
-    for d in [&env.work, &env.home, &env.snaps] {
-        std::fs::create_dir_all(d)?;
-    }
-
-    let mut spent = Used::default();
-    for stage in ts.stages.iter().take(n) {
-        let limits = remaining(&budget, spent);
-        let (_timing, interrupted) = run_stage(&env, stage, limits).await?;
-        let u = used(&read_usage(
-            &args.out_dir.join(&stage.id).join("usage.jsonl"),
-        ));
-        spent.requests += u.requests;
-        spent.tokens += u.tokens;
-        spent.cost += u.cost;
-        if interrupted {
-            bail!("interrupted during stage {}", stage.id);
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

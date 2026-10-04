@@ -11,14 +11,19 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::blob::BlobRef;
+use crate::plugins::Kind;
+
+/// `name` or `name@version` of a scorer reference.
+pub fn scorer_spec(s: &ScorerRef) -> String {
+    match &s.version {
+        Some(v) => format!("{}@{v}", s.name),
+        None => s.name.clone(),
+    }
+}
 
 /// Platform limit on the summed stage time of one run (all stages run back
 /// to back on one machine, inside a 6 h GitHub job).
 pub const MAX_TOTAL_TIME_S: u64 = 18_000;
-
-/// Scorers a user-uploaded taskset may name: those reviewed for untrusted
-/// test material (docs/scorer-contract.md §7).
-pub const USER_SCORERS: &[&str] = &["playwright"];
 
 /// `u-` + 16 lower-case hex: the id of a user-uploaded taskset. Built-in
 /// taskset directories never start with `u-`.
@@ -58,18 +63,14 @@ pub struct TaskSet {
     pub stages: Vec<Stage>,
 }
 
-/// Which scorer container grades the checkpoints, e.g. `playwright`.
+/// Which scorer grades the checkpoints, e.g. `playwright`: a name in the
+/// plugin registry (`plugins.json`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScorerRef {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
 }
-
-/// Behaviour versions of the scorers (bumped when scoring changes);
-/// recorded in each manifest's `scoring` snapshot. Replaced by the plugin
-/// registry in P2 (docs/plugins.md §3).
-pub const SCORER_VERSIONS: &[(&str, &str)] = &[("playwright", "1"), ("astro-survey", "2")];
 
 /// How the scores of items (within a stage) and of stages add up
 /// (docs/plugins.md §8). Schema 1's `"aggregate": "sum"` (Σpassed /
@@ -336,7 +337,20 @@ pub struct Stage {
     pub inputs_blob: BlobRef,
     /// Sealed zip of the hidden test material for this stage.
     pub tests_blob: BlobRef,
-    pub output: OutputKind,
+    /// The packager plugin that turns the work dir into the stage output
+    /// (`web-app`, `files`). Tasksets written before the plugin registry
+    /// call it `output`.
+    #[serde(alias = "output")]
+    pub packager: String,
+    /// Options for the packager, e.g. `{"require": ["observer.project.json"]}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packager_options: Option<serde_json::Value>,
+    /// The producing runner; `None` = `workdir`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner: Option<String>,
+    /// This stage's scorer when it differs from the taskset's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scorer: Option<ScorerRef>,
     pub time_limit_s: u64,
     /// Number of tests the scorer is expected to report. A mismatch is
     /// flagged rather than silently summed.
@@ -344,15 +358,21 @@ pub struct Stage {
     pub expected_total: Option<u32>,
 }
 
-/// What the agent must leave in its working directory at the end of a stage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum OutputKind {
-    /// A runnable web app (frontend + backend) served for browser tests;
-    /// packaged as a zip with a Dockerfile at its root.
-    WebApp,
-    /// Arbitrary files, scored by a script or unit tests.
-    Files,
+/// The default producing runner.
+pub const DEFAULT_RUNNER: &str = "workdir";
+
+/// Largest `packager_options`, as JSON.
+pub const MAX_PLUGIN_OPTIONS_BYTES: usize = 4096;
+
+impl Stage {
+    pub fn runner_name(&self) -> &str {
+        self.runner.as_deref().unwrap_or(DEFAULT_RUNNER)
+    }
+
+    /// The scorer of this stage: its own, else the taskset's.
+    pub fn scorer_ref<'a>(&'a self, ts: &'a TaskSet) -> &'a ScorerRef {
+        self.scorer.as_ref().unwrap_or(&ts.scorer)
+    }
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -377,6 +397,8 @@ pub enum TaskSetError {
     StagesExceedTotal { sum_s: u64, total_s: u64 },
     #[error("taskset: total time {total_s}s exceeds the platform limit {max_s}s")]
     TooLong { total_s: u64, max_s: u64 },
+    #[error("taskset: {0}")]
+    Plugin(String),
 }
 
 impl TaskSet {
@@ -444,25 +466,109 @@ impl TaskSet {
                 }
             }
         });
-        let version = self.scorer.version.clone().unwrap_or_else(|| {
-            SCORER_VERSIONS
-                .iter()
-                .find(|(n, _)| *n == self.scorer.name)
-                .map_or("unknown", |(_, v)| v)
-                .to_owned()
-        });
         Scoring {
             aggregate: self.aggregate.clone(),
             display: Display {
                 stage: Some(stage),
                 total: Some(total),
             },
-            plugins: vec![PluginVersion {
-                kind: "scorer".into(),
-                name: self.scorer.name.clone(),
-                version,
-            }],
+            plugins: self.plugin_versions(),
         }
+    }
+
+    /// Every plugin this taskset uses, scorers first, each once, with the
+    /// registered version (or the one the taskset pinned).
+    pub fn plugin_versions(&self) -> Vec<PluginVersion> {
+        let reg = crate::plugins::registry();
+        let mut out: Vec<PluginVersion> = Vec::new();
+        let mut add = |kind: Kind, r: &str| {
+            let (name, pinned) = match r.split_once('@') {
+                Some((n, v)) => (n, Some(v.to_owned())),
+                None => (r, None),
+            };
+            let version = pinned
+                .or_else(|| reg.get(kind, name).map(|p| p.version.clone()))
+                .unwrap_or_else(|| "unknown".into());
+            let v = PluginVersion {
+                kind: kind.as_str().into(),
+                name: name.into(),
+                version,
+            };
+            if !out.contains(&v) {
+                out.push(v);
+            }
+        };
+        for s in &self.stages {
+            let sc = s.scorer_ref(self);
+            match &sc.version {
+                Some(v) => add(Kind::Scorer, &format!("{}@{v}", sc.name)),
+                None => add(Kind::Scorer, &sc.name),
+            }
+        }
+        for s in &self.stages {
+            add(Kind::Runner, s.runner_name());
+            add(Kind::Packager, &s.packager);
+        }
+        out
+    }
+
+    /// Every plugin reference resolves in the registry with the right kind;
+    /// producing runners are not interactive; a scorer accepts the stage's
+    /// packager; plugin options are small JSON objects.
+    pub fn check_plugins(&self) -> Result<(), String> {
+        let reg = crate::plugins::registry();
+        for s in &self.stages {
+            let at = |e: String| format!("stage {}: {e}", s.id);
+            let sc = s.scorer_ref(self);
+            let scorer = reg.resolve(Kind::Scorer, &scorer_spec(sc)).map_err(at)?;
+            let runner = reg.resolve(Kind::Runner, s.runner_name()).map_err(at)?;
+            if runner.interactive {
+                return Err(at(format!("runner {} is interactive", runner.name)));
+            }
+            let packager = reg.resolve(Kind::Packager, &s.packager).map_err(at)?;
+            if !scorer.accepts.is_empty() && !scorer.accepts.contains(&packager.name) {
+                return Err(at(format!(
+                    "scorer {} needs packager {}",
+                    scorer.name,
+                    scorer.accepts.join(" or ")
+                )));
+            }
+            if let Some(o) = &s.packager_options
+                && (!o.is_object() || o.to_string().len() > MAX_PLUGIN_OPTIONS_BYTES)
+            {
+                return Err(at(format!(
+                    "packager_options must be a JSON object of at most {MAX_PLUGIN_OPTIONS_BYTES} bytes"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The extra rule for uploaded tasksets: every plugin they use is
+    /// offered to users (`"user": true` in the registry).
+    pub fn check_user_plugins(&self) -> Result<(), String> {
+        self.check_plugins()?;
+        let reg = crate::plugins::registry();
+        for s in &self.stages {
+            let sc = s.scorer_ref(self);
+            for (kind, r) in [
+                (Kind::Scorer, scorer_spec(sc)),
+                (Kind::Runner, s.runner_name().to_owned()),
+                (Kind::Packager, s.packager.clone()),
+            ] {
+                let p = reg.resolve(kind, &r)?;
+                // The default runner needs no review of its own: it never
+                // sees test material.
+                if !p.user && !(kind == Kind::Runner && p.name == DEFAULT_RUNNER) {
+                    return Err(format!(
+                        "{} {:?} is not available for uploaded tasksets",
+                        kind.as_str(),
+                        p.name
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Registration check against the platform's per-run limit.
@@ -471,6 +577,7 @@ impl TaskSet {
             return Err(TaskSetError::Schema);
         }
         self.check_scoring().map_err(TaskSetError::Scoring)?;
+        self.check_plugins().map_err(TaskSetError::Plugin)?;
         if !crate::is_slug(&self.name, 64) {
             return Err(TaskSetError::Name);
         }
@@ -544,7 +651,8 @@ mod tests {
     fn parse_and_validate() {
         let t: TaskSet = serde_json::from_str(&github()).unwrap();
         assert_eq!(t.stage_time_s(), 9600);
-        assert_eq!(t.stages[0].output, OutputKind::WebApp);
+        assert_eq!(t.stages[0].packager, "web-app");
+        assert_eq!(t.stages[0].runner_name(), "workdir");
         t.validate(MAX_TOTAL_TIME_S).unwrap();
         assert_eq!(
             t.validate(3600),
@@ -579,13 +687,64 @@ mod tests {
         let mut t = base.clone();
         t.stages[0].tests_blob.sha256 = "xyz".into();
         assert!(matches!(t.validate(1 << 20), Err(TaskSetError::Blob(_))));
-        let mut t = base;
+        let mut t = base.clone();
         t.stages[0].time_limit_s = 0;
         assert!(matches!(
             t.validate(1 << 20),
             Err(TaskSetError::TimeLimit(_))
         ));
-        assert!(serde_json::from_str::<OutputKind>("\"web_app\"").is_err());
+        // Plugins: unknown names, wrong kinds, a packager the scorer
+        // cannot take, a pinned version this platform does not have.
+        for (f, why) in [
+            (
+                Box::new(|t: &mut TaskSet| t.stages[0].packager = "web_app".into())
+                    as Box<dyn Fn(&mut TaskSet)>,
+                "unknown packager",
+            ),
+            (
+                Box::new(|t: &mut TaskSet| t.stages[0].packager = "files".into()),
+                "playwright takes web-app",
+            ),
+            (
+                Box::new(|t: &mut TaskSet| t.stages[0].runner = Some("playwright".into())),
+                "scorer as runner",
+            ),
+            (
+                Box::new(|t: &mut TaskSet| t.scorer.version = Some("7".into())),
+                "version",
+            ),
+            (
+                Box::new(|t: &mut TaskSet| {
+                    t.stages[1].scorer = Some(ScorerRef {
+                        name: "nope".into(),
+                        version: None,
+                    })
+                }),
+                "stage scorer",
+            ),
+            (
+                Box::new(|t: &mut TaskSet| {
+                    t.stages[0].packager_options = Some(serde_json::json!([1]))
+                }),
+                "options not an object",
+            ),
+        ] {
+            let mut t = base.clone();
+            f(&mut t);
+            assert!(
+                matches!(t.validate(1 << 20), Err(TaskSetError::Plugin(_))),
+                "{why}"
+            );
+        }
+        // Uploaded tasksets: only plugins marked `user`.
+        base.check_user_plugins().unwrap();
+        let mut t = base;
+        t.scorer.name = "astro-survey".into();
+        for s in &mut t.stages {
+            s.packager = "files".into();
+        }
+        t.validate(1 << 20).unwrap();
+        assert!(t.check_user_plugins().is_err());
     }
 
     /// The repository's tasksets parse, validate, and snapshot as intended.
@@ -603,6 +762,17 @@ mod tests {
         );
         assert_eq!(sc.display.total.as_ref().unwrap().fmt(1.0, None), "100.0%");
         assert_eq!(sc.plugins[0].version, "1");
+        assert_eq!(
+            sc.plugins
+                .iter()
+                .map(|p| format!("{}:{}@{}", p.kind, p.name, p.version))
+                .collect::<Vec<_>>(),
+            [
+                "scorer:playwright@1",
+                "runner:workdir@1",
+                "packager:web-app@1"
+            ]
+        );
 
         let astro: TaskSet = serde_json::from_str(include_str!(
             "../../../tasksets/astro-practice/taskset.json"
@@ -618,6 +788,15 @@ mod tests {
         // Serialized and read back: the object form survives.
         let back: TaskSet = serde_json::from_str(&serde_json::to_string(&astro).unwrap()).unwrap();
         assert_eq!(back, astro);
+
+        // Every taskset in the repository, unchanged, still validates.
+        for raw in [
+            include_str!("../../../tasksets/arcbench-github/taskset.json"),
+            include_str!("../../../tasksets/arcbench-github-official/taskset.json"),
+        ] {
+            let t: TaskSet = serde_json::from_str(raw).unwrap();
+            t.validate(MAX_TOTAL_TIME_S).unwrap();
+        }
     }
 
     #[test]

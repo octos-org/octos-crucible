@@ -15,7 +15,7 @@ use anyhow::{Context, Result, bail};
 use crucible_core::BlobRef;
 use crucible_core::TaskSet;
 use crucible_core::taskset::{
-    Aggregate, Display, MAX_TOTAL_TIME_S, ModelDecl, OutputKind, ScorerRef, Stage,
+    Aggregate, DEFAULT_RUNNER, Display, MAX_TOTAL_TIME_S, ModelDecl, ScorerRef, Stage,
 };
 use crucible_crypto::{PrivateKey, PublicKey};
 use serde::Deserialize;
@@ -32,6 +32,13 @@ pub struct PackSource {
     #[serde(default)]
     pub description: String,
     pub scorer: ScorerRef,
+    /// Defaults for every stage (a stage may set its own).
+    #[serde(default)]
+    pub runner: Option<String>,
+    #[serde(default)]
+    pub packager: Option<String>,
+    #[serde(default)]
+    pub packager_options: Option<serde_json::Value>,
     #[serde(default)]
     pub aggregate: Aggregate,
     #[serde(default)]
@@ -52,7 +59,16 @@ pub struct PackStage {
     pub inputs: Vec<String>,
     /// Files or directories (relative to `dir`) only the scorer sees.
     pub tests: Vec<String>,
-    pub output: OutputKind,
+    /// The packager plugin (`output` in tasksets written before the plugin
+    /// registry); default: the taskset's `packager`.
+    #[serde(default, alias = "output")]
+    pub packager: Option<String>,
+    #[serde(default)]
+    pub packager_options: Option<serde_json::Value>,
+    #[serde(default)]
+    pub runner: Option<String>,
+    #[serde(default)]
+    pub scorer: Option<ScorerRef>,
     pub time_limit_s: u64,
     #[serde(default)]
     pub expected_total: Option<u32>,
@@ -130,7 +146,21 @@ impl Prepared {
                     id: s.id.clone(),
                     inputs_blob,
                     tests_blob,
-                    output: s.output,
+                    packager: s
+                        .packager
+                        .clone()
+                        .or_else(|| src.packager.clone())
+                        .unwrap_or_default(),
+                    packager_options: s
+                        .packager_options
+                        .clone()
+                        .or_else(|| src.packager_options.clone()),
+                    runner: s
+                        .runner
+                        .clone()
+                        .or_else(|| src.runner.clone())
+                        .filter(|r| r != DEFAULT_RUNNER),
+                    scorer: s.scorer.clone().filter(|sc| *sc != src.scorer),
                     time_limit_s: s.time_limit_s,
                     expected_total: s.expected_total,
                 })
@@ -140,33 +170,20 @@ impl Prepared {
 }
 
 /// Parse `source.json`, cut every stage into its inputs and tests zips, and
-/// run the taskset checks (format, stage ids, total time <= the platform
-/// limit). With `allowed_scorers`, the scorer must be one of them, and a
-/// `playwright` taskset may only ask for `web-app` outputs.
-pub fn prepare(
-    source: &Path,
-    src_dir: &Path,
-    allowed_scorers: Option<&[&str]>,
-) -> Result<Prepared> {
+/// run the taskset checks (format, stage ids, plugins in the registry,
+/// total time <= the platform limit). `user`: the rules for uploaded
+/// tasksets (only plugins marked `user` in the registry).
+pub fn prepare(source: &Path, src_dir: &Path, user: bool) -> Result<Prepared> {
     let raw =
         std::fs::read_to_string(source).with_context(|| format!("reading {}", source.display()))?;
     let src: PackSource =
         serde_json::from_str(&raw).with_context(|| format!("parsing {}", source.display()))?;
-    if let Some(allowed) = allowed_scorers {
-        if !allowed.contains(&src.scorer.name.as_str()) {
-            bail!(
-                "scorer {:?} is not available; use one of {allowed:?}",
-                src.scorer.name
-            );
-        }
-        if src.scorer.name == "playwright"
-            && let Some(s) = src.stages.iter().find(|s| s.output != OutputKind::WebApp)
-        {
-            bail!(
-                "stage {}: the playwright scorer needs output \"web-app\"",
-                s.id
-            );
-        }
+    if let Some(s) = src
+        .stages
+        .iter()
+        .find(|s| s.packager.is_none() && src.packager.is_none())
+    {
+        bail!("stage {}: no packager (set packager, or output)", s.id);
     }
     let mut zips = Vec::new();
     for s in &src.stages {
@@ -188,19 +205,27 @@ pub fn prepare(
         sha256: "0".repeat(64),
         key_id: "0".repeat(16),
     };
-    p.taskset(vec![(placeholder.clone(), placeholder); p.zips.len()])
-        .validate(MAX_TOTAL_TIME_S)?;
+    let ts = p.taskset(vec![(placeholder.clone(), placeholder); p.zips.len()]);
+    ts.validate(MAX_TOTAL_TIME_S)?;
+    for s in &ts.stages {
+        crate::packagers::check_options(&s.packager, s.packager_options.as_ref())
+            .with_context(|| format!("stage {}", s.id))?;
+    }
+    if user {
+        ts.check_user_plugins()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
     Ok(p)
 }
 
 pub async fn pack(
     source: &Path,
     src_dir: &Path,
-    allowed_scorers: Option<&[&str]>,
+    user: bool,
     key: &PublicKey,
     store: &Store,
 ) -> Result<TaskSet> {
-    let p = prepare(source, src_dir, allowed_scorers)?;
+    let p = prepare(source, src_dir, user)?;
     let mut blobs = Vec::new();
     for (s, (inputs_zip, tests_zip, ni, nt)) in p.src.stages.iter().zip(&p.zips) {
         let inputs_blob = store.put_sealed(key, inputs_zip).await?;
@@ -306,7 +331,7 @@ mod tests {
         std::fs::write(&source, SOURCE).unwrap();
         let store = Store::parse(&format!("dir:{}", work.path().join("store").display())).unwrap();
         let sk = PrivateKey::generate();
-        let ts = pack(&source, src.path(), None, &sk.public(), &store)
+        let ts = pack(&source, src.path(), false, &sk.public(), &store)
             .await
             .unwrap();
         assert_eq!(ts.stages.len(), 2);
@@ -340,7 +365,7 @@ mod tests {
         ] {
             assert_ne!(bad, SOURCE, "{why}");
             std::fs::write(&source, bad).unwrap();
-            assert!(pack(&source, src.path(), None, &key, &store).await.is_err(), "{why}");
+            assert!(pack(&source, src.path(), false, &key, &store).await.is_err(), "{why}");
         }
     }
 
@@ -349,7 +374,7 @@ mod tests {
         let src = tree();
         let work = tempfile::tempdir().unwrap();
         let source = work.path().join("source.json");
-        let user = Some(crucible_core::taskset::USER_SCORERS);
+        let user = true;
         std::fs::write(&source, SOURCE).unwrap();
         let p = prepare(&source, src.path(), user).unwrap();
         assert_eq!(p.zips[0].2, 2); // requirements.yaml + reference/a.png
@@ -366,6 +391,22 @@ mod tests {
             (
                 SOURCE.replacen("\"web-app\"", "\"files\"", 1),
                 "playwright needs web-app",
+            ),
+            (
+                SOURCE.replacen("\"output\": \"web-app\"", "\"output\": \"zip\"", 1),
+                "unknown packager",
+            ),
+            (
+                SOURCE.replacen(
+                    "\"output\": \"web-app\"",
+                    "\"output\": \"web-app\", \"packager_options\": {\"require\": [\"x\"]}",
+                    1,
+                ),
+                "web-app takes no options",
+            ),
+            (
+                SOURCE.replacen("\"output\": \"web-app\", ", "", 1),
+                "no packager",
             ),
             (
                 SOURCE.replace(
@@ -406,13 +447,38 @@ mod tests {
             std::fs::write(&source, &bad).unwrap();
             assert!(prepare(&source, src.path(), user).is_err(), "{why}");
         }
-        // Without user rules (built-in tasksets) any scorer name is accepted.
+        // Without user rules (built-in tasksets) any registered scorer is
+        // accepted, and packager defaults come from the taskset level.
         std::fs::write(
             &source,
-            SOURCE.replace("\"playwright\"", "\"astro-survey\""),
+            SOURCE
+                .replace("\"playwright\"", "\"astro-survey\"")
+                .replace("\"output\": \"web-app\", ", "")
+                .replace(
+                    "\"aggregate\"",
+                    "\"packager\": \"files\", \"packager_options\": {\"require\": [\"a\"]}, \"aggregate\"",
+                ),
         )
         .unwrap();
-        assert!(prepare(&source, src.path(), None).is_ok());
+        let p = prepare(&source, src.path(), false).unwrap();
+        let ts = p.taskset(vec![
+            (
+                BlobRef {
+                    sha256: "0".repeat(64),
+                    key_id: "0".repeat(16)
+                },
+                BlobRef {
+                    sha256: "0".repeat(64),
+                    key_id: "0".repeat(16)
+                }
+            );
+            2
+        ]);
+        assert_eq!(ts.stages[1].packager, "files");
+        assert!(ts.stages[1].packager_options.is_some());
+        assert!(prepare(&source, src.path(), true).is_err());
+        std::fs::write(&source, SOURCE.replace("\"playwright\"", "\"nope\"")).unwrap();
+        assert!(prepare(&source, src.path(), false).is_err());
     }
 
     #[test]
@@ -434,7 +500,7 @@ mod tests {
                 .into_inner();
             let d = tempfile::tempdir().unwrap();
             let root = unpack_source_zip(&zip, d.path()).unwrap();
-            assert!(prepare(&root.join("source.json"), &root, Some(&["playwright"])).is_ok());
+            assert!(prepare(&root.join("source.json"), &root, true).is_ok());
         }
         let d = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(d.path().join("a")).unwrap();

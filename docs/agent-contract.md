@@ -73,12 +73,12 @@ my-agent/
 
 ## 产出
 
-阶段结束时 `/work` 的内容按题目包声明的产出类型打包（符号链接一律丢弃，`.git` 不打包）：
+阶段结束时 `/work` 的内容由题目包声明的打包器（`packager`，旧题目包写作 `output`）打包（符号链接一律丢弃，`.git` 不打包）。打包器是登记在 `plugins.json` 里、编译进 `crucible` 的插件，接口见 `docs/plugins.md` §5。现有两种：
 
 - `web-app`：打成根目录带 `Dockerfile` 的 zip，打分器用 `--network=none` 构建并在 3000 端口访问。
   - `/work` 根目录有 `Dockerfile`：整个 `/work` 原样打包。
   - 否则（ARC-Bench 约定）：打包 `frontend/` 与 `backend/`（不含 `frontend/node_modules`），平台补一个 Dockerfile：`FROM node:24-bookworm-slim`、`WORKDIR /app/backend`、`PORT=3000`、`CMD <app_start_cmd>`。运行时需要的依赖（如 `backend/node_modules`、前端 `dist/`）要留在 `/work` 里。
-- `files`：整个 `/work`。
+- `files`：整个 `/work`。题目包可以用 `packager_options.require` 列出根目录必须有的文件（例如 `answer.md`），缺了就没有产出。
 
 ## 示例：my-agent
 
