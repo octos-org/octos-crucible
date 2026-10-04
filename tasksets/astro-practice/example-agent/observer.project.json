@@ -1,0 +1,13 @@
+{
+  "schema_version": "observer-project-v1",
+  "protocol": "jsonl-v4",
+  "image": "python:3.12-slim",
+  "build": [],
+  "run": ["python3", "-u", "agent.py"],
+  "working_directory": ".",
+  "environment": {
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "OPENAI_API_KEY": "offline-no-model",
+    "OPENAI_BASE_URL": "http://127.0.0.1:9/v1"
+  }
+}
