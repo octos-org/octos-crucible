@@ -169,6 +169,8 @@ manifest（`schema: 2`）的阶段分数 `replicas[].stages[].score` 是 result 
 
 workflow 通过 `/internal/status` 上报的精确状态优先。估计值只能让状态前进，不会覆盖已上报的更靠后的状态。
 
+回传的结果单独存在 `results/<eval_id>`，查询时刷新只写 `evals/<eval_id>`、从不碰结果。展示时结果优先：结果状态为终态（`done`/`failed`）时以它为准，否则取两者中更靠后的状态（记录已是 `failed` 则保持 `failed`）。因此即使刷新读到旧记录（KV 最终一致）并写回、甚至在宽限期后写成 `failed`，一旦结果可见，评测就显示 `done` 和 manifest，下一次查询详情时列表摘要也随之更正。
+
 ### `GET /evals/:id/download`（仅 owner 或管理员）
 - 请求头带 `Accept: application/json` 时 → `200 {"url": "<下载地址>"}`（网页使用这种方式）。
 - 否则 → 302 到同一地址。
@@ -185,7 +187,7 @@ workflow 通过 `/internal/status` 上报的精确状态优先。估计值只能
 | `POST /internal/status/:id` | `{"status": "building" \| "running:<阶段名>" \| "scoring" \| "failed"}` → `200 {"ok":true,"status"}`。评测已结束时返回 409。 |
 | `GET /internal/tasksets/:id?github_id=N` | `:id` 为 `u-<16 hex>`。→ 该题目包的 `taskset.json`；未就绪 409；该用户既不是上传者、题目包也未公开时 403。 |
 | `POST /internal/tasksets/:id` | taskset-pack 的结果：`{"status": "ready", "taskset": {...}}`（`name` 必须等于 id，打分器必须是用户可用的，校验通过）或 `{"status": "failed", "error": "<≤500 字符>"}`。只接受一次（之后 409）。 |
-| `POST /internal/results/:id` | 请求体是一个 crucible-core `Manifest`（`eval_id` 必须与 URL 一致；`download` 就是 Manifest 自带的字段，由 `crucible download-zip` 写入），外加两个可选的顶层字段：`download: {"sha256": "<密码 zip 的哈希>"}`，以及 `status`（默认 `done`；如果只是回传部分结果、run 还在继续，可填 `running:<阶段>` 或 `scoring`）。不超过 2 MiB。Worker 存下 manifest（去掉这两个字段），更新状态；进入终态时删除凭据。→ `200 {"ok":true,"status"}` |
+| `POST /internal/results/:id` | 请求体是一个 crucible-core `Manifest`（`eval_id` 必须与 URL 一致；`download` 就是 Manifest 自带的字段，由 `crucible download-zip` 写入），外加两个可选的顶层字段：`download: {"sha256": "<密码 zip 的哈希>"}`，以及 `status`（默认 `done`；如果只是回传部分结果、run 还在继续，可填 `running:<阶段>` 或 `scoring`）。不超过 2 MiB。Worker 把 manifest（去掉这两个字段）存进 `results/<eval_id>`，更新状态；进入终态时删除凭据。→ `200 {"ok":true,"status"}` |
 
 ## 触发参数（workflow_dispatch）
 
@@ -217,7 +219,8 @@ workflow 通过 `/internal/status` 上报的精确状态优先。估计值只能
 | key | 值 | 过期 |
 |---|---|---|
 | `cred/<eval_id>` | 凭据 envelope 字节 | 24 小时；run 结束时删除 |
-| `evals/<eval_id>` | 评测记录（含 manifest），key metadata 是列表摘要 | 永久 |
+| `evals/<eval_id>` | 评测记录（状态、run 等；旧记录可能含 manifest），key metadata 是列表摘要 | 永久 |
+| `results/<eval_id>` | `{manifest, download_sha256, status, updated_at}`，只由 `/internal/results` 写入 | 永久 |
 | `owner/<github_id>/<eval_id>` | 空值，key metadata 是列表摘要 | 永久 |
 | `upload/<sha256>` | `{owner_id, kind, size, created_at}`，kind 为 `agent`/`app`/`taskset` | 永久 |
 | `tasksets/<u-id>` | 用户题目包 `{id, owner_id, owner_login, upload_hash, status, error, public, title, taskset, created_at, updated_at}`；key metadata 为 `{owner_id, status, public, created_at}` | 永久 |

@@ -11,8 +11,8 @@ use crate::http::{ApiError, Backend, PutOptions, Req, Resp};
 use crate::keys;
 use crate::model::{
     CRED_TTL_S, DONE, EvalRecord, EvalRequest, EvalSummary, FAILED, MAX_UPLOAD, Mode, QUEUED,
-    UploadRecord, ValidEval, is_login, is_status, is_terminal, is_uuid_v4, parse_results,
-    status_rank,
+    StoredResults, UploadRecord, ValidEval, is_login, is_status, is_terminal, is_uuid_v4,
+    parse_results, status_rank,
 };
 use crate::model::{
     PackResult, TS_FAILED, TS_PACKING, TS_READY, UploadKind, UserTaskset, UserTasksetMeta,
@@ -221,8 +221,11 @@ impl<'a, B: Backend> App<'a, B> {
             .is_some())
     }
 
-    async fn save_record(&self, rec: &EvalRecord) -> Result<()> {
-        let meta = serde_json::to_value(rec.summary()).expect("json");
+    /// Writes `evals/<id>` (never results; see [`StoredResults`]) with the
+    /// list summary of the eval as shown.
+    async fn save_record(&self, rec: &EvalRecord, results: Option<&StoredResults>) -> Result<()> {
+        let view = rec.clone().with_results(results);
+        let meta = serde_json::to_value(view.summary()).expect("json");
         let opts = || PutOptions {
             ttl: None,
             metadata: Some(meta.clone()),
@@ -250,6 +253,10 @@ impl<'a, B: Backend> App<'a, B> {
         self.kv_json(&format!("evals/{id}"))
             .await?
             .ok_or_else(|| ApiError::not_found("no such eval"))
+    }
+
+    async fn load_results(&self, id: &str) -> Result<Option<StoredResults>> {
+        self.kv_json(&format!("results/{id}")).await
     }
 
     // ---- auth -----------------------------------------------------------
@@ -826,7 +833,7 @@ impl<'a, B: Backend> App<'a, B> {
             download_sha256: None,
             updated_at: rfc3339(now),
         };
-        self.save_record(&rec).await?;
+        self.save_record(&rec, None).await?;
 
         let worker_url = self
             .cfg
@@ -838,7 +845,7 @@ impl<'a, B: Backend> App<'a, B> {
             let _ = self.b.kv_delete(&format!("cred/{}", rec.eval_id)).await;
             rec.status = FAILED.into();
             rec.updated_at = rfc3339(self.b.now_s());
-            let _ = self.save_record(&rec).await;
+            let _ = self.save_record(&rec, None).await;
             return Err(e);
         }
         Ok(Resp::json(201, &json!({"eval_id": rec.eval_id})))
@@ -872,12 +879,25 @@ impl<'a, B: Backend> App<'a, B> {
         if !authz::can_view_eval(&p, rec.owner_id) {
             return Err(ApiError::forbidden("not your eval"));
         }
-        if self.refresh(&mut rec).await {
+        let results = self.load_results(id).await?;
+        let shown = rec.clone().with_results(results.as_ref());
+        let mut dirty = !is_terminal(&shown.status) && self.refresh(&mut rec).await;
+        // A record written from a stale read lags its final results; bring
+        // it (and the list summary) back in line.
+        if let Some(r) = &results
+            && is_terminal(&r.status)
+            && rec.status != r.status
+        {
+            rec.status.clone_from(&r.status);
+            dirty = true;
+        }
+        if dirty {
             rec.updated_at = rfc3339(self.b.now_s());
-            if let Err(e) = self.save_record(&rec).await {
+            if let Err(e) = self.save_record(&rec, results.as_ref()).await {
                 self.b.log(&format!("refresh save failed: {}", e.message));
             }
         }
+        let rec = rec.with_results(results.as_ref());
         let mut out = json!({
             "eval_id": rec.eval_id,
             "status": rec.status,
@@ -979,6 +999,7 @@ impl<'a, B: Backend> App<'a, B> {
         if !authz::can_view_eval(&p, rec.owner_id) {
             return Err(ApiError::forbidden("not your eval"));
         }
+        let rec = rec.with_results(self.load_results(id).await?.as_ref());
         let hash = rec
             .download_sha256
             .ok_or_else(|| ApiError::new(404, "not_ready", "no download for this eval yet"))?;
@@ -1030,17 +1051,33 @@ impl<'a, B: Backend> App<'a, B> {
         let id = self.internal_id(req, id)?;
         let mut rec = self.load_record(id).await?;
         let results = parse_results(&req.body, id)?;
-        rec.manifest = Some(results.manifest);
-        if results.download.is_some() {
-            rec.download_sha256 = results.download;
+        let prev = self.load_results(id).await?;
+        let stored = StoredResults {
+            manifest: results.manifest,
+            download_sha256: results
+                .download
+                .or_else(|| prev.and_then(|p| p.download_sha256)),
+            status: results.status,
+            updated_at: rfc3339(self.b.now_s()),
+        };
+        // The results key is the source of truth and is written first; the
+        // record write below only mirrors the status for the list.
+        self.kv_put(
+            &format!("results/{id}"),
+            &serde_json::to_vec(&stored).expect("json"),
+            PutOptions::default(),
+        )
+        .await?;
+        if is_terminal(&stored.status) {
+            rec.status.clone_from(&stored.status);
         }
-        rec.status = results.status;
-        rec.updated_at = rfc3339(self.b.now_s());
-        self.save_record(&rec).await?;
-        if is_terminal(&rec.status) {
+        rec.updated_at.clone_from(&stored.updated_at);
+        self.save_record(&rec, Some(&stored)).await?;
+        if is_terminal(&stored.status) {
             let _ = self.b.kv_delete(&format!("cred/{id}")).await;
         }
-        Ok(Resp::json(200, &json!({"ok": true, "status": rec.status})))
+        let status = rec.with_results(Some(&stored)).status;
+        Ok(Resp::json(200, &json!({"ok": true, "status": status})))
     }
 
     /// Progress from the workflow: `{"status": "building" | "running:<stage>"
@@ -1063,15 +1100,14 @@ impl<'a, B: Backend> App<'a, B> {
                 "status must be building, running:<stage>, scoring or failed",
             ));
         }
-        if is_terminal(&rec.status) {
-            return Err(ApiError::conflict(format!(
-                "eval is already {}",
-                rec.status
-            )));
+        let results = self.load_results(id).await?;
+        let shown = rec.clone().with_results(results.as_ref()).status;
+        if is_terminal(&shown) {
+            return Err(ApiError::conflict(format!("eval is already {shown}")));
         }
         rec.status = body.status;
         rec.updated_at = rfc3339(self.b.now_s());
-        self.save_record(&rec).await?;
+        self.save_record(&rec, results.as_ref()).await?;
         if is_terminal(&rec.status) {
             let _ = self.b.kv_delete(&format!("cred/{id}")).await;
         }
