@@ -1,0 +1,51 @@
+id: ROOT
+name: Todo - Stage 1
+type: FOLDER
+dependencies: []
+description: A small todo web application served at the application home page `/`.
+  Tasks are stored by the server, so every visitor and every browser session sees
+  the same list. Later stages extend the same application.
+children:
+- id: REQ-1
+  name: Todo Page
+  type: ATOMIC
+  dependencies: []
+  description: |-
+    The home page `/` shows a level-1 heading with exactly the text “Todo”, a text input whose visible label is “New task”, a button named “Add”, and the task list. The task list is the only list on the page and shows every stored task as one list item, oldest first.
+  scenarios:
+  - name: 'REQ-1: Todo Page - Scenario 1'
+    steps:
+    - keyword: GIVEN
+      content: 'A visitor opens the application home page.'
+    - keyword: THEN
+      content: 'The page shows the heading “Todo”, the “New task” input and the “Add” button.'
+- id: REQ-2
+  name: Add Task
+  type: ATOMIC
+  dependencies: [REQ-1]
+  description: |-
+    Typing a text into “New task” and pressing “Add” stores a new task with that text (surrounding spaces trimmed) and appends it to the list as a list item showing the text; the input is then cleared. Pressing “Add” with an empty or blank input adds nothing.
+  scenarios:
+  - name: 'REQ-2: Add Task - Scenario 1'
+    steps:
+    - keyword: GIVEN
+      content: 'A visitor is on the home page.'
+    - keyword: WHEN
+      content: 'They type “Buy milk” into “New task” and press “Add”.'
+    - keyword: THEN
+      content: 'A list item “Buy milk” appears in the task list and the input is empty again.'
+- id: REQ-3
+  name: Persistent Tasks
+  type: ATOMIC
+  dependencies: [REQ-2]
+  description: |-
+    Tasks are kept by the server: after reloading the page, or opening it in a different browser session, every added task is still listed. Tasks survive as long as the server runs (an in-memory store or a file is fine).
+  scenarios:
+  - name: 'REQ-3: Persistent Tasks - Scenario 1'
+    steps:
+    - keyword: GIVEN
+      content: 'A visitor added the task “Walk the dog”.'
+    - keyword: WHEN
+      content: 'Another visitor opens the home page in a fresh browser session.'
+    - keyword: THEN
+      content: 'The task list includes “Walk the dog”.'

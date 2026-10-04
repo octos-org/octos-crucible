@@ -1,0 +1,54 @@
+id: ROOT
+name: Todo - Stage 2
+type: FOLDER
+dependencies: []
+description: The todo application already exists from the previous stage (home page
+  `/` with the “Todo” heading, the “New task” input, the “Add” button and a
+  server-stored task list). Everything it does must keep working. This stage adds
+  completing and deleting tasks and a counter of remaining tasks.
+children:
+- id: REQ-4
+  name: Complete Task
+  type: ATOMIC
+  dependencies: []
+  description: |-
+    Every task in the list has a checkbox whose accessible name is exactly the task's text (for example the checkbox inside a label holding the text). Checking it marks the task done, unchecking marks it not done; the state is stored by the server, so it is kept after a reload and seen by other browser sessions. New tasks start not done.
+  scenarios:
+  - name: 'REQ-4: Complete Task - Scenario 1'
+    steps:
+    - keyword: GIVEN
+      content: 'The list holds the task “Pay rent”.'
+    - keyword: WHEN
+      content: 'The visitor checks the checkbox “Pay rent” and reloads the page.'
+    - keyword: THEN
+      content: 'The checkbox “Pay rent” is still checked.'
+- id: REQ-5
+  name: Delete Task
+  type: ATOMIC
+  dependencies: []
+  description: |-
+    Every task in the list has a button whose accessible name is “Delete ” followed by the task's text (for example “Delete Pay rent”). Pressing it removes the task from the server and from the list.
+  scenarios:
+  - name: 'REQ-5: Delete Task - Scenario 1'
+    steps:
+    - keyword: GIVEN
+      content: 'The list holds the task “Old idea”.'
+    - keyword: WHEN
+      content: 'The visitor presses “Delete Old idea” and reloads the page.'
+    - keyword: THEN
+      content: 'No list item “Old idea” is shown.'
+- id: REQ-6
+  name: Remaining Counter
+  type: ATOMIC
+  dependencies: [REQ-4, REQ-5]
+  description: |-
+    The home page shows the text “Remaining: N”, where N is the number of stored tasks that are not done. It updates immediately (without a reload) whenever a task is added, checked, unchecked or deleted.
+  scenarios:
+  - name: 'REQ-6: Remaining Counter - Scenario 1'
+    steps:
+    - keyword: GIVEN
+      content: 'The page shows “Remaining: 2”.'
+    - keyword: WHEN
+      content: 'The visitor adds a task, then checks it.'
+    - keyword: THEN
+      content: 'The page shows “Remaining: 3” after adding and “Remaining: 2” after checking.'
