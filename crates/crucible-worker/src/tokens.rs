@@ -1,7 +1,7 @@
 //! Personal API tokens for the command line (`crucible submit`).
 //!
-//! Format: `crt_<id: 16 hex>_<secret: 64 hex>`. KV keeps only the SHA-256
-//! of the whole token under `token/<id>`; the plaintext is shown once, when
+//! Format: `crt_<id: 16 hex>_<secret: 64 hex>`. D1 keeps only the SHA-256
+//! of the whole token (table `tokens`); the plaintext is shown once, when
 //! it is created. A token acts as its owner on the user endpoints, never as
 //! an administrator, and cannot manage tokens (that needs a web session).
 
@@ -15,7 +15,7 @@ pub const PREFIX: &str = "crt_";
 pub const MAX_PER_USER: usize = 20;
 pub const MAX_NAME: usize = 60;
 
-/// KV `token/<id>`.
+/// D1 `tokens` (the id is the key).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenRecord {
     pub owner_id: u64,
@@ -26,7 +26,7 @@ pub struct TokenRecord {
     pub created_at: String,
 }
 
-/// What `GET /tokens` lists (also the metadata of `tokens/<gid>/<id>`).
+/// What `GET /tokens` lists.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenSummary {
     pub id: String,

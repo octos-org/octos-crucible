@@ -5,8 +5,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::Config;
-use crate::http::{ApiError, Backend, HttpRequest, HttpResponse, PutOptions};
+use crate::http::{ApiError, Backend, HttpRequest, HttpResponse};
 use crate::model::{BUILDING, FAILED, QUEUED, SCORING, is_slug};
+use crate::store::Db;
 use crate::util::{b64_decode_lenient, pct_encode, rfc3339};
 
 const API_VERSION: &str = "2022-11-28";
@@ -185,11 +186,12 @@ impl<'a, B: Backend> GitHub<'a, B> {
     // ---- Blob store (与 crucible-store 保持一致) -------------------------
 
     /// The release for `tag`, created as a pre-release if missing. Cached
-    /// in KV: tags never move.
+    /// in D1 without expiry: tags never move.
     pub async fn release(&self, tag: &str) -> Result<Release, ApiError> {
-        let cache_key = format!("cache/release/{tag}");
-        if let Ok(Some(raw)) = self.b.kv_get(&cache_key).await
-            && let Ok(r) = serde_json::from_slice::<Release>(&raw)
+        let cache_key = format!("release/{tag}");
+        let db = Db(self.b);
+        if let Ok(Some(raw)) = db.cache_get(&cache_key, self.b.now_s()).await
+            && let Ok(r) = serde_json::from_str::<Release>(&raw)
         {
             return Ok(r);
         }
@@ -214,12 +216,11 @@ impl<'a, B: Backend> GitHub<'a, B> {
         }
         let release = found
             .ok_or_else(|| ApiError::upstream(format!("release {tag} missing after create")))?;
-        let _ = self
-            .b
-            .kv_put(
+        let _ = db
+            .cache_put(
                 &cache_key,
-                &serde_json::to_vec(&release).expect("json"),
-                PutOptions::default(),
+                &serde_json::to_string(&release).expect("json"),
+                None,
             )
             .await;
         Ok(release)

@@ -1,4 +1,4 @@
-//! Request bodies, their validation, and the records kept in KV.
+//! Request bodies, their validation, and the records kept in D1.
 
 use crucible_core::Manifest;
 use serde::{Deserialize, Serialize};
@@ -13,7 +13,8 @@ use crate::util::b64_decode;
 pub const MAX_UPLOAD: usize = 25 * 1024 * 1024;
 pub const MAX_EVAL_BODY: usize = 64 * 1024;
 pub const MAX_CRED: usize = 16 * 1024;
-pub const MAX_RESULTS_BODY: usize = 2 * 1024 * 1024;
+/// Below D1's 2,000,000-byte row limit (the manifest is stored as one value).
+pub const MAX_RESULTS_BODY: usize = 1_900_000;
 /// Same limit as the page (the workflow allows more).
 pub const MAX_REPLICAS: u32 = 10;
 pub const CRED_TTL_S: u64 = 86_400;
@@ -236,7 +237,7 @@ impl EvalRequest {
             .map_err(|e| ApiError::bad_request(format!("invalid request body: {e}")))
     }
 
-    /// Checks that need no KV or GitHub lookups.
+    /// Checks that need no storage or GitHub lookups.
     pub fn validate(self, current_key_id: &str) -> Result<ValidEval, ApiError> {
         let bad = |m: &str| Err(ApiError::bad_request(m.to_owned()));
         if !self.consent {
@@ -345,7 +346,7 @@ fn check_budget(b: &Budget) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// KV `upload/<hash>`: who uploaded a blob through the Worker. An eval may
+/// D1 `uploads`: who uploaded a blob through the Worker. An eval may
 /// only reference the caller's own uploads, so nobody can feed someone
 /// else's sealed blob (which the platform would decrypt) into a run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -363,7 +364,7 @@ pub const TS_READY: &str = "ready";
 pub const TS_FAILED: &str = "failed";
 pub const MAX_TASKSET_BODY: usize = 256 * 1024;
 
-/// KV `tasksets/<id>`: a user-uploaded taskset. Private to its owner until
+/// D1 `user_tasksets`: a user-uploaded taskset. Private to its owner until
 /// an admin makes it public; built-in tasksets live in the repository.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UserTaskset {
@@ -388,25 +389,7 @@ pub struct UserTaskset {
     pub updated_at: String,
 }
 
-/// KV key metadata of `tasksets/<id>`: enough to decide who sees it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct UserTasksetMeta {
-    pub owner_id: u64,
-    pub status: String,
-    pub public: bool,
-    pub created_at: String,
-}
-
 impl UserTaskset {
-    pub fn meta(&self) -> UserTasksetMeta {
-        UserTasksetMeta {
-            owner_id: self.owner_id,
-            status: self.status.clone(),
-            public: self.public,
-            created_at: self.created_at.clone(),
-        }
-    }
-
     /// Who may see it in listings and details.
     pub fn visible_to(&self, github_id: u64, is_admin: bool) -> bool {
         is_admin || self.owner_id == github_id || (self.public && self.status == TS_READY)
@@ -465,7 +448,8 @@ pub fn parse_pack_result(body: &[u8], id: &str) -> Result<PackResult, ApiError> 
     }
 }
 
-/// KV `evals/<eval_id>`.
+/// D1 `evals`. `manifest` and `download_sha256` are only ever set on
+/// records read from the old KV store (see `/internal/migrate-kv`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EvalRecord {
     pub eval_id: String,
@@ -504,10 +488,9 @@ pub struct EvalRecord {
     pub updated_at: String,
 }
 
-/// KV `results/<eval_id>`: what the workflow posted to
-/// `POST /internal/results`. Only that endpoint writes this key; refreshing
-/// from GitHub writes `evals/<eval_id>` and never touches it, so a refresh
-/// that read a stale record cannot erase results.
+/// D1 `results`: what the workflow posted to `POST /internal/results`.
+/// Only that endpoint (and the migration) writes it; status updates write
+/// `evals` and never touch it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoredResults {
     pub manifest: Value,
@@ -517,8 +500,7 @@ pub struct StoredResults {
     pub updated_at: String,
 }
 
-/// Shown by `GET /evals` and kept as KV key metadata (< 1 KiB) so the list
-/// needs a single KV call.
+/// Shown by `GET /evals`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EvalSummary {
     pub eval_id: String,
@@ -550,11 +532,7 @@ impl EvalRecord {
         if r.download_sha256.is_some() {
             self.download_sha256.clone_from(&r.download_sha256);
         }
-        if is_terminal(&r.status)
-            || (!is_terminal(&self.status) && status_rank(&r.status) > status_rank(&self.status))
-        {
-            self.status.clone_from(&r.status);
-        }
+        self.status = shown_status(&self.status, Some(&r.status));
         if r.updated_at > self.updated_at {
             self.updated_at.clone_from(&r.updated_at);
         }
@@ -564,20 +542,28 @@ impl EvalRecord {
     pub fn total_score(&self) -> Option<f64> {
         total_score(&self.parsed_manifest()?)
     }
+}
 
-    pub fn summary(&self) -> EvalSummary {
-        EvalSummary {
-            eval_id: self.eval_id.clone(),
-            mode: self.mode,
-            taskset: self.taskset.clone(),
-            model: self.model.clone(),
-            created_at: self.created_at.clone(),
-            status: self.status.clone(),
-            total_score: self.total_score(),
-            display: self
-                .parsed_manifest()
-                .and_then(|m| m.scoring?.display.total),
+/// The status shown for a record status and (optional) posted results
+/// status: a terminal results status is final; otherwise a failed record
+/// (the run died after partial results) stays failed, and anything else
+/// takes the further of the two.
+pub fn shown_status(record: &str, results: Option<&str>) -> String {
+    match results {
+        Some(r)
+            if is_terminal(r) || (!is_terminal(record) && status_rank(r) > status_rank(record)) =>
+        {
+            r.to_owned()
         }
+        _ => record.to_owned(),
+    }
+}
+
+/// `(total_score, display)` of a manifest, as listed by `GET /evals`.
+pub fn score_of(manifest: &Value) -> (Option<f64>, Option<crucible_core::taskset::ScoreFormat>) {
+    match serde_json::from_value::<Manifest>(manifest.clone()) {
+        Ok(m) => (total_score(&m), m.scoring.and_then(|s| s.display.total)),
+        Err(_) => (None, None),
     }
 }
 

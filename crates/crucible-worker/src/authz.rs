@@ -44,7 +44,7 @@ pub fn check_ban_target(
 }
 
 /// A ban outranks everything, admin status included (an admin whose id is
-/// later banned by direct KV edit is locked out too).
+/// later banned by a direct database edit is locked out too).
 pub fn admit(
     github_id: u64,
     login: &str,
