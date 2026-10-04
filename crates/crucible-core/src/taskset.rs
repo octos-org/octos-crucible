@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::blob::BlobRef;
-use crate::plugins::Kind;
+use crate::plugins::{Kind, Plugin, UserPlugin};
 
 /// `name` or `name@version` of a scorer reference.
 pub fn scorer_spec(s: &ScorerRef) -> String {
@@ -61,6 +61,10 @@ pub struct TaskSet {
     /// limits and at most [`MAX_TOTAL_TIME_S`].
     pub total_time_limit_s: u64,
     pub stages: Vec<Stage>,
+    /// User-uploaded plugins the stages refer to (`u-<16 hex>`), pinned
+    /// when the taskset was registered (docs/plugins.md §14).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub user_plugins: Vec<UserPlugin>,
 }
 
 /// Which scorer grades the checkpoints, e.g. `playwright`: a name in the
@@ -503,10 +507,52 @@ impl TaskSet {
         }
     }
 
+    /// Look up `name` or `name@version`: a user plugin pinned in
+    /// `user_plugins` (`u-<16 hex>`), else the registry.
+    pub fn plugin(&self, kind: Kind, reference: &str) -> Result<Plugin, String> {
+        let (name, version) = match reference.split_once('@') {
+            Some((n, v)) => (n, Some(v)),
+            None => (reference, None),
+        };
+        if !crate::plugins::is_user_plugin_id(name) {
+            return crate::plugins::registry().resolve(kind, reference).cloned();
+        }
+        let p = self
+            .user_plugins
+            .iter()
+            .find(|p| p.name == name && p.kind == kind)
+            .ok_or_else(|| {
+                format!(
+                    "unknown {} {name:?} (not an uploaded plugin this taskset may use)",
+                    kind.as_str()
+                )
+            })?;
+        if let Some(v) = version
+            && v != p.version
+        {
+            return Err(format!(
+                "{} {name}: version {v} is not the uploaded one ({})",
+                kind.as_str(),
+                p.version
+            ));
+        }
+        Ok(p.as_plugin())
+    }
+
+    /// [`TaskSet::plugin`] by kind name (`runner`, `packager`, `scorer`).
+    pub fn plugins_of_kind(&self, kind: &str, name: &str) -> Option<Plugin> {
+        let k = match kind {
+            "runner" => Kind::Runner,
+            "packager" => Kind::Packager,
+            "scorer" => Kind::Scorer,
+            _ => return None,
+        };
+        self.plugin(k, name).ok()
+    }
+
     /// Every plugin this taskset uses, scorers first, each once, with the
     /// registered version (or the one the taskset pinned).
     pub fn plugin_versions(&self) -> Vec<PluginVersion> {
-        let reg = crate::plugins::registry();
         let mut out: Vec<PluginVersion> = Vec::new();
         let mut add = |kind: Kind, r: &str| {
             let (name, pinned) = match r.split_once('@') {
@@ -514,7 +560,7 @@ impl TaskSet {
                 None => (r, None),
             };
             let version = pinned
-                .or_else(|| reg.get(kind, name).map(|p| p.version.clone()))
+                .or_else(|| self.plugin(kind, name).ok().map(|p| p.version))
                 .unwrap_or_else(|| "unknown".into());
             let v = PluginVersion {
                 kind: kind.as_str().into(),
@@ -548,16 +594,29 @@ impl TaskSet {
     /// producing runners are not interactive; a scorer accepts the stage's
     /// packager; plugin options are small JSON objects.
     pub fn check_plugins(&self) -> Result<(), String> {
-        let reg = crate::plugins::registry();
+        let mut seen = std::collections::HashSet::new();
+        for u in &self.user_plugins {
+            u.check()?;
+            if !seen.insert(u.name.as_str()) {
+                return Err(format!("user plugin {} listed twice", u.name));
+            }
+            let used = self
+                .stages
+                .iter()
+                .any(|s| s.scorer_ref(self).name == u.name);
+            if !used {
+                return Err(format!("user plugin {} is not used by any stage", u.name));
+            }
+        }
         for s in &self.stages {
             let at = |e: String| format!("stage {}: {e}", s.id);
             let sc = s.scorer_ref(self);
-            let scorer = reg.resolve(Kind::Scorer, &scorer_spec(sc)).map_err(at)?;
-            let runner = reg.resolve(Kind::Runner, s.runner_name()).map_err(at)?;
+            let scorer = self.plugin(Kind::Scorer, &scorer_spec(sc)).map_err(at)?;
+            let runner = self.plugin(Kind::Runner, s.runner_name()).map_err(at)?;
             if runner.interactive {
                 return Err(at(format!("runner {} is interactive", runner.name)));
             }
-            let packager = reg.resolve(Kind::Packager, &s.packager).map_err(at)?;
+            let packager = self.plugin(Kind::Packager, &s.packager).map_err(at)?;
             if !scorer.accepts.is_empty() && !scorer.accepts.contains(&packager.name) {
                 return Err(at(format!(
                     "scorer {} needs packager {}",
@@ -583,7 +642,7 @@ impl TaskSet {
             }
             let model = self.model.clone().unwrap_or_default();
             if let Some(i) = &s.interactive {
-                let r = reg.resolve(Kind::Runner, &i.name).map_err(at)?;
+                let r = self.plugin(Kind::Runner, &i.name).map_err(at)?;
                 if !r.interactive {
                     return Err(at(format!("runner {} is not interactive", r.name)));
                 }
@@ -644,7 +703,6 @@ impl TaskSet {
     /// offered to users (`"user": true` in the registry).
     pub fn check_user_plugins(&self) -> Result<(), String> {
         self.check_plugins()?;
-        let reg = crate::plugins::registry();
         for s in &self.stages {
             let sc = s.scorer_ref(self);
             let interactive = s
@@ -659,7 +717,7 @@ impl TaskSet {
             .into_iter()
             .chain(interactive)
             {
-                let p = reg.resolve(kind, &r)?;
+                let p = self.plugin(kind, &r)?;
                 // The default runner needs no review of its own: it never
                 // sees test material.
                 if !p.user && !(kind == Kind::Runner && p.name == DEFAULT_RUNNER) {

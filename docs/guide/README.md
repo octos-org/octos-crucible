@@ -73,7 +73,7 @@ crucible submit agent --agent-dir ./my-agent --taskset github-full \
 
 ## 上传自己的题目包
 
-在网页“题目包”页登录后点“上传题目包”。
+在网页“题目包”页登录后点“上传题目包”，或用命令行 `crucible taskset upload my-tasks.zip --wait`（也可以传目录；令牌同上）。
 
 - **格式**：一个 zip，结构同仓库里的 `tasksets/hello-world/source`：根目录（或 zip 里唯一的顶层文件夹）放 `source.json`，每个阶段一个目录，里面是给 agent 的需求文件（如 `requirements.yaml`）和只给打分器的测试（如 `tests/`）。`source.json` 示例：
 
@@ -87,11 +87,34 @@ crucible submit agent --agent-dir ./my-agent --taskset github-full \
     ]
   }
   ```
-- **限制**：各阶段限时之和 ≤ `total_time_limit_s` ≤ 18000 秒；只能引用插件注册表 `plugins.json` 里标为 `user: true` 的插件，目前打分器只有 `playwright`（打包器 `web-app`；旧写法 `"output": "web-app"` 同样有效）；给 agent 的文件和测试文件不能重叠；不能有符号链接；加密后不超过 25 MB。
+- **限制**：各阶段限时之和 ≤ `total_time_limit_s` ≤ 18000 秒；只能引用插件注册表 `plugins.json` 里标为 `user: true` 的插件（打分器如 `playwright`、`llm-judge`、`astro-survey`；打包器 `web-app`、`files`，旧写法 `"output": "web-app"` 同样有效），或你自己上传的打分器插件（`"scorer": {"name": "u-…"}`，见下一节）；给 agent 的文件和测试文件不能重叠；不能有符号链接；加密后不超过 25 MB。
 - **先在本地检查**：`crucible taskset validate my-tasks.zip`（也可以传目录或 `source.json`），和平台用的是同一套检查。
 - **登记**：文件在浏览器里用平台公钥加密后上传。平台解密、检查、按阶段拆成“给 agent 的输入”和“测试”两份分别加密保存，几分钟后状态变为“可用”；没通过时页面上显示原因。
 - **可见性**：默认私有，只有你能看到和使用（提交页的题目包列表、命令行 `--taskset u-…`）；管理员可以把它设为公开。仓库内置的题目包不受影响。
 - **安全**：你的测试会被当作不可信代码运行：运行测试的机器上没有任何平台密钥，测试容器不能联网、不能访问宿主机（见 `docs/scorer-contract.md` §7）。
+
+## 上传自己的打分器插件
+
+平台自带的打分器不够用时，可以把打分逻辑做成容器镜像上传。在网页“插件”页上传，或：
+
+```sh
+crucible plugin upload examples/plugins/keyword-scorer --wait   # 打印 u-<16 hex>
+crucible plugin list
+crucible plugin status u-<16 hex>
+```
+
+- **格式**：一个 zip（或目录），根目录放 `plugin.json` 和 `Dockerfile`：
+
+  ```json
+  {"schema": 1, "kind": "scorer", "name": "keyword-scorer", "version": "1",
+   "description": "按关键字给文本产出打分", "runs_taskset_code": false, "model": false, "accepts": ["files"]}
+  ```
+
+  镜像的入口会收到 `--artifact /in/artifact --tests /in/tests --out /out/result.json --visibility hidden`（声明了模型时另有 `--model-base-url`、`--model`），写出 result.json v2（`docs/scorer-contract.md` §4）。容器没有网络、只读根、非 root，墙钟 1200 秒。可选 `selftest/artifact` 和 `selftest/tests/` 作为自检样例。完整约定见 `docs/plugins.md` §14，示例见 `examples/plugins/keyword-scorer`。
+- **登记**：插件包在本地加密后上传；平台在 GitHub 托管机上构建镜像，用自检样例跑一次，能写出合法 result.json 即“可用”，页面和 `crucible plugin status` 显示自检分数；没通过时显示原因。
+- **使用**：在自己的题目包 `source.json` 里写 `"scorer": {"name": "u-…"}`，再上传题目包（示例 `examples/tasksets/keyword-demo`）。
+- **可见性**：默认私有，只有你的题目包能用；管理员可以设为公开，之后任何人的题目包都能用。插件登记后不能修改，改了就重新上传。
+- **能拿到什么**：只在打分容器里看到产出和本阶段的测试材料；拿不到平台密钥；声明 `model: true` 时只能经计量代理用提交者的 key。
 
 ## 下载产出
 

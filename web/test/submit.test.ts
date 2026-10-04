@@ -6,16 +6,17 @@ import { Decrypter, generateX25519Identity, identityToRecipient } from "age-encr
 import type { Backend } from "../src/api";
 import { keyIdOf } from "../src/crypto";
 import { currentKey } from "../src/keys";
-import { resolveKey, submitEval, submitTaskset } from "../src/submit";
+import { resolveKey, submitEval, submitPlugin, submitTaskset } from "../src/submit";
 import type { CreateEval } from "../src/types";
 import { emptyForm, type FormInput } from "../src/validate";
 
 function fakeBackend(pub: { key_id: string; public_key: string }) {
-  const calls: { uploads: Uint8Array[]; kinds: string[]; evals: CreateEval[]; tasksets: string[] } = {
+  const calls: { uploads: Uint8Array[]; kinds: string[]; evals: CreateEval[]; tasksets: string[]; plugins: string[] } = {
     uploads: [],
     kinds: [],
     evals: [],
     tasksets: [],
+    plugins: [],
   };
   const b: Backend = {
     me: async () => ({ github_id: 1, login: "t", is_admin: false }),
@@ -43,6 +44,12 @@ function fakeBackend(pub: { key_id: string; public_key: string }) {
       return { id: "u-0123456789abcdef", status: "packing" };
     },
     setTasksetPublic: async (id, on) => ({ id, public: on }),
+    plugins: async () => [],
+    registerPlugin: async (h) => {
+      calls.plugins.push(h);
+      return { id: "u-fedcba9876543210", status: "building" };
+    },
+    setPluginPublic: async (id, on) => ({ id, public: on }),
   };
   return { b, calls };
 }
@@ -139,5 +146,19 @@ describe("submitTaskset", () => {
     d.addIdentity(id);
     const f = calls.uploads[0];
     expect(await d.decrypt(f.subarray(f.indexOf(0x0a) + 1))).toEqual(zip);
+  });
+});
+
+describe("submitPlugin", () => {
+  it("uploads the package sealed as kind plugin, then registers that upload", async () => {
+    const id = await generateX25519Identity();
+    const rec = await identityToRecipient(id);
+    const { b, calls } = fakeBackend({ key_id: await keyIdOf(rec), public_key: rec });
+    const zip = new TextEncoder().encode("PK-PLAINTEXT-SCORER");
+    const res = await submitPlugin(b, zip);
+    expect(res).toEqual({ id: "u-fedcba9876543210", status: "building" });
+    expect(calls.kinds).toEqual(["plugin"]);
+    expect(calls.plugins).toEqual(["h".repeat(64)]);
+    expect(new TextDecoder().decode(calls.uploads[0])).not.toContain("PLAINTEXT");
   });
 });

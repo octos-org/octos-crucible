@@ -1,7 +1,7 @@
 // Fixed data for developing without a Worker. Shapes follow the API contract.
 
 import { ApiError, type Backend } from "./api";
-import type { ApiToken, EvalDetail, EvalSummary, Manifest, StageEntry, TaskSet } from "./types";
+import type { ApiToken, EvalDetail, EvalSummary, Manifest, StageEntry, TaskSet, UserPlugin } from "./types";
 import { currentKey } from "./keys";
 import { toHex } from "./crypto";
 
@@ -191,6 +191,25 @@ const DETAILS: Record<string, EvalDetail> = {
 
 let TOKENS: ApiToken[] = [];
 
+const PLUGINS: UserPlugin[] = [
+  {
+    id: "u-3f2a9c1d7e5b4a60",
+    title: "keyword-scorer",
+    owner_login: "demo-user",
+    public: false,
+    status: "ready",
+    kind: "scorer",
+    version: "1",
+    description: "按关键字给文本产出打分：每出现一个要求的关键字得 1 分",
+    runs_taskset_code: false,
+    model: false,
+    accepts: ["files"],
+    selftest: { status: "scored", score: 2, max: 3, detail: "2/3 keywords" },
+    created_at: "2026-10-03T08:00:00Z",
+    updated_at: "2026-10-03T08:04:00Z",
+  },
+];
+
 const delay = <T>(v: T, ms = 250) => new Promise<T>((r) => setTimeout(() => r(structuredClone(v)), ms));
 
 export const mockBackend: Backend = {
@@ -201,6 +220,18 @@ export const mockBackend: Backend = {
     const id = `u-${toHex(crypto.getRandomValues(new Uint8Array(8)))}`;
     TASKSETS.push({ name: id, version: "upload", stages: [], title: "我的题目包", owner_login: "demo-user", public: false, status: "packing" });
     return delay({ id, status: "packing" });
+  },
+  plugins: () => delay(PLUGINS),
+  async registerPlugin() {
+    const id = `u-${toHex(crypto.getRandomValues(new Uint8Array(8)))}`;
+    const now = new Date().toISOString();
+    PLUGINS.unshift({ id, owner_login: "demo-user", public: false, status: "building", created_at: now, updated_at: now });
+    return delay({ id, status: "building" });
+  },
+  async setPluginPublic(id, on) {
+    const p = PLUGINS.find((x) => x.id === id);
+    if (p) p.public = on;
+    return delay({ id, public: on });
   },
   async setTasksetPublic(id, on) {
     const t = TASKSETS.find((x) => x.name === id);

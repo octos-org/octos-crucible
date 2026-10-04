@@ -14,6 +14,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use crucible_core::BlobRef;
 use crucible_core::TaskSet;
+use crucible_core::plugins::UserPlugin;
 use crucible_core::taskset::{
     Aggregate, DEFAULT_RUNNER, Display, InteractiveRef, MAX_TOTAL_TIME_S, ModelDecl, ScorerRef,
     Stage,
@@ -52,6 +53,27 @@ pub struct PackSource {
     pub model: Option<ModelDecl>,
     pub total_time_limit_s: u64,
     pub stages: Vec<PackStage>,
+}
+
+impl PackSource {
+    pub fn read(source: &Path) -> Result<PackSource> {
+        let raw = std::fs::read_to_string(source)
+            .with_context(|| format!("reading {}", source.display()))?;
+        serde_json::from_str(&raw).with_context(|| format!("parsing {}", source.display()))
+    }
+
+    /// The user-uploaded plugins (`u-<16 hex>`) its scorers name, each once.
+    pub fn user_plugin_refs(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for sc in std::iter::once(&self.scorer)
+            .chain(self.stages.iter().filter_map(|s| s.scorer.as_ref()))
+        {
+            if crucible_core::plugins::is_user_plugin_id(&sc.name) && !out.contains(&sc.name) {
+                out.push(sc.name.clone());
+            }
+        }
+        out
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -130,6 +152,8 @@ pub fn zip_paths(root: &Path, paths: &[String]) -> Result<(Vec<u8>, BTreeSet<Str
 /// A checked source: what `pack` would store, before storing it.
 pub struct Prepared {
     pub src: PackSource,
+    /// The uploaded plugins its scorers name, as registered.
+    pub user_plugins: Vec<UserPlugin>,
     /// Per stage: (inputs zip, tests zip, inputs file count, tests file count).
     pub zips: Vec<(Vec<u8>, Vec<u8>, usize, usize)>,
 }
@@ -147,6 +171,7 @@ impl Prepared {
             display: src.display.clone(),
             model: src.model.clone(),
             total_time_limit_s: src.total_time_limit_s,
+            user_plugins: self.user_plugins.clone(),
             stages: src
                 .stages
                 .iter()
@@ -187,11 +212,16 @@ impl Prepared {
 /// run the taskset checks (format, stage ids, plugins in the registry,
 /// total time <= the platform limit). `user`: the rules for uploaded
 /// tasksets (only plugins marked `user` in the registry).
-pub fn prepare(source: &Path, src_dir: &Path, user: bool) -> Result<Prepared> {
-    let raw =
-        std::fs::read_to_string(source).with_context(|| format!("reading {}", source.display()))?;
-    let src: PackSource =
-        serde_json::from_str(&raw).with_context(|| format!("parsing {}", source.display()))?;
+///
+/// `user_plugins`: the uploaded plugins (`u-...`) the source may name
+/// (from the Worker: registered, and usable by the taskset's owner).
+pub fn prepare_with(
+    source: &Path,
+    src_dir: &Path,
+    user: bool,
+    user_plugins: &[UserPlugin],
+) -> Result<Prepared> {
+    let src = PackSource::read(source)?;
     if let Some(s) = src
         .stages
         .iter()
@@ -214,7 +244,17 @@ pub fn prepare(source: &Path, src_dir: &Path, user: bool) -> Result<Prepared> {
         }
         zips.push((inputs_zip, tests_zip, inputs.len(), tests.len()));
     }
-    let p = Prepared { src, zips };
+    let refs = src.user_plugin_refs();
+    let user_plugins: Vec<UserPlugin> = user_plugins
+        .iter()
+        .filter(|u| refs.contains(&u.name))
+        .cloned()
+        .collect();
+    let p = Prepared {
+        src,
+        zips,
+        user_plugins,
+    };
     let placeholder = BlobRef {
         sha256: "0".repeat(64),
         key_id: "0".repeat(16),
@@ -240,7 +280,20 @@ pub async fn pack(
     store: &Store,
     verbose: bool,
 ) -> Result<TaskSet> {
-    let p = prepare(source, src_dir, user)?;
+    pack_with(source, src_dir, user, &[], key, store, verbose).await
+}
+
+/// [`pack`] with the uploaded plugins the source may name.
+pub async fn pack_with(
+    source: &Path,
+    src_dir: &Path,
+    user: bool,
+    user_plugins: &[UserPlugin],
+    key: &PublicKey,
+    store: &Store,
+    verbose: bool,
+) -> Result<TaskSet> {
+    let p = prepare_with(source, src_dir, user, user_plugins)?;
     let mut blobs = Vec::new();
     for (s, (inputs_zip, tests_zip, ni, nt)) in p.src.stages.iter().zip(&p.zips) {
         let inputs_blob = store.put_sealed(key, inputs_zip).await?;
@@ -393,7 +446,7 @@ mod tests {
         let source = work.path().join("source.json");
         let user = true;
         std::fs::write(&source, SOURCE).unwrap();
-        let p = prepare(&source, src.path(), user).unwrap();
+        let p = prepare_with(&source, src.path(), user, &[]).unwrap();
         assert_eq!(p.zips[0].2, 2); // requirements.yaml + reference/a.png
         assert_eq!(p.zips[0].3, 2); // tests/a.spec.ts + tests/support/e2e.ts
         for (bad, why) in [
@@ -462,7 +515,10 @@ mod tests {
             ("{".into(), "not JSON"),
         ] {
             std::fs::write(&source, &bad).unwrap();
-            assert!(prepare(&source, src.path(), user).is_err(), "{why}");
+            assert!(
+                prepare_with(&source, src.path(), user, &[]).is_err(),
+                "{why}"
+            );
         }
         // Without user rules (built-in tasksets) any registered scorer is
         // accepted, and packager defaults come from the taskset level.
@@ -477,7 +533,7 @@ mod tests {
                 ),
         )
         .unwrap();
-        let p = prepare(&source, src.path(), false).unwrap();
+        let p = prepare_with(&source, src.path(), false, &[]).unwrap();
         let ts = p.taskset(vec![
             (
                 BlobRef {
@@ -494,7 +550,57 @@ mod tests {
         assert_eq!(ts.stages[1].packager, "files");
         assert!(ts.stages[1].packager_options.is_some());
         std::fs::write(&source, SOURCE.replace("\"playwright\"", "\"nope\"")).unwrap();
-        assert!(prepare(&source, src.path(), false).is_err());
+        assert!(prepare_with(&source, src.path(), false, &[]).is_err());
+    }
+
+    #[test]
+    fn uploaded_scorer_plugins() {
+        let src = tree();
+        let work = tempfile::tempdir().unwrap();
+        let source = work.path().join("source.json");
+        let id = "u-0123456789abcdef";
+        std::fs::write(
+            &source,
+            SOURCE
+                .replace("\"playwright\"", &format!("\"{id}\""))
+                .replace("\"web-app\"", "\"files\"")
+                .replace(", \"expected_total\": 1", ""),
+        )
+        .unwrap();
+        let plugin = |accepts: &[&str], model: bool| UserPlugin {
+            kind: crucible_core::plugins::Kind::Scorer,
+            name: id.into(),
+            version: "1".into(),
+            blob: BlobRef {
+                sha256: "a".repeat(64),
+                key_id: "1ffa702796eb5ee8".into(),
+            },
+            runs_taskset_code: !model,
+            model,
+            accepts: accepts.iter().map(|s| s.to_string()).collect(),
+        };
+        // Not registered for this owner: refused.
+        assert!(prepare_with(&source, src.path(), true, &[]).is_err());
+        let p = prepare_with(&source, src.path(), true, &[plugin(&["files"], false)]).unwrap();
+        let ts = p.taskset(vec![(plugin(&[], false).blob, plugin(&[], false).blob); 2]);
+        assert_eq!(ts.user_plugins.len(), 1);
+        ts.check_user_plugins().unwrap();
+        let ts: TaskSet = serde_json::from_str(&serde_json::to_string(&ts).unwrap()).unwrap();
+        assert!(
+            ts.plugin(crucible_core::plugins::Kind::Scorer, id)
+                .unwrap()
+                .is_user()
+        );
+        assert_eq!(ts.plugin_versions()[0].version, "1");
+        // Its traits are checked like a registered plugin's.
+        assert!(prepare_with(&source, src.path(), true, &[plugin(&["web-app"], false)]).is_err());
+        let with_model = std::fs::read_to_string(&source).unwrap().replace(
+            "\"aggregate\"",
+            "\"model\": {\"scorer\": \"required\"}, \"aggregate\"",
+        );
+        std::fs::write(&source, with_model).unwrap();
+        assert!(prepare_with(&source, src.path(), true, &[plugin(&[], false)]).is_err());
+        prepare_with(&source, src.path(), true, &[plugin(&[], true)]).unwrap();
     }
 
     #[test]
@@ -516,7 +622,7 @@ mod tests {
                 .into_inner();
             let d = tempfile::tempdir().unwrap();
             let root = unpack_source_zip(&zip, d.path()).unwrap();
-            assert!(prepare(&root.join("source.json"), &root, true).is_ok());
+            assert!(prepare_with(&root.join("source.json"), &root, true, &[]).is_ok());
         }
         let d = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(d.path().join("a")).unwrap();

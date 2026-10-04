@@ -104,15 +104,24 @@ curl -s https://crucible-worker.stratosphericus.workers.dev/tasksets
 
 Answer: `[{"name", "version", "stages": [{"name", "time_limit_s", "total"}]}]`. `total` is the number of tests in the stage and may be `null`. Stage numbers on the command line are 1-based positions in `stages`.
 
-### Your own task set (coming soon)
+### Your own task set and scorer
 
-Uploading private task sets through the website (题目包 page) is being rolled out and is not live yet. The format is a zip like `tasksets/hello-world/source` in the repository: `source.json` plus one directory per stage with the agent's inputs and the hidden tests; total time limit at most 18000 s; scorer `playwright` (`web-app` output) only. You can already check a task set locally with the same rules the platform uses:
+Uploaded task sets are private to the uploader unless an admin makes them public. The format is a zip (or directory) like `tasksets/hello-world/source` in the repository: `source.json` plus one directory per stage with the agent's inputs and the hidden tests; total time limit at most 18000 s; plugins offered to users (`playwright`, `llm-judge`, ...) or a scorer you uploaded yourself. Check locally with the same rules the platform uses, then upload (token from `CRUCIBLE_TOKEN`):
 
 ```sh
 crucible taskset validate my-tasks.zip
+crucible taskset upload my-tasks.zip --wait    # prints u-<16 hex>
 ```
 
-Once live, uploaded task sets appear in `GET /tasksets` (with your token) as `u-...` names, usable with `--taskset u-...`, private to the uploader unless an admin makes them public.
+Uploaded task sets appear in `GET /tasksets` (with your token) as `u-...` names, usable with `--taskset u-...`.
+
+A scorer of your own is a zip (or directory) with `plugin.json` (`{"schema": 1, "kind": "scorer", "name", "version", "runs_taskset_code", "model", "accepts"}`) and a `Dockerfile`; the image's entrypoint is called as `ENTRYPOINT --artifact /in/artifact --tests /in/tests --out /out/result.json --visibility hidden` and writes result.json v2 (docs/plugins.md §14 in the repository). The platform builds and self-tests it, then a task set refers to it as `"scorer": {"name": "u-..."}`:
+
+```sh
+crucible plugin upload my-scorer/ --wait       # prints u-<16 hex>
+crucible plugin status u-0123456789abcdef
+crucible plugin list
+```
 
 ## Submit
 

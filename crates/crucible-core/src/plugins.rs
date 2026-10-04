@@ -64,6 +64,11 @@ impl Plugin {
     pub fn is_builtin(&self) -> bool {
         self.implementation == "builtin"
     }
+
+    /// A user-uploaded plugin (docs/plugins.md §14).
+    pub fn is_user(&self) -> bool {
+        self.implementation == USER_IMPL
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,7 +106,7 @@ impl Registry {
         let mut seen = std::collections::HashSet::new();
         for p in &self.plugins {
             let id = format!("{} {}", p.kind.as_str(), p.name);
-            if !crate::is_slug(&p.name, 40) {
+            if !crate::is_slug(&p.name, 40) || is_user_plugin_id(&p.name) {
                 return Err(format!("{id}: bad name"));
             }
             if !seen.insert((p.kind, p.name.clone())) {
@@ -183,6 +188,159 @@ impl Registry {
     }
 }
 
+/// `u-` + 16 lower-case hex: the platform id of a user-uploaded plugin
+/// (docs/plugins.md §14). Registry names never look like this.
+pub fn is_user_plugin_id(s: &str) -> bool {
+    crate::taskset::is_user_taskset_id(s)
+}
+
+/// A plugin package's own declaration: `plugin.json` at the root of the
+/// uploaded zip, next to its `Dockerfile` (docs/plugins.md §14).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginManifest {
+    pub schema: u32,
+    /// Only `scorer` for now.
+    pub kind: Kind,
+    /// The uploader's name for it (`[a-z0-9][a-z0-9-]{0,39}`); the
+    /// platform registers it under an id `u-<16 hex>`.
+    pub name: String,
+    pub version: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// Whether it executes taskset files as code. Defaults to true.
+    #[serde(default = "yes")]
+    pub runs_taskset_code: bool,
+    /// Whether a taskset may give it the submitter's model (through the meter).
+    #[serde(default)]
+    pub model: bool,
+    /// The packagers whose output it can score (empty: any).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accepts: Vec<String>,
+}
+
+fn version_ok(v: &str) -> bool {
+    !v.is_empty() && v.len() <= 20 && v.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.')
+}
+
+impl PluginManifest {
+    pub fn parse(raw: &[u8]) -> Result<PluginManifest, String> {
+        let m: PluginManifest =
+            serde_json::from_slice(raw).map_err(|e| format!("plugin.json: {e}"))?;
+        m.check()?;
+        Ok(m)
+    }
+
+    pub fn check(&self) -> Result<(), String> {
+        if self.schema != 1 {
+            return Err("plugin.json: schema must be 1".into());
+        }
+        if self.kind != Kind::Scorer {
+            return Err("plugin.json: only scorer plugins can be uploaded for now".into());
+        }
+        if !crate::is_slug(&self.name, 40) {
+            return Err("plugin.json: name must match [a-z0-9][a-z0-9-]{0,39}".into());
+        }
+        if !version_ok(&self.version) {
+            return Err("plugin.json: version must be 1-20 of [A-Za-z0-9.]".into());
+        }
+        if self.description.chars().count() > 300 || self.description.chars().any(char::is_control)
+        {
+            return Err("plugin.json: description ≤ 300 characters, no control characters".into());
+        }
+        check_traits(self.runs_taskset_code, self.model, &self.accepts)
+            .map_err(|e| format!("plugin.json: {e}"))
+    }
+
+    /// The registered form, as a taskset pins it.
+    pub fn pin(&self, id: &str, blob: crate::BlobRef) -> UserPlugin {
+        UserPlugin {
+            kind: self.kind,
+            name: id.to_owned(),
+            version: self.version.clone(),
+            blob,
+            runs_taskset_code: self.runs_taskset_code,
+            model: self.model,
+            accepts: self.accepts.clone(),
+        }
+    }
+}
+
+fn check_traits(runs_taskset_code: bool, model: bool, accepts: &[String]) -> Result<(), String> {
+    if model && runs_taskset_code {
+        return Err("a plugin that runs taskset code may not have a model".into());
+    }
+    if accepts.len() > 8 {
+        return Err("accepts: at most 8 packagers".into());
+    }
+    for a in accepts {
+        if registry().get(Kind::Packager, a).is_none() {
+            return Err(format!("accepts unknown packager {a:?}"));
+        }
+    }
+    Ok(())
+}
+
+/// A user-uploaded plugin as a registered taskset pins it (`user_plugins`
+/// in taskset.json): its id, version, traits and the sealed package. The
+/// platform runs it only inside containers of the scoring job (its image
+/// is built there from the package), through the generic shell
+/// `scorers/_user/score.sh`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserPlugin {
+    pub kind: Kind,
+    /// `u-<16 hex>`.
+    pub name: String,
+    pub version: String,
+    /// The sealed package (a zip: plugin.json, Dockerfile, build context).
+    pub blob: crate::BlobRef,
+    #[serde(default = "yes")]
+    pub runs_taskset_code: bool,
+    #[serde(default)]
+    pub model: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accepts: Vec<String>,
+}
+
+/// `impl` of a user plugin seen as a [`Plugin`].
+pub const USER_IMPL: &str = "user";
+
+impl UserPlugin {
+    pub fn check(&self) -> Result<(), String> {
+        let id = format!("{} {}", self.kind.as_str(), self.name);
+        if !is_user_plugin_id(&self.name) {
+            return Err(format!("{id}: a user plugin id is u-<16 hex>"));
+        }
+        if self.kind != Kind::Scorer {
+            return Err(format!("{id}: only scorer plugins can be uploaded"));
+        }
+        if !version_ok(&self.version) {
+            return Err(format!("{id}: bad version"));
+        }
+        if !self.blob.is_valid() {
+            return Err(format!("{id}: bad blob reference"));
+        }
+        check_traits(self.runs_taskset_code, self.model, &self.accepts)
+            .map_err(|e| format!("{id}: {e}"))
+    }
+
+    /// As a registry entry (offered to uploaded tasksets).
+    pub fn as_plugin(&self) -> Plugin {
+        Plugin {
+            kind: self.kind,
+            name: self.name.clone(),
+            version: self.version.clone(),
+            implementation: USER_IMPL.into(),
+            interactive: false,
+            user: true,
+            runs_taskset_code: self.runs_taskset_code,
+            model: self.model,
+            accepts: self.accepts.clone(),
+        }
+    }
+}
+
 /// The compiled-in registry. Its validity is a unit test, so this never
 /// fails in a released build.
 pub fn registry() -> &'static Registry {
@@ -250,6 +408,30 @@ mod tests {
             ),
         ] {
             assert!(Registry::parse(&base(bad)).is_err(), "{why}");
+        }
+    }
+
+    #[test]
+    fn plugin_manifest_rules() {
+        let ok = br#"{"schema":1,"kind":"scorer","name":"kw","version":"0.1","runs_taskset_code":false,"accepts":["files"]}"#;
+        let m = PluginManifest::parse(ok).unwrap();
+        let blob = crate::BlobRef {
+            sha256: "a".repeat(64),
+            key_id: "1ffa702796eb5ee8".into(),
+        };
+        let u = m.pin("u-0123456789abcdef", blob.clone());
+        u.check().unwrap();
+        assert!(u.as_plugin().is_user() && u.as_plugin().user);
+        assert!(m.pin("kw", blob).check().is_err());
+        for bad in [
+            r#"{"schema":1,"kind":"runner","name":"kw","version":"1"}"#,
+            r#"{"schema":1,"kind":"scorer","name":"KW","version":"1"}"#,
+            r#"{"schema":1,"kind":"scorer","name":"kw","version":"1","model":true}"#,
+            r#"{"schema":1,"kind":"scorer","name":"kw","version":"1","accepts":["zip"]}"#,
+            r#"{"schema":1,"kind":"scorer","name":"kw","version":"1","extra":1}"#,
+            r#"{"schema":2,"kind":"scorer","name":"kw","version":"1"}"#,
+        ] {
+            assert!(PluginManifest::parse(bad.as_bytes()).is_err(), "{bad}");
         }
     }
 }

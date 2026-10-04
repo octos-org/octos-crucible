@@ -131,7 +131,7 @@ pub async fn run(a: Args, s: &Secrets) -> Result<()> {
         a.out.join("pricing.json"),
     )?;
     // Tests, checkpoints and the credential leave only sealed.
-    for d in ["tests", "results"] {
+    for d in ["tests", "results", "plugins"] {
         super::sealed_only(&a.out.join(d), false)?;
     }
     if a.out.join("cred.sealed").exists() {

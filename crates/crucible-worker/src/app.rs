@@ -17,7 +17,8 @@ use crate::model::{
     parse_results, status_rank,
 };
 use crate::model::{
-    PackResult, TS_FAILED, TS_PACKING, TS_READY, UploadKind, UserTaskset, parse_pack_result,
+    PL_BUILDING, PL_FAILED, PL_READY, PackResult, PluginResult, TS_FAILED, TS_PACKING, TS_READY,
+    UploadKind, UserPluginRecord, UserTaskset, parse_pack_result, parse_plugin_result,
 };
 use crate::session;
 use crate::shard::{release_tag, sha256_hex};
@@ -163,6 +164,12 @@ impl<'a, B: Backend> App<'a, B> {
             ("POST", ["tasksets", id, "public"]) => self.set_taskset_public(req, id).await,
             ("GET", ["internal", "tasksets", id]) => self.internal_get_taskset(req, id).await,
             ("POST", ["internal", "tasksets", id]) => self.internal_taskset_result(req, id).await,
+            ("GET", ["plugins"]) => self.list_plugins(req).await,
+            ("POST", ["plugins"]) => self.create_plugin(req).await,
+            ("GET", ["plugins", id]) => self.get_plugin(req, id).await,
+            ("POST", ["plugins", id, "public"]) => self.set_plugin_public(req, id).await,
+            ("GET", ["internal", "plugins", id]) => self.internal_get_plugin(req, id).await,
+            ("POST", ["internal", "plugins", id]) => self.internal_plugin_result(req, id).await,
             ("POST", ["uploads"]) => self.upload(req).await,
             ("POST", ["evals"]) => self.create_eval(req).await,
             ("GET", ["evals"]) => self.list_evals(req).await,
@@ -184,6 +191,7 @@ impl<'a, B: Backend> App<'a, B> {
                 | ["me"]
                 | ["pubkey"]
                 | ["tasksets"]
+                | ["plugins", ..]
                 | ["uploads"]
                 | ["evals", ..]
                 | ["tokens", ..]
@@ -693,6 +701,19 @@ impl<'a, B: Backend> App<'a, B> {
         }
         match parse_pack_result(&req.body, id)? {
             PackResult::Ready(ts) => {
+                // Uploaded plugins: as registered, and usable by its owner.
+                for up in &ts.user_plugins {
+                    let rec = self.load_plugin(&up.name).await?;
+                    let ok = rec
+                        .as_ref()
+                        .is_some_and(|r| r.usable_by(u.owner_id) && r.plugin.as_ref() == Some(up));
+                    if !ok {
+                        return Err(ApiError::bad_request(format!(
+                            "plugin {} is not a ready plugin the owner may use",
+                            up.name
+                        )));
+                    }
+                }
                 u.title = ts.title.clone();
                 u.taskset = Some(serde_json::to_value(&ts).expect("json"));
                 u.status = TS_READY.into();
@@ -715,6 +736,224 @@ impl<'a, B: Backend> App<'a, B> {
         Ok(Resp::json(200, &json!({"ok": true, "status": u.status})))
     }
 
+    // ---- user plugins ---------------------------------------------------
+
+    async fn load_plugin(&self, id: &str) -> Result<Option<UserPluginRecord>> {
+        if !crucible_core::plugins::is_user_plugin_id(id) {
+            return Ok(None);
+        }
+        self.db().plugin(id).await.map_err(|e| self.storage_err(e))
+    }
+
+    /// `GET /plugins`: the caller's own uploads and the public ones
+    /// (anonymous: public only; admins with `?all=1`: every upload).
+    async fn list_plugins(&self, req: &Req) -> Result<Resp> {
+        let p = match req.bearer() {
+            Some(_) => self.principal(req).await.ok(),
+            None => None,
+        };
+        let all = query_get(&parse_query(&req.query), "all") == Some("1")
+            && p.as_ref().is_some_and(|p| p.is_admin);
+        let list = self
+            .db()
+            .list_plugins(
+                p.as_ref().map(|p| p.github_id),
+                all,
+                MAX_LISTED_USER_TASKSETS,
+            )
+            .await
+            .map_err(|e| self.storage_err(e))?;
+        let out: Vec<serde_json::Value> = list.iter().map(UserPluginRecord::view).collect();
+        Ok(Resp::json(200, &out))
+    }
+
+    /// `POST /plugins {"upload_hash"}`: register an uploaded plugin package.
+    async fn create_plugin(&self, req: &Req) -> Result<Resp> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Body {
+            upload_hash: String,
+        }
+        let p = self.principal(req).await?;
+        if req.body.len() > 4096 {
+            return Err(ApiError::too_large(4096));
+        }
+        let body: Body = serde_json::from_slice(&req.body)
+            .map_err(|e| ApiError::bad_request(format!("invalid request body: {e}")))?;
+        if !crate::shard::is_hash(&body.upload_hash) {
+            return Err(ApiError::bad_request(
+                "upload_hash must be 64 lower-case hex characters",
+            ));
+        }
+        let upload = self.own_upload(&p, &body.upload_hash).await?;
+        if upload.kind != UploadKind::Plugin {
+            return Err(ApiError::bad_request(format!(
+                "upload_hash was uploaded as {}, not plugin",
+                upload.kind.as_str()
+            )));
+        }
+        let id = format!("u-{}", hex::encode(self.b.random_bytes(8)));
+        let now = rfc3339(self.b.now_s());
+        let mut u = UserPluginRecord {
+            id: id.clone(),
+            owner_id: p.github_id,
+            owner_login: p.login.clone(),
+            upload_hash: body.upload_hash.clone(),
+            status: PL_BUILDING.into(),
+            error: None,
+            public: false,
+            title: None,
+            plugin: None,
+            info: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        if !self
+            .db()
+            .add_plugin(&u)
+            .await
+            .map_err(|e| self.storage_err(e))?
+        {
+            return Err(ApiError::conflict("plugin id collision; retry"));
+        }
+        let worker_url = self
+            .cfg
+            .worker_url
+            .clone()
+            .unwrap_or_else(|| req.origin.clone());
+        let inputs = json!({
+            "plugin_id": id,
+            "source": format!("blob:{}", body.upload_hash),
+            "results_url": format!("{worker_url}/internal/plugins/{id}"),
+        });
+        if let Err(e) = self.gh().dispatch(&self.cfg.plugin_workflow, &inputs).await {
+            u.status = PL_FAILED.into();
+            u.error = Some("could not start building; please retry".into());
+            u.updated_at = rfc3339(self.b.now_s());
+            let _ = self.db().finish_plugin(&u).await;
+            return Err(e);
+        }
+        Ok(Resp::json(201, &json!({"id": id, "status": PL_BUILDING})))
+    }
+
+    async fn get_plugin(&self, req: &Req, id: &str) -> Result<Resp> {
+        let p = self.principal(req).await?;
+        let u = self
+            .load_plugin(id)
+            .await?
+            .filter(|u| u.visible_to(p.github_id, p.is_admin))
+            .ok_or_else(|| ApiError::not_found("no such plugin"))?;
+        Ok(Resp::json(200, &u.view()))
+    }
+
+    /// `POST /plugins/:id/public {"public": bool}` (admins only).
+    async fn set_plugin_public(&self, req: &Req, id: &str) -> Result<Resp> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Body {
+            public: bool,
+        }
+        let p = self.principal(req).await?;
+        authz::require_admin(&p)?;
+        let body: Body = serde_json::from_slice(&req.body)
+            .map_err(|e| ApiError::bad_request(format!("invalid request body: {e}")))?;
+        let u = self
+            .load_plugin(id)
+            .await?
+            .ok_or_else(|| ApiError::not_found("no such plugin"))?;
+        if body.public && u.status != PL_READY {
+            return Err(ApiError::conflict("only a ready plugin can be made public"));
+        }
+        self.db()
+            .set_plugin_public(&u.id, body.public, &rfc3339(self.b.now_s()))
+            .await
+            .map_err(|e| self.storage_err(e))?;
+        self.b.log(&format!(
+            "admin {} set plugin {id} public={}",
+            p.github_id, body.public
+        ));
+        Ok(Resp::json(200, &json!({"id": u.id, "public": body.public})))
+    }
+
+    fn internal_plugin_id<'i>(&self, req: &Req, id: &'i str) -> Result<&'i str> {
+        self.internal_auth(req)?;
+        if !crucible_core::plugins::is_user_plugin_id(id) {
+            return Err(ApiError::bad_request("plugin id must be u-<16 hex>"));
+        }
+        Ok(id)
+    }
+
+    /// `GET /internal/plugins/:id?taskset=T`: the pinned plugin, only if
+    /// the owner of user taskset `T` may use it (taskset-pack's check).
+    async fn internal_get_plugin(&self, req: &Req, id: &str) -> Result<Resp> {
+        let id = self.internal_plugin_id(req, id)?;
+        let tid = query_get(&parse_query(&req.query), "taskset")
+            .filter(|t| is_user_taskset_id(t))
+            .ok_or_else(|| ApiError::bad_request("taskset=u-<16 hex> is required"))?
+            .to_owned();
+        let ts = self
+            .load_user_taskset(&tid)
+            .await?
+            .ok_or_else(|| ApiError::not_found("no such taskset"))?;
+        let u = self
+            .load_plugin(id)
+            .await?
+            .ok_or_else(|| ApiError::not_found("no such plugin"))?;
+        if u.status != PL_READY {
+            return Err(ApiError::conflict(format!("plugin is {}", u.status)));
+        }
+        if !u.usable_by(ts.owner_id) {
+            return Err(ApiError::forbidden(
+                "this plugin is private to another user",
+            ));
+        }
+        Ok(Resp::json(200, u.plugin.as_ref().expect("ready")))
+    }
+
+    /// `POST /internal/plugins/:id`: the plugin-pack outcome.
+    async fn internal_plugin_result(&self, req: &Req, id: &str) -> Result<Resp> {
+        let id = self.internal_plugin_id(req, id)?;
+        let mut u = self
+            .load_plugin(id)
+            .await?
+            .ok_or_else(|| ApiError::not_found("no such plugin"))?;
+        if u.status != PL_BUILDING {
+            return Err(ApiError::conflict(format!(
+                "plugin is already {}",
+                u.status
+            )));
+        }
+        match parse_plugin_result(&req.body, id)? {
+            PluginResult::Ready {
+                plugin,
+                title,
+                info,
+            } => {
+                if plugin.blob.sha256 != u.upload_hash {
+                    return Err(ApiError::bad_request("plugin.blob must be the upload"));
+                }
+                u.plugin = Some(*plugin);
+                u.title = Some(title).filter(|t| !t.is_empty());
+                u.info = Some(info);
+                u.status = PL_READY.into();
+            }
+            PluginResult::Failed(e) => {
+                u.error = Some(e);
+                u.status = PL_FAILED.into();
+            }
+        }
+        u.updated_at = rfc3339(self.b.now_s());
+        if !self
+            .db()
+            .finish_plugin(&u)
+            .await
+            .map_err(|e| self.storage_err(e))?
+        {
+            return Err(ApiError::conflict("plugin is already built"));
+        }
+        Ok(Resp::json(200, &json!({"ok": true, "status": u.status})))
+    }
+
     // ---- uploads --------------------------------------------------------
 
     async fn upload(&self, req: &Req) -> Result<Resp> {
@@ -722,7 +961,9 @@ impl<'a, B: Backend> App<'a, B> {
         let kind = req
             .header("x-upload-kind")
             .and_then(UploadKind::parse)
-            .ok_or_else(|| ApiError::bad_request("X-Upload-Kind must be agent, app or taskset"))?;
+            .ok_or_else(|| {
+                ApiError::bad_request("X-Upload-Kind must be agent, app, taskset or plugin")
+            })?;
         if req.body.len() > MAX_UPLOAD {
             return Err(ApiError::too_large(MAX_UPLOAD));
         }

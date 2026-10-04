@@ -13,6 +13,7 @@ import type {
   NewApiToken,
   TaskSet,
   UploadKind,
+  UserPlugin,
 } from "./types";
 import type { PublicKeyInfo } from "./crypto";
 import { mockBackend } from "./mock";
@@ -88,6 +89,10 @@ export interface Backend {
   upload(kind: UploadKind, sealed: Uint8Array): Promise<{ hash: string }>;
   registerTaskset(upload_hash: string): Promise<{ id: string; status: string }>;
   setTasksetPublic(id: string, on: boolean): Promise<{ id: string; public: boolean }>;
+  /** Uploaded plugins: own and public (`all`: admins list every one). */
+  plugins(all?: boolean): Promise<UserPlugin[]>;
+  registerPlugin(upload_hash: string): Promise<{ id: string; status: string }>;
+  setPluginPublic(id: string, on: boolean): Promise<{ id: string; public: boolean }>;
   createEval(body: CreateEval): Promise<{ eval_id: string }>;
   evals(): Promise<EvalSummary[]>;
   evalDetail(id: string): Promise<EvalDetail>;
@@ -149,6 +154,19 @@ export const httpBackend: Backend = {
     }),
   setTasksetPublic: (id, on) =>
     json(`/tasksets/${enc(id)}/public`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ public: on }),
+    }),
+  plugins: (all) => json(all ? "/plugins?all=1" : "/plugins"),
+  registerPlugin: (upload_hash) =>
+    json("/plugins", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ upload_hash }),
+    }),
+  setPluginPublic: (id, on) =>
+    json(`/plugins/${enc(id)}/public`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ public: on }),

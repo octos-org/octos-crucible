@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "kind": "scorer",
+  "name": "keyword-scorer",
+  "version": "1",
+  "description": "按关键字给文本产出打分：每出现一个要求的关键字得 1 分",
+  "runs_taskset_code": false,
+  "model": false,
+  "accepts": ["files"]
+}

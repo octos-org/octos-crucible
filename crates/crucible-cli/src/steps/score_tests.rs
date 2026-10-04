@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 
 use super::{Common, Secret, Secrets};
 use crate::executor::{BuildSpec, Executor};
@@ -41,18 +41,28 @@ pub async fn run(a: Args, s: &Secrets) -> Result<()> {
     let exec = crate::executor::backend()?;
     super::check_caps(super::spec("score-tests"), exec.caps())?;
 
-    // The container plugins the taskset uses, from the registry compiled
-    // into crucible; `crucible score` hands each its image.
-    let reg = crucible_core::plugins::registry();
+    // The container plugins the taskset uses: from the registry compiled
+    // into crucible, or uploaded (their sealed packages are in the
+    // handoff); `crucible score` hands each its image.
     for v in ts.plugin_versions() {
-        let Some(p) = reg
-            .plugins
-            .iter()
-            .find(|p| p.kind.as_str() == v.kind && p.name == v.name)
-        else {
+        let Some(p) = ts.plugins_of_kind(&v.kind, &v.name) else {
             bail!("{} {} is not registered", v.kind, v.name);
         };
         if p.is_builtin() {
+            continue;
+        }
+        let tag = format!("crucible-{}-{}:run", v.kind, p.name);
+        if p.is_user() {
+            let sealed = h.join("plugins").join(format!("{}.sealed", p.name));
+            let zip = crucible_crypto::open(&keys, &std::fs::read(&sealed)?)
+                .map_err(|_| anyhow!("{} {}: package missing in the handoff", v.kind, p.name))?;
+            let tmp = tempfile::tempdir()?;
+            let (root, _) = crate::user_plugin::unpack(&zip, tmp.path())?;
+            drop(zip);
+            crate::user_plugin::build(&exec, &root, &tag)
+                .await
+                .map_err(|e| anyhow!("{} {}: {e:#}", v.kind, p.name))?;
+            eprintln!("{} {} (uploaded) ready", v.kind, p.name);
             continue;
         }
         let dir = h.join(&p.implementation);
@@ -60,7 +70,6 @@ pub async fn run(a: Args, s: &Secrets) -> Result<()> {
             bail!("{} {} missing in the handoff", v.kind, p.name);
         }
         if dir.join("image").is_dir() {
-            let tag = format!("crucible-{}-{}:run", v.kind, p.name);
             let log = tempfile::NamedTempFile::new()?;
             let b = BuildSpec {
                 dir: dir.join("image"),

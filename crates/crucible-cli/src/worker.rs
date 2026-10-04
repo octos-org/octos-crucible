@@ -140,6 +140,42 @@ impl Worker {
         Ok(())
     }
 
+    /// `GET /internal/plugins/:id?taskset=T`: an uploaded plugin as a
+    /// taskset pins it, if the owner of taskset `T` may use it (their own
+    /// ready plugin, or a public one).
+    pub async fn get_user_plugin(
+        &self,
+        id: &str,
+        taskset_id: &str,
+    ) -> Result<crucible_core::plugins::UserPlugin> {
+        let raw = self
+            .expect_ok(
+                Method::GET,
+                &format!("/internal/plugins/{id}?taskset={taskset_id}"),
+                None,
+            )
+            .await
+            .with_context(|| format!("plugin {id}"))?;
+        let p: crucible_core::plugins::UserPlugin = serde_json::from_slice(&raw)
+            .map_err(|e| anyhow!("plugin {id} from the Worker: {e}"))?;
+        if p.name != id {
+            bail!("plugin {id} from the Worker is named {:?}", p.name);
+        }
+        p.check().map_err(|e| anyhow!("{e}"))?;
+        Ok(p)
+    }
+
+    /// `POST /internal/plugins/:id`: the outcome of `plugin-pack`.
+    pub async fn plugin_result(&self, id: &str, body: &serde_json::Value) -> Result<()> {
+        self.expect_ok(
+            Method::POST,
+            &format!("/internal/plugins/{id}"),
+            Some(serde_json::to_vec(body)?),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// `POST /internal/status/:id`.
     pub async fn status(&self, eval_id: &str, status: &str) -> Result<()> {
         let body = serde_json::to_vec(&serde_json::json!({ "status": status }))?;
