@@ -1,0 +1,81 @@
+# Shared storage for multi-node evaluations (deploy/k8s/sim-multinode.sh):
+# an NFS server inside the cluster, its export on a local-path volume of
+# the trusted node, and storage class `nfs-rwx` (csi-driver-nfs) for the
+# evaluation volumes (`crucible eval k8s --rwx --storage-class nfs-rwx`).
+# Any other ReadWriteMany class of the cluster (NFS appliance, CephFS)
+# works the same; this one needs nothing outside the cluster but the
+# kernel's nfsd module on the node it runs on.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: crucible-system
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nfs-export
+  namespace: crucible-system
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 100Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nfs-server
+  namespace: crucible-system
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {app: nfs-server}
+  template:
+    metadata:
+      labels: {app: nfs-server}
+    spec:
+      nodeSelector:
+        crucible/pool: trusted
+      containers:
+        - name: nfs-server
+          image: itsthenetwork/nfs-server-alpine:12
+          env:
+            - {name: SHARED_DIRECTORY, value: /exports}
+          securityContext:
+            privileged: true
+          ports:
+            - {containerPort: 2049, protocol: TCP}
+          volumeMounts:
+            - {name: export, mountPath: /exports}
+      volumes:
+        - name: export
+          persistentVolumeClaim:
+            claimName: nfs-export
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nfs-server
+  namespace: crucible-system
+spec:
+  # Fixed: the storage class names it, the nodes mount it.
+  clusterIP: 10.43.200.201
+  selector: {app: nfs-server}
+  ports:
+    - {name: nfs, port: 2049, protocol: TCP}
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: nfs-rwx
+provisioner: nfs.csi.k8s.io
+parameters:
+  server: 10.43.200.201
+  share: /
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+mountOptions:
+  - nfsvers=4.1

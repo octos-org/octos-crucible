@@ -26,7 +26,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use serde_json::{Value, json};
 
-use crate::executor::k8s::{STEP_LABEL, dns_name, label_value};
+use crate::executor::k8s::{
+    STEP_LABEL, dns_name, label_value, parse_selector, place, selector_string,
+};
 use crate::steps::{Pool, Secret, StepSpec};
 
 #[derive(clap::Args)]
@@ -50,6 +52,20 @@ pub struct K8sArgs {
     /// Storage class of the evaluation's volume (default: the cluster's).
     #[arg(long)]
     pub storage_class: Option<String>,
+    /// The volume is ReadWriteMany (a shared storage class: NFS, CephFS):
+    /// steps and the Pods they start may run on any node of their pool.
+    /// Without it the volume is ReadWriteOnce and a step's Pods run on the
+    /// step's node.
+    #[arg(long)]
+    pub rwx: bool,
+    /// Nodes of the steps that start no untrusted code (handoff, publish)
+    /// and of the loader: `key=value[,key=value]` (default: any node).
+    #[arg(long, default_value = "")]
+    pub trusted_selector: String,
+    /// Nodes of the steps that run agents or uploaded tests (generate,
+    /// score-tests) and of every Pod they start (default: any node).
+    #[arg(long, default_value = "")]
+    pub sandbox_selector: String,
     /// The nodes limit processes per Pod (kubelet `pod-max-pids`).
     #[arg(long)]
     pub pids_limited: bool,
@@ -114,6 +130,10 @@ pub struct Cluster {
     pub dns: String,
     pub pids_limited: bool,
     pub timeout_s: u64,
+    /// The volume is ReadWriteMany: Pods need not share the step's node.
+    pub rwx: bool,
+    pub trusted: Vec<(String, String)>,
+    pub sandbox: Vec<(String, String)>,
 }
 
 /// The Job of one step: `crucible step <name> --secrets-dir ... <args>`
@@ -164,6 +184,8 @@ pub fn job_spec(
                 "CRUCIBLE_K8S_PIDS_LIMIT",
                 if c.pids_limited { "1" } else { "0" },
             ),
+            ("CRUCIBLE_K8S_SAME_NODE", if c.rwx { "0" } else { "1" }),
+            ("CRUCIBLE_K8S_NODE_SELECTOR", &selector_string(&c.sandbox)),
         ] {
             env.push(json!({"name": k, "value": v}));
         }
@@ -208,10 +230,11 @@ pub fn job_spec(
     if sandbox {
         pod["serviceAccountName"] = json!(SA);
     }
-    let pool = match step.needs.pool {
-        Pool::Trusted => "trusted",
-        Pool::Sandbox => "sandbox",
+    let (pool, selector) = match step.needs.pool {
+        Pool::Trusted => ("trusted", &c.trusted),
+        Pool::Sandbox => ("sandbox", &c.sandbox),
     };
+    place(&mut pod, selector);
     Ok(json!({
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -232,6 +255,9 @@ pub struct NsOpts {
     pub volume_size: String,
     pub storage_class: Option<String>,
     pub step_image: String,
+    pub rwx: bool,
+    /// The loader's nodes (the trusted pool).
+    pub trusted: Vec<(String, String)>,
 }
 
 /// The namespace's fixed objects: default deny, step Pods out, the
@@ -240,11 +266,23 @@ pub fn namespace_objects(ns: &str, eval_id: &str, a: &NsOpts) -> Vec<Value> {
     let mut pvc = json!({
         "apiVersion": "v1", "kind": "PersistentVolumeClaim",
         "metadata": {"name": PVC, "namespace": ns},
-        "spec": {"accessModes": ["ReadWriteOnce"], "resources": {"requests": {"storage": a.volume_size}}},
+        "spec": {"accessModes": [if a.rwx { "ReadWriteMany" } else { "ReadWriteOnce" }],
+                 "resources": {"requests": {"storage": a.volume_size}}},
     });
     if let Some(sc) = &a.storage_class {
         pvc["spec"]["storageClassName"] = json!(sc);
     }
+    let mut loader = json!({
+        "automountServiceAccountToken": false,
+        "enableServiceLinks": false,
+        "securityContext": {"runAsUser": UID, "runAsGroup": UID, "fsGroup": UID, "runAsNonRoot": true,
+                            "seccompProfile": {"type": "RuntimeDefault"}},
+        "containers": [{"name": "loader", "image": a.step_image, "command": ["sleep", "infinity"],
+                        "securityContext": {"allowPrivilegeEscalation": false, "capabilities": {"drop": ["ALL"]}},
+                        "volumeMounts": [{"name": "data", "mountPath": ROOT}]}],
+        "volumes": [{"name": "data", "persistentVolumeClaim": {"claimName": PVC}}],
+    });
+    place(&mut loader, &a.trusted);
     vec![
         json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": ns, "labels": {"crucible/eval": label_value(eval_id)}}}),
         json!({"apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy",
@@ -263,16 +301,7 @@ pub fn namespace_objects(ns: &str, eval_id: &str, a: &NsOpts) -> Vec<Value> {
                "subjects": [{"kind": "ServiceAccount", "name": SA, "namespace": ns}]}),
         json!({"apiVersion": "v1", "kind": "Pod",
         "metadata": {"name": LOADER, "namespace": ns, "labels": {"crucible/role": "loader"}},
-        "spec": {
-            "automountServiceAccountToken": false,
-            "enableServiceLinks": false,
-            "securityContext": {"runAsUser": UID, "runAsGroup": UID, "fsGroup": UID, "runAsNonRoot": true,
-                                "seccompProfile": {"type": "RuntimeDefault"}},
-            "containers": [{"name": "loader", "image": a.step_image, "command": ["sleep", "infinity"],
-                            "securityContext": {"allowPrivilegeEscalation": false, "capabilities": {"drop": ["ALL"]}},
-                            "volumeMounts": [{"name": "data", "mountPath": ROOT}]}],
-            "volumes": [{"name": "data", "persistentVolumeClaim": {"claimName": PVC}}],
-        }}),
+        "spec": loader}),
     ]
 }
 
@@ -337,8 +366,10 @@ pub struct Ended {
 
 impl K8s {
     /// The settings; [`K8s::bind`] names the evaluation.
-    pub fn new(a: &K8sArgs) -> K8s {
-        K8s {
+    pub fn new(a: &K8sArgs) -> Result<K8s> {
+        let trusted = parse_selector(&a.trusted_selector).context("--trusted-selector")?;
+        let sandbox = parse_selector(&a.sandbox_selector).context("--sandbox-selector")?;
+        Ok(K8s {
             ns: String::new(),
             cluster: Cluster {
                 step_image: a.step_image.clone(),
@@ -347,15 +378,20 @@ impl K8s {
                 dns: a.cluster_dns.clone(),
                 pids_limited: a.pids_limited,
                 timeout_s: a.step_timeout_s,
+                rwx: a.rwx,
+                trusted: trusted.clone(),
+                sandbox,
             },
             eval_id: String::new(),
             opts: NsOpts {
                 volume_size: a.volume_size.clone(),
                 storage_class: a.storage_class.clone(),
                 step_image: a.step_image.clone(),
+                rwx: a.rwx,
+                trusted,
             },
             ready: false,
-        }
+        })
     }
 
     pub fn bind(&mut self, eval_id: &str) {
@@ -620,6 +656,9 @@ mod tests {
             dns: "10.43.0.10".into(),
             pids_limited: true,
             timeout_s: 3600,
+            rwx: false,
+            trusted: vec![],
+            sandbox: vec![],
         }
     }
 
@@ -721,6 +760,73 @@ mod tests {
             !p["containers"][0]["env"]
                 .to_string()
                 .contains("CRUCIBLE_EXECUTOR")
+        );
+    }
+
+    #[test]
+    fn steps_go_to_their_pool() {
+        // Default: no pools, a ReadWriteOnce volume, Pods on the step's node.
+        let g = job("generate", &[]).unwrap();
+        let p = &g["spec"]["template"]["spec"];
+        assert!(p.get("nodeSelector").is_none() && p.get("tolerations").is_none());
+        let env = p["containers"][0]["env"].to_string();
+        assert!(env.contains(r#"{"name":"CRUCIBLE_K8S_SAME_NODE","value":"1"}"#));
+        let o = NsOpts {
+            volume_size: "1Gi".into(),
+            storage_class: None,
+            step_image: "i".into(),
+            rwx: false,
+            trusted: vec![],
+        };
+        let objs = namespace_objects("ns", "e", &o);
+        let pvc = objs
+            .iter()
+            .find(|o| o["kind"] == "PersistentVolumeClaim")
+            .unwrap();
+        assert_eq!(pvc["spec"]["accessModes"], json!(["ReadWriteOnce"]));
+
+        // Multi-node: shared volume, two pools.
+        let mut c = cluster();
+        c.rwx = true;
+        c.trusted = parse_selector("crucible/pool=trusted").unwrap();
+        c.sandbox = parse_selector("crucible/pool=sandbox").unwrap();
+        let on = |step: &str, secrets: &[Secret]| {
+            job_spec("ns", "j", spec(step), "/c", &[], secrets, &c).unwrap()["spec"]["template"]
+                ["spec"]
+                .clone()
+        };
+        for (step, pool) in [
+            ("generate", "sandbox"),
+            ("score-tests", "sandbox"),
+            ("handoff", "trusted"),
+            ("publish", "trusted"),
+        ] {
+            let p = on(step, &[]);
+            assert_eq!(p["nodeSelector"], json!({"crucible/pool": pool}), "{step}");
+            assert_eq!(p["tolerations"][0]["value"], pool, "{step}");
+        }
+        let env = on("generate", &[])["containers"][0]["env"].to_string();
+        assert!(env.contains(r#"{"name":"CRUCIBLE_K8S_SAME_NODE","value":"0"}"#));
+        assert!(
+            env.contains(
+                r#"{"name":"CRUCIBLE_K8S_NODE_SELECTOR","value":"crucible/pool=sandbox"}"#
+            )
+        );
+        let o = NsOpts {
+            rwx: true,
+            trusted: c.trusted.clone(),
+            ..o
+        };
+        let objs = namespace_objects("ns", "e", &o);
+        let pvc = objs
+            .iter()
+            .find(|o| o["kind"] == "PersistentVolumeClaim")
+            .unwrap();
+        assert_eq!(pvc["spec"]["accessModes"], json!(["ReadWriteMany"]));
+        let loader = objs.iter().find(|o| o["kind"] == "Pod").unwrap();
+        assert_eq!(
+            loader["spec"]["nodeSelector"],
+            json!({"crucible/pool": "trusted"})
         );
     }
 

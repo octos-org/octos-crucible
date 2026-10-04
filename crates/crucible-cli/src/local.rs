@@ -339,7 +339,7 @@ pub async fn eval_k8s(a: crate::k8s_eval::K8sArgs) -> Result<()> {
         Some(p) => std::path::absolute(p)?,
         None => std::env::current_exe()?,
     };
-    let k = crate::k8s_eval::K8s::new(&a);
+    let k = crate::k8s_eval::K8s::new(&a)?;
     run_eval(a.eval, Backend::K8s(Box::new(k)), exe).await
 }
 
