@@ -135,7 +135,14 @@ case "${1:-}" in
     echo "sandbox clean: no crucible containers, networks, volumes or rules left"
     ;;
   check)
-    docker pull -q "$PROBE" >/dev/null
+    # Pulled once per machine (several sandboxes may check at once).
+    if ! docker image inspect "$PROBE" >/dev/null 2>&1; then
+      for attempt in 1 2 3; do
+        docker pull -q "$PROBE" >/dev/null && break
+        [ "$attempt" = 3 ] && exit 1
+        sleep $((attempt * 5))
+      done
+    fi
     fail=0
     for name in dns_github http_example_com tcp_1_1_1_1_443 tcp_host_22; do
       case $name in

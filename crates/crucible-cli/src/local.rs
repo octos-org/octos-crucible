@@ -546,6 +546,12 @@ pub async fn eval_local(a: LocalArgs) -> Result<()> {
         serde_json::to_string_pretty(&drv.records)? + "\n",
     )?;
     result?;
+    let failed: Vec<&str> = drv
+        .records
+        .iter()
+        .filter(|r| !r.ok)
+        .map(|r| r.step.as_str())
+        .collect();
     let m = publish.join("manifest.json");
     let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&m)?)?;
     println!(
@@ -555,7 +561,11 @@ pub async fn eval_local(a: LocalArgs) -> Result<()> {
             "total_score": v["total_score"],
             "stages": v["replicas"].as_array().into_iter().flatten().flat_map(|r| r["stages"].as_array().cloned().unwrap_or_default()).map(|s| serde_json::json!({"stage": s["stage"], "score": s["score"]["score"], "status": s["score"]["status"]})).collect::<Vec<_>>(),
             "manifest": m,
+            "failed_steps": failed,
         })
     );
+    if !failed.is_empty() {
+        bail!("steps failed: {}", failed.join(", "));
+    }
     Ok(())
 }
