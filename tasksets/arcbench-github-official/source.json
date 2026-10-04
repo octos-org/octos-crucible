@@ -1,0 +1,55 @@
+{
+  "schema": 1,
+  "name": "arcbench-github-official",
+  "description": "ARC-Bench GitHub task, scored the way the official ARC-Bench runner scores it: submissions in the official template format (frontend/ + backend/ at the zip root, no Dockerfile) are installed, built, started and tested with the official runner's own code (pinned runner image). Same requirements and Playwright tests as arcbench-github (30 / 29 / 41).",
+  "scorer": {
+    "name": "arcbench-official",
+    "version": "1"
+  },
+  "aggregate": "sum",
+  "total_time_limit_s": 15600,
+  "stages": [
+    {
+      "id": "stage-1",
+      "dir": "github-stage-1",
+      "inputs": [
+        "requirements.yaml",
+        "reference"
+      ],
+      "tests": [
+        "tests"
+      ],
+      "output": "web-app",
+      "time_limit_s": 4800,
+      "expected_total": 30
+    },
+    {
+      "id": "stage-2",
+      "dir": "github-stage-2",
+      "inputs": [
+        "requirements.yaml",
+        "reference"
+      ],
+      "tests": [
+        "tests"
+      ],
+      "output": "web-app",
+      "time_limit_s": 4800,
+      "expected_total": 29
+    },
+    {
+      "id": "stage-3",
+      "dir": "github-stage-3",
+      "inputs": [
+        "requirements.yaml",
+        "reference"
+      ],
+      "tests": [
+        "tests"
+      ],
+      "output": "web-app",
+      "time_limit_s": 6000,
+      "expected_total": 41
+    }
+  ]
+}
