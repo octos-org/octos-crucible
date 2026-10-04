@@ -447,7 +447,7 @@ crucible eval local --root <仓库> --taskset hello-world --agent builtin:octos 
 
 ### 5.3 c. Kubernetes 后端
 
-**已实现（`crucible eval k8s`，`docs/kubernetes.md`）。** 与下面的计划相比：包搬运不走 blob 存储，每次评测一个命名空间和一个 PVC，所有步骤和容器都挂在 `/crucible`，驱动经装载 Pod 拷入拷出；快照不需要边车，步骤进程直接读卷上的工作目录（容器与步骤同节点）；没有 MinIO、Pod Security 标签和 RuntimeClass；可信与沙箱步骤暂不分节点池；新 Pod 的 NetworkPolicy 空窗由 init 容器 `netgate` 挡住；`--network container:` 不支持（arcbench-official 打分器只能用 Docker 后端）。
+**已实现（`crucible eval k8s`，`docs/kubernetes.md`）。** 与下面的计划相比：包搬运不走 blob 存储，每次评测一个命名空间和一个 PVC，所有步骤和容器都挂在 `/crucible`，驱动经装载 Pod 拷入拷出；快照不需要边车，步骤进程直接读卷上的工作目录（同一个卷，单节点或共享存储）；没有 MinIO、Pod Security 标签和 RuntimeClass；多节点时评测卷用 ReadWriteMany（`--rwx`），可信与沙箱步骤按 `--trusted-selector`/`--sandbox-selector` 分节点池（nodeSelector + 同名污点容忍）；新 Pod 的 NetworkPolicy 空窗由 init 容器 `netgate` 挡住；`--network container:` 不支持（arcbench-official 打分器只能用 Docker 后端）。
 
 **要改什么：**
 

@@ -11,8 +11,12 @@
 //!   (`CRUCIBLE_K8S_ROOT`) in the step Pod and in every Pod it starts; a
 //!   host path of a container spec must lie under it and becomes a
 //!   `subPath` of that volume, a named volume is the directory
-//!   `.volumes/<name>` on it. Pods run on the step's node (required node
-//!   affinity), so a ReadWriteOnce `local-path` volume works.
+//!   `.volumes/<name>` on it. With a ReadWriteOnce volume (`local-path`)
+//!   Pods run on the step's node (required node affinity); with a
+//!   ReadWriteMany one (`CRUCIBLE_K8S_SAME_NODE=0`) on any node of the
+//!   sandbox pool (`CRUCIBLE_K8S_NODE_SELECTOR`, with matching
+//!   tolerations), except Pods with a named volume, which stay on the
+//!   step's node (named volumes may carry FIFOs, node-local).
 //! - **Networks.** The namespace denies everything by default. A pod on an
 //!   internal network carries the label `net.crucible/<net>=1` and the
 //!   network's policy lets its members reach each other only; aliases are
@@ -86,6 +90,11 @@ pub struct Conf {
     pub dns: String,
     /// `CRUCIBLE_K8S_PIDS_LIMIT=1`: the nodes limit processes per Pod.
     pub pids_limit: bool,
+    /// `CRUCIBLE_K8S_SAME_NODE` (default 1): Pods on the step's node (a
+    /// ReadWriteOnce volume); 0: anywhere in the pool (ReadWriteMany).
+    pub same_node: bool,
+    /// `CRUCIBLE_K8S_NODE_SELECTOR` (`k=v,...`): the sandbox pool's nodes.
+    pub node_selector: Vec<(String, String)>,
 }
 
 impl Conf {
@@ -109,8 +118,62 @@ impl Conf {
             buildkit: get("CRUCIBLE_K8S_BUILDKIT")?,
             dns: opt("CRUCIBLE_K8S_DNS", "10.43.0.10"),
             pids_limit: opt("CRUCIBLE_K8S_PIDS_LIMIT", "0") == "1",
+            same_node: opt("CRUCIBLE_K8S_SAME_NODE", "1") != "0",
+            node_selector: parse_selector(&opt("CRUCIBLE_K8S_NODE_SELECTOR", ""))?,
         })
     }
+}
+
+/// A node selector `key=value[,key=value]` (empty: none).
+pub fn parse_selector(s: &str) -> Result<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    for kv in s.split(',').map(str::trim).filter(|x| !x.is_empty()) {
+        let (k, v) = kv
+            .split_once('=')
+            .ok_or_else(|| anyhow!("node selector {kv:?}: key=value"))?;
+        let ok = |x: &str| {
+            !x.is_empty()
+                && x.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "._-/".contains(c))
+        };
+        if !ok(k) || !(v.is_empty() || ok(v)) || v.contains('/') {
+            bail!("node selector {kv:?}");
+        }
+        out.push((k.to_owned(), v.to_owned()));
+    }
+    Ok(out)
+}
+
+/// `selector` as `k=v,...` (the environment form).
+pub fn selector_string(selector: &[(String, String)]) -> String {
+    selector
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Pin a Pod spec to a pool: `nodeSelector` (merged with what is there)
+/// and a toleration per label (`key=value:NoSchedule`, so the pool's nodes
+/// may be tainted with their own label to keep other Pods off).
+pub fn place(spec: &mut Value, selector: &[(String, String)]) {
+    if selector.is_empty() {
+        return;
+    }
+    if !spec["nodeSelector"].is_object() {
+        spec["nodeSelector"] = json!({});
+    }
+    for (k, v) in selector {
+        spec["nodeSelector"][k] = json!(v);
+    }
+    spec["tolerations"] = json!(
+        selector
+            .iter()
+            .map(
+                |(k, v)| json!({"key": k, "operator": "Equal", "value": v, "effect": "NoSchedule"})
+            )
+            .collect::<Vec<_>>()
+    );
 }
 
 /// A DNS-1123 name (Pods, policies): lowercase, `[a-z0-9-]`, at most 63;
@@ -347,9 +410,6 @@ pub fn pod_spec(conf: &Conf, c: &ContainerSpec, aliases: &[(String, String)]) ->
         "enableServiceLinks": false,
         "shareProcessNamespace": c.init,
         "terminationGracePeriodSeconds": 30,
-        "affinity": {"nodeAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": {
-            "nodeSelectorTerms": [{"matchExpressions": [{
-                "key": "kubernetes.io/hostname", "operator": "In", "values": [conf.node]}]}]}}},
         "securityContext": {"seccompProfile": {"type": "RuntimeDefault"}},
         "containers": [ctr],
         "volumes": volumes,
@@ -360,10 +420,23 @@ pub fn pod_spec(conf: &Conf, c: &ContainerSpec, aliases: &[(String, String)]) ->
     if c.network != Network::Default {
         spec["initContainers"] = json!([netgate(conf)]);
     }
+    // The step's node: with a ReadWriteOnce volume always; with a shared
+    // one for containers on a named volume, which may be node-local IPC
+    // (astro-v4's FIFOs: a FIFO on NFS connects only on one node).
+    let pin = conf.same_node
+        || c.mounts
+            .iter()
+            .any(|m| matches!(m.src, MountSrc::Volume(_)));
+    if pin {
+        spec["affinity"] = json!({"nodeAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": {
+            "nodeSelectorTerms": [{"matchExpressions": [{
+                "key": "kubernetes.io/hostname", "operator": "In", "values": [conf.node]}]}]}}});
+    }
     if let Some(p) = &c.platform {
         let arch = p.rsplit('/').next().unwrap_or(p);
         spec["nodeSelector"] = json!({"kubernetes.io/arch": arch});
     }
+    place(&mut spec, &conf.node_selector);
     if !aliases.is_empty() {
         let mut by_ip: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
         for (a, ip) in aliases {
@@ -1292,6 +1365,8 @@ mod tests {
             buildkit: "tcp://buildkitd.crucible-system:1234".into(),
             dns: "10.43.0.10".into(),
             pids_limit: true,
+            same_node: true,
+            node_selector: vec![],
         }
     }
 
@@ -1378,6 +1453,65 @@ mod tests {
             env.contains(&json!({"name": "OPENAI_BASE_URL", "value": "http://10.42.0.9:8787/v1"}))
         );
         assert_eq!(c["command"], json!(["/run.sh"]));
+    }
+
+    #[test]
+    fn shared_volume_pods_go_to_the_sandbox_pool_not_the_step_node() {
+        // Single node (default): no pool, the step's node, as before.
+        let s = pod_spec(&conf(), &agent(), &[]).unwrap()["spec"].clone();
+        assert!(s.get("nodeSelector").is_none() && s.get("tolerations").is_none());
+        // ReadWriteMany volume and a sandbox pool.
+        let mut cf = conf();
+        cf.same_node = false;
+        cf.node_selector = parse_selector("crucible/pool=sandbox").unwrap();
+        let s = pod_spec(&cf, &agent(), &[]).unwrap()["spec"].clone();
+        assert!(s.get("affinity").is_none());
+        assert_eq!(s["nodeSelector"], json!({"crucible/pool": "sandbox"}));
+        // A named volume (FIFOs): the step's node, still in the pool.
+        let mut c = agent();
+        c.mounts.push(Mount {
+            src: MountSrc::Volume("pipes".into()),
+            dst: "/pipes".into(),
+            read_only: false,
+        });
+        let s = pod_spec(&cf, &c, &[]).unwrap()["spec"].clone();
+        assert_eq!(
+            s["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"]
+                [0]["matchExpressions"][0]["values"],
+            json!(["n1"])
+        );
+        assert_eq!(s["nodeSelector"], json!({"crucible/pool": "sandbox"}));
+        assert_eq!(
+            s["tolerations"],
+            json!([{"key": "crucible/pool", "operator": "Equal", "value": "sandbox", "effect": "NoSchedule"}])
+        );
+        // --platform keeps the pool.
+        let mut c = agent();
+        c.platform = Some("linux/arm64".into());
+        let s = pod_spec(&cf, &c, &[]).unwrap()["spec"].clone();
+        assert_eq!(
+            s["nodeSelector"],
+            json!({"kubernetes.io/arch": "arm64", "crucible/pool": "sandbox"})
+        );
+    }
+
+    #[test]
+    fn node_selectors_parse() {
+        assert_eq!(parse_selector("").unwrap(), vec![]);
+        assert_eq!(
+            parse_selector("crucible/pool=sandbox, zone=a").unwrap(),
+            vec![
+                ("crucible/pool".to_string(), "sandbox".to_string()),
+                ("zone".into(), "a".into())
+            ]
+        );
+        assert_eq!(
+            selector_string(&parse_selector("a=b,c=d").unwrap()),
+            "a=b,c=d"
+        );
+        for bad in ["pool", "=x", "a=b c", "a=b/c", "a b=c"] {
+            assert!(parse_selector(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

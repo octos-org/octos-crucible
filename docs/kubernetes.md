@@ -66,6 +66,9 @@ crucible eval k8s --root <仓库> --taskset hello-world --agent builtin:octos \
 | `--cluster-dns` | `10.43.0.10` | 集群 DNS 服务地址（网络闸门和探测用） |
 | `--volume-size` | `20Gi` | 每次评测的卷大小 |
 | `--storage-class` | 集群默认 | 卷的存储类 |
+| `--rwx` | 否 | 卷是 ReadWriteMany（共享存储类）：步骤和它起的 Pod 可以落在池内任意节点（见"多节点"） |
+| `--trusted-selector` | 任意节点 | handoff、publish 和装载 Pod 的节点，`键=值[,键=值]` |
+| `--sandbox-selector` | 任意节点 | generate、score-tests 以及它们起的所有 Pod 的节点 |
 | `--pids-limited` | 否 | 声明节点限制了每个 Pod 的进程数（kubelet `pod-max-pids`）；不声明时起容器的步骤拒绝运行 |
 | `--crucible-bin` | 驱动自己 | 拷到卷上的 `crucible`（Linux） |
 | `--step-timeout-s` | 21600 | 每步上限（Job 的 `activeDeadlineSeconds`） |
@@ -104,7 +107,8 @@ crucible eval k8s --root <仓库> --taskset hello-world --agent builtin:octos \
 | 宿主机路径挂载 | 评测卷的 `subPath`；不在卷下的路径直接报错 |
 | 命名卷 | 卷上的 `.volumes/<名字>` |
 | `--platform` | `nodeSelector kubernetes.io/arch` |
-| — | 节点亲和：与步骤 Pod 同一节点（`local-path` 这种 ReadWriteOnce 卷可用） |
+| — | 节点：默认与步骤 Pod 同一节点（节点亲和，ReadWriteOnce 卷可用）；`--rwx` 时沙箱池内任意节点，但挂了命名卷的容器仍与步骤同节点（命名卷里可能是 FIFO，只在一个节点内相通，例如 astro-v4 的 agent 与引擎） |
+| — | `--sandbox-selector` 的 `nodeSelector`，加上同名同值的 `NoSchedule` 容忍 |
 
 agent 的工作目录、HOME、`/req` 都是卷上的目录，步骤进程直接读工作目录打快照，不需要边车容器。
 
@@ -127,13 +131,58 @@ kubectl -n crucible-system exec deploy/registry -- registry garbage-collect /etc
 
 BuildKit 是无根模式（需要非受限的 seccomp/AppArmor 以使用用户命名空间），构建缓存在它自己的 `emptyDir` 里，Pod 重建即清空。
 
-## 多节点与存储注意事项
+## 多节点（含单机模拟）
 
-- **评测卷**：所有步骤和容器都挂同一个 PVC，并通过节点亲和跑在步骤所在节点上。单节点用 `local-path` 即可；多节点时，`local-path` 的卷绑定在第一个使用它的节点上（`WaitForFirstConsumer`），之后整次评测都在该节点上，能用但不分散负载。要让不同步骤落到不同节点，换成 ReadWriteMany 的存储类（NFS、CephFS 等集群自己的存储）并去掉节点亲和（目前写死在执行后端里，待做）。
-- **节点池**：目前可信步骤与沙箱步骤不区分节点（Job 上带了 `crucible/pool` 标签，未用于调度）。公开运营前应把 generate、score-tests 放到专用节点（nodeSelector + taint），可信步骤放别处。
-- **镜像仓库**：单副本、HTTP、`local-path` 卷；多节点时每个节点都要有同样的 `registries.yaml`。
-- **进程数**：每个节点都要设 `pod-max-pids`。
+默认（不带下面的参数）与单节点完全相同：ReadWriteOnce 卷，步骤起的 Pod 都和步骤在同一节点，不分节点池。多节点时：
+
+- **评测卷用 ReadWriteMany**：`--rwx --storage-class <共享存储类>`（NFS、CephFS 等集群自己的存储）。这样起的 Pod 不再钉在步骤所在节点，由调度器在沙箱池里放；只有挂命名卷的容器仍与步骤同节点（命名卷可能装 FIFO 这类只在一个节点内有效的东西）。不带 `--rwx` 时，`local-path` 的卷绑定在第一个用它的节点上，整次评测都在那个节点，能用但不分散负载。
+- **节点池**：`--trusted-selector`、`--sandbox-selector` 给步骤 Job（和装载 Pod、步骤起的 Pod）加 `nodeSelector` 和同名同值的 `NoSchedule` 容忍。给沙箱节点打上同样的污点（`kubectl taint node <节点> crucible/pool=sandbox:NoSchedule`），别的工作负载（镜像仓库、BuildKit、CoreDNS、可信步骤）就不会落上去。
+- **网络隔离**跨节点照样成立：NetworkPolicy 按 Pod 标签选择，与节点无关；k3s 的策略控制器在每个节点上执行。沙箱探测 Pod 和 agent Pod 可能与步骤不在同一节点，计量代理地址就是步骤 Pod 的 IP。
+- **镜像仓库**：每个节点都要有同样的 `registries.yaml`（`10.43.200.200:5000` 走 HTTP）；**进程数**：每个节点都设 `pod-max-pids`。
+
+```bash
+crucible eval k8s --root <仓库> --taskset astro-practice --app agent.zip --stage 1 \
+    --pids-limited --rwx --storage-class nfs-rwx \
+    --trusted-selector crucible/pool=trusted --sandbox-selector crucible/pool=sandbox
+```
+
+### 单机模拟：`deploy/k8s/sim-multinode.sh`
+
+用 k3d（k3s 跑在 Docker 容器里）在一台机器上起 1 个 server + 2 个 agent：
+
+| 节点 | 标签 / 污点 | 跑什么 |
+|---|---|---|
+| `k3d-crucible-sim-server-0` | `crucible/pool=trusted` | handoff、publish、装载 Pod；镜像仓库、BuildKit、NFS 服务端、CoreDNS |
+| `k3d-crucible-sim-agent-0`、`-agent-1` | `crucible/pool=sandbox`，污点 `crucible/pool=sandbox:NoSchedule` | generate、score-tests 以及它们起的所有 Pod |
+
+共享存储全在集群里，不用付费服务：一个 NFS 服务端 Pod（内核 nfsd，特权容器，导出目录在 server 节点的 `local-path` 卷上，固定地址 `10.43.200.201`）加 csi-driver-nfs，存储类 `nfs-rwx`（`deploy/k8s/sim-nfs.yaml`）。脚本还会装好镜像仓库、BuildKit、构建步骤镜像。
+
+```bash
+deploy/k8s/sim-multinode.sh up         # 约 5 分钟；中途失败再跑一次会接着做
+export KUBECONFIG=~/.kube/crucible-sim.yaml
+crucible eval k8s ... --pids-limited --rwx --storage-class nfs-rwx \
+    --trusted-selector crucible/pool=trusted --sandbox-selector crucible/pool=sandbox
+deploy/k8s/sim-multinode.sh down       # 删集群、卷和 kubeconfig
+```
+
+需要 Docker、kubectl、curl，内核模块 `nfsd`、`nfs`（脚本缺了用 sudo 加载）。拉镜像不稳时设 `CRUCIBLE_SIM_PROXY=http://主机:端口`：节点的 containerd、BuildKit 和脚本的下载都走它（集群内地址不走）。除了 Docker 里的东西，只装 `~/.local/bin/k3d` 和写 kubeconfig；宿主机的 k3s（若有）不受影响，两者网段在各自的容器里。
+
+`down` 先删评测命名空间（卷在 NFS 服务端还在时卸载），再让节点里残留的 NFS 挂载立刻失败（`/sys/fs/nfs/*/shutdown`，内核 6.8 以上），然后删集群。服务端先没了而挂载还在时，硬挂载会一直重试，节点容器就删不掉（实测遇到过一次）。
+
+**magicbook 实测**（2026-10-04，k3s v1.36.5，k3d v5.9.0，csi-driver-nfs v4.13.4）：
+
+| 项目 | 结果 | 落在哪 |
+|---|---|---|
+| hello-world app | 1.0（通过 1/1） | handoff、publish、装载 Pod 在 server；score-tests 在 agent-1，被测应用 Pod 在 agent-0，测试 Pod 在 agent-1（内部网络跨节点） |
+| 巡天 L1 app | 4458.556163（与单节点相同） | score-tests、agent、引擎都在 agent-1（命名卷 FIFO，与步骤同节点）；handoff、publish 在 server |
+| 两个评测并发（巡天 app + 假模型凭据；hello-world agent `builtin:math-prover` + 假模型凭据） | 4458.556163、0.0（与单节点相同） | agent 评测的 generate 在 agent-1、score-tests 在 agent-0，巡天的 score-tests 在 agent-1；两个沙箱的探测 Pod 都在 agent-0、与各自步骤不同节点，10 项全部拦住；agent Pod 在 agent-0、步骤在 agent-1，经跨节点的计量代理发出 3 个请求 |
+
+评测卷是 `RWX nfs-rwx`。第一次真跑巡天时 agent 与引擎被分到两个节点，FIFO 不通，得 0 分，于是加了"挂命名卷的容器与步骤同节点"。
+
+### 其他注意事项
+
 - **更强的隔离**：可以给 agent、应用、测试 Pod 设 `runtimeClassName: gvisor`/`kata`（未实现）。
+- **镜像仓库**：单副本、HTTP、`local-path` 卷。
 
 ## 已知限制
 
