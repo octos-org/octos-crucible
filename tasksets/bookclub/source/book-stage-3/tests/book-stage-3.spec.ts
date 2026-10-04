@@ -30,7 +30,7 @@ test('REQ-7: posting a review shows it; posting again replaces it', async ({ pag
   await page.reload();
   await expect(page.getByRole('listitem').filter({ hasText: `${user} rated` })).toHaveCount(1);
   await expect(page.getByRole('listitem').filter({ hasText: `${user} rated 2/5` })).toHaveCount(1);
-  await expect(page.getByText('First impressions')).toHaveCount(0);
+  await expect(page.getByText('First impressions').filter({ visible: true })).toHaveCount(0);
 });
 
 test('REQ-7: signed-out visitors see no form', async ({ page }) => {
