@@ -11,33 +11,49 @@ octos-crucible 是评测 coding agent 的基础设施：运行 agent、计量、
 
 使用条件：GitHub 登录即可，不限次数，管理员可封禁。
 
-## 3. 模块
+## 3. 核心与插件
 
-模块之间只通过约定好的文件格式交互，每一块都可单独替换。
+核心只管六件事：调度、隔离与安全、计量、存储、凭据、结果汇总。与某一种评测相关的一切（agent 怎样产生产出、产出打成什么格式、怎样判分、分数表示什么、阶段怎样汇总）都由插件和题目包声明，核心只按名字调用。目标是让新的评测形式（浏览器测试、单元测试、交互式环境、模型评判……）只需要加插件和题目包，不改核心。接口细节见 `docs/plugins.md`；插件化按 §10 分三步落地，落地前现行行为以 `docs/scorer-contract.md` 和 `docs/agent-contract.md` 为准。
+
+**核心**
 
 | 模块 | 职责 |
 |---|---|
-| 题目包 taskset | 声明阶段（每阶段给 agent 的输入、要求的产出类型、限时）、打分器、总分算法。登记时检查总时长不超过平台上限。 |
-| Agent 包 | `agent.json`（如何启动）+ `Dockerfile`。对 agent 的要求只有两条：能从命令行启动、读需求、在工作目录里干活；调模型的 base URL 可配置。不要求理解"阶段"，不要求保存状态。内置 agent 与上传的格式相同。 |
-| 打分器 scorer | 一个容器：输入产出 + 隐藏的测试材料，输出固定格式 `result.json`。第一个实现是 Playwright；以后可加单元测试、脚本比对、模型评判等。 |
-| 计量代理 meter | agent 调模型都经过它。记录每次调用的 token（含缓存命中）和耗时；只转发到用户填的接口（必须 https，不能指向内网）。默认无预算上限，用户可自设。 |
-| 价格配置 pricing | 公开价格表，折算等价花销。表里没有的模型只报 token，用户可自填单价。 |
-| 存储 store | 只有 `put(bytes) -> hash` 和 `get(hash) -> bytes`。当前实现为 GitHub Release，可替换。 |
-| 结果 results | 每次评测一份清单（manifest），汇总表和网页都由清单生成。清单的去处（results sink）可组合：总是加密存为块（存档）；提交者选择公开分数时，明文提交到数据分支；第 4 步起回传给 Worker 存入 KV。 |
+| 调度 | workflow 与 job 划分、阶段顺序、时限、按题目包声明依次调用插件 |
+| 计量代理 meter | 所有模型调用都经过它（agent 生成时、交互运行时、模型评判时各起一个）。记录 token（含缓存命中）和耗时；只转发到用户填的接口（必须 https，不能指向内网）；可选预算按整次评测累计 |
+| 出网代理 egress | 生成时 agent 只能访问白名单软件源（npm、PyPI） |
+| 价格配置 pricing | 公开价格表，折算等价花销。表里没有的模型只报 token，用户可自填单价 |
+| 存储 store | 只有 `put(bytes) -> hash` 和 `get(hash) -> bytes`。当前实现为 GitHub Release，可替换 |
+| 凭据 | 模型 key、下载密码的加密收发、交接与删除 |
+| 结果 results | 每次评测一份清单（manifest），按题目包声明的汇总方式算总分，按声明的展示方式显示。清单总是加密存档；提交者选择公开分数时，明文提交到数据分支；同时回传 Worker |
+
+**插件与声明**
+
+| 种类 | 作用 | 现有实现 |
+|---|---|---|
+| 运行器 runner | 让 agent 产生产出。产出运行器在生成 job 里运行，看不到隐藏材料；交互运行器在打分 job 里运行，让沙箱外的裁判进程与沙箱内的 agent 一问一答 | `workdir`（agent 在工作目录里按阶段干活）；`astro-v4`（交互，P3） |
+| 打包器 packager | 把工作目录变成产出文件；app 模式下检查上传的产出 | `web-app`（根目录带 Dockerfile 的 zip）、`files`（原样打包） |
+| 打分器 scorer | 输入产出、隐藏材料（和交互运行记录），输出连续分数与可选明细 | `playwright`、`astro-survey` |
+| 题目包 taskset | 声明阶段（输入、时限、隐藏材料）、每个插槽用哪个插件、阶段内与阶段间怎样汇总（`aggregate`）、分数的名称单位方向范围（`display`）、打分时是否需要模型 | `arcbench-github`、`hello-world`、`astro-practice` |
+| Agent 包 | 被评测的对象。默认格式是 `agent.json` + `Dockerfile`（`docs/agent-contract.md`）：能从命令行启动、读需求、在工作目录里干活、调模型的 base URL 可配置；不要求理解"阶段"。交互运行器可以约定自己的 agent 格式 | 内置 Octos、Codex，与上传的格式相同 |
+
+插件只能由维护者加入仓库并登记在 `plugins.json`；题目包和 agent 可以由用户上传，题目包只能引用已登记的插件（见 §8）。
 
 ## 4. 一次完整评测
 
-1. **提交**：浏览器用平台公钥加密 agent 包和模型 key。agent 包存为块；模型 key 存入 Workers KV。明文不经过我们的服务器。
-2. **触发**：Worker 校验 GitHub 身份后触发 GitHub Actions，只传评测编号。
-3. **生成**（每遍一台机器，可并行）：
+1. **提交**：浏览器用平台公钥加密 agent 包（或产出）和模型 key。包存为块；模型 key 存入 Workers KV。明文不经过我们的服务器。
+2. **触发**：Worker 校验 GitHub 身份后触发 GitHub Actions，只传评测编号等非秘密参数。
+3. **生成**（`generate`，每遍一台机器，可并行；只在 agent 模式）：
    - 在容器里构建 agent；此时机器上没有任何密钥。
    - 解密模型 key，只交给计量代理（经 stdin，不进环境变量和日志）。
-   - 按阶段运行 agent：每阶段结束保存产出作为该阶段 checkpoint，然后在同一工作目录给出下一阶段需求。工作目录和 agent 的 HOME 在阶段之间原样保留。
-   - 阶段内每 15 分钟自动快照；被强制结束时，用最后一份快照打分。
-   - 容器限制：2G 内存、1 核、非 root、cap-drop ALL、no-new-privileges；只能访问计量代理和白名单软件源（npm、PyPI）；看不到测试。
-4. **打分**：持钥 job 解密题目包的测试和各阶段 checkpoint，重新封到一把一次性钥匙交给不持有任何密钥的 job，由后者用指定打分器打分（测试可能是用户上传的不可信代码，见 `docs/scorer-contract.md` §7）。
-5. **汇总**：用时取平台进程在运行步骤内的计时，并用 GitHub job/step 时间戳核对（不采信 agent 自报），token 和花销取计量代理日志；产出和日志加密存为块；清单加密存档，提交者选择公开时才明文提交到数据分支；为提交者生成用下载密码加密的 zip。
-6. **清理**：删除模型 key 和下载密码；KV 另设 24 小时过期兜底。
+   - 按阶段调用产出运行器（默认 `workdir`：每阶段结束保存产出作为 checkpoint，然后在同一工作目录给出下一阶段需求，工作目录和 HOME 在阶段之间原样保留；阶段内每 15 分钟快照，被强制结束时用最后一份快照），再调用打包器把工作目录打成产出。
+   - 容器限制：2G 内存、1 核、非 root、cap-drop ALL、no-new-privileges；只能访问计量代理和白名单软件源；看不到隐藏材料。
+4. **交接**（`score`）：持钥 job 解开所需阶段的隐藏材料和各遍产出（阶段声明打分时需要模型的，连同模型 key），用一把一次性钥匙重新封好，交给不持有任何平台密钥的 job。这个 job 不运行任何插件。
+5. **评测**（`score-tests`）：只持有一次性钥匙。按阶段调用交互运行器（若题目包声明）和打分器，得到每阶段的结果；需要模型的插槽经宿主机上的计量代理调用，单独记账。隐藏材料和产出都可能是不可信代码，只在容器里处理（`docs/scorer-contract.md` §7）。
+6. **汇总**（`publish`）：用时取平台进程在运行步骤内的计时，并用 GitHub job/step 时间戳核对（不采信 agent 自报）；token 和花销取计量代理日志，生成阶段与评测阶段分开记；总分按题目包的 `aggregate` 计算，manifest 记下所用的汇总方式、展示方式和插件版本；产出和日志加密存为块；清单加密存档，提交者选择公开时才明文提交到数据分支；为提交者生成用下载密码加密的 zip。
+7. **清理**：删除模型 key 和下载密码；KV 另设 24 小时过期兜底。
+
+上传产出（app 模式）跳过第 3 步：上传的文件直接进入第 4 步，第 5 步打分前由题目包所声明的打包器检查格式。
 
 ## 5. 存储与数据
 
@@ -46,6 +62,7 @@ octos-crucible 是评测 coding agent 的基础设施：运行 agent、计量、
 | 所有文件（上传的包、产出、日志、题目包） | 加密后按 SHA-256 命名，存于 32 个预发布 Release `blobs-00`…`blobs-31`，分片 = 哈希前 5 位 | 永久 |
 | 题目登记表 | 仓库 `tasksets/<name>/taskset.json` | 永久 |
 | 用户上传的题目包登记 | Workers KV `tasksets/<u-id>`（默认私有，管理员可设为公开；见 `docs/api.md`） | 永久 |
+| 插件注册表 | 仓库 `plugins.json`（P2 起） | 永久 |
 | 评测清单 | 加密块（总是）；公开分数的评测另在仓库 `data` 分支 `evals/<eval_id>.json` | 永久 |
 | 平台程序 | 正式 Release `vX.Y.Z` | 永久 |
 | 用户模型 key、下载密码 | Workers KV | 评测结束即删 |
@@ -70,7 +87,7 @@ octos-crucible 是评测 coding agent 的基础设施：运行 agent、计量、
 ## 7. 技术选型
 
 - **Rust**：计量代理、加解密、存储、汇总、命令行工具 `crucible`、Cloudflare Worker（workers-rs）。预编译后发布到 Release，评测时按固定版本下载。
-- **打分器**：用各自需要的语言，Playwright 打分器为 TypeScript。
+- **插件**：打包器与产出运行器编译进 `crucible`（Rust，处理不可信字节的宿主机代码只用评审过的 Rust）；打分器和交互运行器是容器镜像，用各自需要的语言（Playwright 打分器为 TypeScript，巡天引擎为 Python）。
 - **网页**：静态页面，GitHub Pages。
 - **费用**：全部在免费额度内，不需要绑卡。
 
@@ -78,7 +95,7 @@ octos-crucible 是评测 coding agent 的基础设施：运行 agent、计量、
 
 | crate | 职责 |
 |---|---|
-| `crucible-core` | 共享类型：TaskSet、AgentSpec、UsageRecord、Result、Manifest、Envelope；可编译到 wasm |
+| `crucible-core` | 共享类型：TaskSet、AgentSpec、UsageRecord、ScoreResult、Manifest、Envelope、插件注册表；可编译到 wasm |
 | `crucible-metering` | 纯函数：解析 usage、查价格、计算等价花销 |
 | `crucible-meter` | 计量代理：OpenAI 兼容转发、SSE 透传、SSRF 防护、可选预算、JSONL 记录 |
 | `crucible-egress` | CONNECT 白名单出网代理 |
@@ -91,6 +108,8 @@ octos-crucible 是评测 coding agent 的基础设施：运行 agent、计量、
 ## 8. 安全边界
 
 - 上传的代码只在容器里运行；宿主机只执行平台自己的代码。
+- 信任分两级。官方插件（运行器、打包器、打分器）只能由维护者经 PR 评审加入并登记在 `plugins.json`，它们能接触解密后的隐藏材料。用户可上传的是题目包和 agent：题目包对核心来说只是数据，只能引用已登记的插件（用户题目包只能引用标为 `user: true` 的）；题目包里的文件是否被当作代码执行取决于所引用的插件，执行它们的插件只在 `score-tests` 的容器里运行。
+- 打分或交互时需要模型的阶段，提交者的模型 key 经交接到 `score-tests`，只在宿主机的计量代理进程里，容器只拿到计量代理地址；会执行题目包代码的插件永远拿不到模型（`docs/plugins.md` §10）。
 - 每个 job 只拿它需要的东西：生成 job 拿不到题目；跑测试的 job（`score-tests`）拿不到任何平台密钥，`permissions: {}`；只有发布 job 有写仓库权限。workflow 顶层 `permissions: {}`。
 - 所有输入经正则校验后通过 env 传入 shell，不做表达式拼接。
 - 已知残余风险：生成 job 里的容器逃逸可拿到该机器上的模型 key 和私钥（打分时的逃逸拿不到，见上）。缓解：机器一次性使用、key 用完即删、钥匙可更换。
@@ -104,8 +123,10 @@ octos-crucible 是评测 coding agent 的基础设施：运行 agent、计量、
 
 ## 10. 实施顺序
 
-1. Rust 基础组件：计量代理、加解密、存储、命令行（对齐 Python 原型的测试）。
-2. 生成流程（含阶段和快照）：用内置 Octos 在 GitHub 上真跑一次，验证联网限制、token 记录、无泄露。
-3. 打分器接口与 Playwright 打分器：打通生成 → 打分 → 汇总。
-4. Cloudflare Worker 与网页：上传、加密、提交、查看结果、下载产出。
-5. 补齐：上传产出的快速打分入口、多遍汇总、每周自检、内置 Codex、文档。
+第一轮（已完成）：Rust 基础组件 → 生成流程 → 打分器接口与 Playwright 打分器 → Worker 与网页 → 上传产出入口、多遍汇总、命令行提交、打分隔离。
+
+第二轮是插件化，分三步，每步单独上线，细节和验证方式见 `docs/plugins.md` §13：
+
+1. **P1 结果格式、状态与展示**：结果改为连续分数 `score`（可为负）、可选 `max`、`status: scored | error`、可选明细；题目包声明汇总方式和展示方式；旧数据按固定规则换算读取，分数不变。巡天立即按原始分显示。
+2. **P2 打包器与运行器插件化**：引入 `plugins.json`；去掉 `OutputKind`，题目包只写插件名；从 `crucible run` 抽出 `workdir` 运行器。
+3. **P3 交互运行器**：新增交互运行器插槽，巡天从"打分器内部跑 agent"迁到 `astro-v4` 交互运行器 + `astro-survey` 打分器；打分和交互阶段可以经计量代理使用提交者的模型。
