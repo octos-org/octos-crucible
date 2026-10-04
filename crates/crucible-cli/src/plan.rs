@@ -53,6 +53,10 @@ pub struct PlanInputs {
     /// variable `CRUCIBLE_WORKER_URL`).
     #[arg(long, env = "IN_WORKER_URL", default_value = "")]
     pub worker_url: String,
+    /// Runner labels for the jobs that start containers (repository
+    /// variable `CRUCIBLE_SANDBOX_RUNNER`, a JSON array; empty = GitHub-hosted).
+    #[arg(long, env = "IN_SANDBOX_RUNNER", default_value = "")]
+    pub sandbox_runner: String,
     /// Used for the default eval id.
     #[arg(long, env = "GITHUB_RUN_ID", default_value = "")]
     pub run_id: String,
@@ -90,6 +94,8 @@ pub struct ScorePlanInputs {
     pub results_url: String,
     #[arg(long, env = "IN_WORKER_URL", default_value = "")]
     pub worker_url: String,
+    #[arg(long, env = "IN_SANDBOX_RUNNER", default_value = "")]
+    pub sandbox_runner: String,
     #[arg(long, env = "GITHUB_RUN_ID", default_value = "")]
     pub run_id: String,
     #[arg(long, env = "GITHUB_RUN_ATTEMPT", default_value = "1")]
@@ -109,6 +115,38 @@ struct Options {
     /// tag of that repo to build instead of upstream.json's ref.
     #[serde(default)]
     agent_ref: Option<String>,
+    /// Where generate / score-tests run: `sandbox` (default, the
+    /// repository variable CRUCIBLE_SANDBOX_RUNNER) or `github-hosted`.
+    #[serde(default)]
+    runner: Option<String>,
+}
+
+pub const GITHUB_HOSTED_RUNNER: &str = r#"["ubuntu-latest"]"#;
+
+/// `runs-on` (compact JSON array) for the jobs that start containers:
+/// the repository variable `CRUCIBLE_SANDBOX_RUNNER` (a JSON array of
+/// labels), GitHub-hosted when it is empty or `choice` is `github-hosted`.
+pub fn sandbox_runner(var: &str, choice: Option<&str>) -> Result<String> {
+    match choice.unwrap_or("sandbox") {
+        "sandbox" => {}
+        "github-hosted" => return Ok(GITHUB_HOSTED_RUNNER.to_owned()),
+        _ => bail!("options.runner must be sandbox or github-hosted"),
+    }
+    if var.trim().is_empty() {
+        return Ok(GITHUB_HOSTED_RUNNER.to_owned());
+    }
+    let labels: Vec<String> = serde_json::from_str(var)
+        .map_err(|_| anyhow!("CRUCIBLE_SANDBOX_RUNNER must be a JSON array of runner labels"))?;
+    let label_ok = |l: &String| {
+        !l.is_empty()
+            && l.len() <= 64
+            && l.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+    };
+    if labels.is_empty() || labels.len() > 10 || !labels.iter().all(label_ok) {
+        bail!("CRUCIBLE_SANDBOX_RUNNER: 1..=10 labels of [A-Za-z0-9._-]{{1,64}}");
+    }
+    Ok(serde_json::to_string(&labels)?)
 }
 
 pub fn owner_ok(o: &str) -> bool {
@@ -355,6 +393,7 @@ pub fn plan_score(inp: &ScorePlanInputs, root: &Path) -> Result<BTreeMap<&'stati
     out.insert("owner", owner.to_owned());
     out.insert("results_url", results_url.to_owned());
     out.insert("worker_url", worker);
+    out.insert("sandbox_runner", sandbox_runner(&inp.sandbox_runner, None)?);
     Ok(out)
 }
 
@@ -390,7 +429,7 @@ pub fn plan(inp: &PlanInputs, root: &Path) -> Result<BTreeMap<&'static str, Stri
         Options::default()
     } else {
         serde_json::from_str(&inp.options).map_err(|_| {
-            anyhow!("options must be JSON {{budget?, stages?, results_url?, agent_ref?}}")
+            anyhow!("options must be JSON {{budget?, stages?, results_url?, agent_ref?, runner?}}")
         })?
     };
     let budget_raw = match (&opts.budget, inp.budget.trim()) {
@@ -410,6 +449,7 @@ pub fn plan(inp: &PlanInputs, root: &Path) -> Result<BTreeMap<&'static str, Stri
     {
         bail!("agent_ref must be a branch or tag name, for a builtin agent only");
     }
+    let runner = sandbox_runner(&inp.sandbox_runner, opts.runner.as_deref())?;
     let results_url = opts.results_url.unwrap_or_default();
     check_url("results_url", &results_url)?;
     let worker = worker_url(&results_url, &inp.worker_url)?;
@@ -463,6 +503,7 @@ pub fn plan(inp: &PlanInputs, root: &Path) -> Result<BTreeMap<&'static str, Stri
     out.insert("owner", owner.to_owned());
     out.insert("results_url", results_url);
     out.insert("worker_url", worker);
+    out.insert("sandbox_runner", runner);
     out.insert(
         "matrix",
         serde_json::to_string(
@@ -506,6 +547,40 @@ mod tests {
             run_attempt: "1".into(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn sandbox_runner_labels() {
+        let mh = r#"["self-hosted","linux","x64","magicbook"]"#;
+        assert_eq!(sandbox_runner("", None).unwrap(), GITHUB_HOSTED_RUNNER);
+        assert_eq!(sandbox_runner(mh, None).unwrap(), mh);
+        assert_eq!(sandbox_runner(mh, Some("sandbox")).unwrap(), mh);
+        assert_eq!(
+            sandbox_runner(mh, Some("github-hosted")).unwrap(),
+            GITHUB_HOSTED_RUNNER
+        );
+        assert!(sandbox_runner(mh, Some("magicbook")).is_err());
+        for bad in [
+            r#""ubuntu-latest""#,
+            "[]",
+            r#"["a b"]"#,
+            r#"["x","${{y}}"]"#,
+        ] {
+            assert!(sandbox_runner(bad, None).is_err(), "{bad}");
+        }
+        let r = root();
+        let mut i = good();
+        i.sandbox_runner = mh.into();
+        assert_eq!(plan(&i, r.path()).unwrap()["sandbox_runner"], mh);
+        i.options = r#"{"runner":"github-hosted"}"#.into();
+        assert_eq!(
+            plan(&i, r.path()).unwrap()["sandbox_runner"],
+            GITHUB_HOSTED_RUNNER
+        );
+        assert_eq!(
+            plan(&good(), r.path()).unwrap()["sandbox_runner"],
+            GITHUB_HOSTED_RUNNER
+        );
     }
 
     #[test]

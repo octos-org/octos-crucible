@@ -14,6 +14,9 @@ name: score
 #             (mode app), archives it sealed, commits it in clear to the data
 #             branch only if score_public, delivers it to the Worker.
 #
+# score-tests runs on the runner labels of the repository variable
+# CRUCIBLE_SANDBOX_RUNNER (unset = GitHub-hosted), docs/self-hosted.md.
+#
 # Rules as eval.yml: top-level permissions are empty; inputs are validated by
 # `crucible plan-score` and reach shells only through env; actions pinned.
 
@@ -82,6 +85,7 @@ jobs:
       results_url: ${{ steps.plan.outputs.results_url }}
       worker_url: ${{ steps.plan.outputs.worker_url }}
       run_key: ${{ steps.handoff.outputs.run_key }}
+      sandbox_runner: ${{ steps.plan.outputs.sandbox_runner }}
     env:
       STORE: github:${{ github.repository }}
     steps:
@@ -136,6 +140,7 @@ jobs:
           IN_OWNER: ${{ inputs.owner }}
           IN_RESULTS_URL: ${{ inputs.results_url }}
           IN_WORKER_URL: ${{ vars.CRUCIBLE_WORKER_URL }}
+          IN_SANDBOX_RUNNER: ${{ vars.CRUCIBLE_SANDBOX_RUNNER }}
           # Only to fetch a user taskset (u-...) the submitter may use.
           CRUCIBLE_WORKER_TOKEN: ${{ secrets.CRUCIBLE_WORKER_TOKEN }}
         run: '"$CRUCIBLE" plan-score --root .'
@@ -219,6 +224,7 @@ jobs:
     with:
       handoff: score-handoff
       scores: scores
+      runs_on: ${{ needs.score.outputs.sandbox_runner }}
     secrets:
       run_key: ${{ needs.score.outputs.run_key }}
 
