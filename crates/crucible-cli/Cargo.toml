@@ -30,6 +30,7 @@ humantime.workspace = true
 tempfile.workspace = true
 hex.workspace = true
 sha2.workspace = true
+getrandom = "0.2"
 
 [dev-dependencies]
 tempfile.workspace = true

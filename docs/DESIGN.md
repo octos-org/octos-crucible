@@ -84,7 +84,7 @@ octos-crucible 是评测 coding agent 的基础设施：运行 agent、计量、
 | `crucible-crypto` | 信封加密（公钥加密、私钥解密）、密码 zip |
 | `crucible-store` | `put`/`get`，GitHub Release 实现（32 分片） |
 | `crucible-report` | 多遍、多阶段汇总 |
-| `crucible-cli` | 二进制 `crucible`：taskset / plan / fetch / build / run / package / cred / seal-outputs / manifest / score / report / put / get |
+| `crucible-cli` | 二进制 `crucible`：taskset / plan / fetch / build / run / package / cred / seal-outputs / manifest / score / report / put / get；用户侧 submit / status（个人 API 令牌） |
 | `crucible-worker` | Cloudflare Worker 后端 |
 
 ## 8. 安全边界

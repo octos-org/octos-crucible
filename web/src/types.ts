@@ -109,6 +109,18 @@ export interface Manifest {
   replicas: ReplicaEntry[];
 }
 
+/** A personal API token for the command line (GET /tokens). */
+export interface ApiToken {
+  id: string;
+  name: string;
+  created_at: string;
+}
+
+/** POST /tokens: the plaintext token is returned only here, once. */
+export interface NewApiToken extends ApiToken {
+  token: string;
+}
+
 export interface ApiErrorBody {
   error: { code: string; message: string };
 }

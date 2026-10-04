@@ -6,7 +6,7 @@ Worker 只经手密文：上传文件和模型凭据都是浏览器用平台公�
 
 ## 通用约定
 
-- **认证**：`GET /auth/callback` 把会话令牌放在 Pages 地址的片段里（`#token=<令牌>`）；之后每个请求带 `Authorization: Bearer <令牌>`。不用 cookie 认证（OAuth 往返期间有一个只作用于 `/auth/callback` 的短期 cookie，用来防登录 CSRF）。令牌是 HMAC-SHA256 签名，有效期 24 小时。被封禁的用户（KV `ban/<github_id>`）每次请求都会被拒绝（403 `banned`）。
+- **认证**：`GET /auth/callback` 把会话令牌放在 Pages 地址的片段里（`#token=<令牌>`）；之后每个请求带 `Authorization: Bearer <令牌>`。用户接口也接受个人 API 令牌（`crt_...`，见下文“命令行令牌”），它代表本人但从不具备管理员权限。不用 cookie 认证（OAuth 往返期间有一个只作用于 `/auth/callback` 的短期 cookie，用来防登录 CSRF）。令牌是 HMAC-SHA256 签名，有效期 24 小时。被封禁的用户（KV `ban/<github_id>`）每次请求都会被拒绝（403 `banned`）。
 - **CORS**：只对 `PAGES_ORIGIN` 放行，允许的方法为 `GET, POST, DELETE, OPTIONS`，允许的请求头为 `Authorization, Content-Type, X-Upload-Kind`。`/internal/*` 不响应跨域请求。
 - **错误**：所有错误都是 `{"error": {"code": "...", "message": "..."}}`，HTTP 状态码见下表。
 
@@ -45,6 +45,20 @@ GitHub 回调。换取 token、读取用户之后，用户的 GitHub token 立�
 
 ### `GET /auth/dev-login?github_id=<n>&login=<name>`（仅开发）
 同时满足 `DEV_AUTH=1` 且请求的 host 是 localhost 时才生效，否则返回 404。→ `{"token": "..."}`。
+
+## 命令行令牌
+
+供 `crucible submit` / `crucible status` 使用。令牌格式 `crt_<id 16 位十六进制>_<64 位十六进制>`；KV 中只存整串令牌的 SHA-256，明文只在创建时返回一次。令牌可代替会话令牌调用用户接口（`/me`、`/uploads`、`/evals...`），身份为令牌的主人，`is_admin` 恒为 false（因此 `/admin/*`、`?all=1` 都会 403）；`/internal/*` 只认 `CRUCIBLE_WORKER_TOKEN`。主人被封禁时令牌同样被拒（403 `banned`）。下面三个接口**只接受会话令牌**（用 API 令牌调用返回 403），所以泄露的令牌不能自我续命。
+
+### `POST /tokens`
+请求体可为空，或 `{"name": "laptop"}`（≤ 60 个字符，无控制字符，默认 `cli`）。每人最多 20 个，超出返回 409。
+→ `201 {"id": "<16 hex>", "name": "laptop", "created_at": "...", "token": "crt_..."}`
+
+### `GET /tokens`
+→ `[{"id", "name", "created_at"}]`，按创建时间倒序，不含令牌本身。
+
+### `DELETE /tokens/:id`
+→ 204；不是本人的或不存在 → 404。撤销后令牌失效（KV 全球同步最多约 60 秒）。
 
 ## 公开信息
 
@@ -180,6 +194,8 @@ workflow 通过 `/internal/status` 上报的精确状态优先。估计值只能
 | `owner/<github_id>/<eval_id>` | 空值，key metadata 是列表摘要 | 永久 |
 | `upload/<sha256>` | `{owner_id, kind, size, created_at}` | 永久 |
 | `ban/<github_id>` | `{by, at, reason}` | 永久 |
+| `token/<id>` | `{owner_id, login, name, hash, created_at}`（hash = SHA-256(令牌)） | 撤销前永久 |
+| `tokens/<github_id>/<id>` | 空值，key metadata 是 `{id, name, created_at}` | 撤销前永久 |
 | `cache/tasksets` | `/tasksets` 的缓存 | 5 分钟 |
 | `cache/release/<tag>` | `{id, upload_url}` | 永久 |
 

@@ -16,6 +16,7 @@ use crate::model::{
 };
 use crate::session;
 use crate::shard::{release_tag, sha256_hex};
+use crate::tokens::{self, TokenRecord, TokenSummary};
 use crate::util::{ct_eq, parse_query, query_get, rfc3339};
 
 const OAUTH_COOKIE: &str = "crucible_oauth";
@@ -120,6 +121,9 @@ impl<'a, B: Backend> App<'a, B> {
             ("DELETE", ["internal", "cred", id]) => self.internal_delete_cred(req, id).await,
             ("POST", ["internal", "results", id]) => self.internal_results(req, id).await,
             ("POST", ["internal", "status", id]) => self.internal_status(req, id).await,
+            ("POST", ["tokens"]) => self.create_token(req).await,
+            ("GET", ["tokens"]) => self.list_tokens(req).await,
+            ("DELETE", ["tokens", id]) => self.delete_token(req, id).await,
             ("POST", ["admin", "ban"]) => self.ban(req, true).await,
             ("POST", ["admin", "unban"]) => self.ban(req, false).await,
             (
@@ -130,6 +134,7 @@ impl<'a, B: Backend> App<'a, B> {
                 | ["tasksets"]
                 | ["uploads"]
                 | ["evals", ..]
+                | ["tokens", ..]
                 | ["internal", ..]
                 | ["admin", ..],
             ) => Err(ApiError::new(
@@ -206,10 +211,37 @@ impl<'a, B: Backend> App<'a, B> {
 
     // ---- auth -----------------------------------------------------------
 
+    /// The caller, by web session or personal API token. A token never
+    /// carries admin rights, so `/admin/*` and `?all=1` stay session-only.
     async fn principal(&self, req: &Req) -> Result<Principal> {
         let token = req
             .bearer()
             .ok_or_else(|| ApiError::unauthorized("missing Authorization: Bearer token"))?;
+        let Some(id) = tokens::parse(token) else {
+            return self.session_principal(req).await;
+        };
+        let bad = || ApiError::unauthorized("invalid or revoked API token");
+        let rec: TokenRecord = self
+            .kv_json(&format!("token/{id}"))
+            .await?
+            .ok_or_else(bad)?;
+        if !tokens::matches(&rec, token) {
+            return Err(bad());
+        }
+        let banned = self.is_banned(rec.owner_id).await?;
+        authz::admit(rec.owner_id, &rec.login, banned, false)
+    }
+
+    /// The caller by web session only (token management).
+    async fn session_principal(&self, req: &Req) -> Result<Principal> {
+        let token = req
+            .bearer()
+            .ok_or_else(|| ApiError::unauthorized("missing Authorization: Bearer token"))?;
+        if tokens::parse(token).is_some() {
+            return Err(ApiError::forbidden(
+                "API tokens are managed from the website, not with a token",
+            ));
+        }
         let s = session::verify_session(&self.cfg.session_key, token, self.b.now_s())
             .map_err(|_| ApiError::unauthorized("invalid or expired session"))?;
         let banned = self.is_banned(s.gid).await?;
@@ -761,6 +793,113 @@ impl<'a, B: Backend> App<'a, B> {
             let _ = self.b.kv_delete(&format!("cred/{id}")).await;
         }
         Ok(Resp::json(200, &json!({"ok": true, "status": rec.status})))
+    }
+
+    // ---- personal API tokens --------------------------------------------
+
+    async fn create_token(&self, req: &Req) -> Result<Resp> {
+        #[derive(Deserialize, Default)]
+        #[serde(deny_unknown_fields)]
+        struct Body {
+            #[serde(default)]
+            name: Option<String>,
+        }
+        let p = self.session_principal(req).await?;
+        if req.body.len() > 4096 {
+            return Err(ApiError::too_large(4096));
+        }
+        let body: Body = if req.body.iter().all(u8::is_ascii_whitespace) {
+            Body::default()
+        } else {
+            serde_json::from_slice(&req.body)
+                .map_err(|e| ApiError::bad_request(format!("invalid request body: {e}")))?
+        };
+        let name = tokens::clean_name(body.name.as_deref()).ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "name: at most {} characters, no control characters",
+                tokens::MAX_NAME
+            ))
+        })?;
+        let prefix = format!("tokens/{}/", p.github_id);
+        let existing = self
+            .b
+            .kv_list(&prefix, tokens::MAX_PER_USER + 1)
+            .await
+            .map_err(|e| self.storage_err(e))?;
+        if existing.len() >= tokens::MAX_PER_USER {
+            return Err(ApiError::conflict(format!(
+                "at most {} tokens; revoke one first",
+                tokens::MAX_PER_USER
+            )));
+        }
+        let (id, token) = tokens::mint(&self.b.random_bytes(40));
+        let created_at = rfc3339(self.b.now_s());
+        let rec = TokenRecord {
+            owner_id: p.github_id,
+            login: p.login.clone(),
+            name: name.clone(),
+            hash: tokens::hash(&token),
+            created_at: created_at.clone(),
+        };
+        let summary = TokenSummary {
+            id: id.clone(),
+            name,
+            created_at,
+        };
+        self.kv_put(
+            &format!("token/{id}"),
+            &serde_json::to_vec(&rec).expect("json"),
+            PutOptions::default(),
+        )
+        .await?;
+        self.kv_put(
+            &format!("{prefix}{id}"),
+            b"",
+            PutOptions {
+                ttl: None,
+                metadata: Some(serde_json::to_value(&summary).expect("json")),
+            },
+        )
+        .await?;
+        let mut out = serde_json::to_value(&summary).expect("json");
+        out["token"] = json!(token);
+        Ok(Resp::json(201, &out))
+    }
+
+    async fn list_tokens(&self, req: &Req) -> Result<Resp> {
+        let p = self.session_principal(req).await?;
+        let keys = self
+            .b
+            .kv_list(&format!("tokens/{}/", p.github_id), LIST_LIMIT)
+            .await
+            .map_err(|e| self.storage_err(e))?;
+        let mut list: Vec<TokenSummary> = keys
+            .into_iter()
+            .filter_map(|k| serde_json::from_value(k.metadata?).ok())
+            .collect();
+        list.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(Resp::json(200, &list))
+    }
+
+    async fn delete_token(&self, req: &Req, id: &str) -> Result<Resp> {
+        let p = self.session_principal(req).await?;
+        if !tokens::is_id(id) {
+            return Err(ApiError::bad_request("token id must be 16 hex characters"));
+        }
+        let key = format!("token/{id}");
+        match self.kv_json::<TokenRecord>(&key).await? {
+            Some(rec) if rec.owner_id == p.github_id => {}
+            _ => return Err(ApiError::not_found("no such token")),
+        }
+        self.b
+            .kv_delete(&key)
+            .await
+            .map_err(|e| self.storage_err(e))?;
+        self.b
+            .kv_delete(&format!("tokens/{}/{id}", p.github_id))
+            .await
+            .map_err(|e| self.storage_err(e))?;
+        Ok(Resp::empty(204))
     }
 
     // ---- admin ----------------------------------------------------------

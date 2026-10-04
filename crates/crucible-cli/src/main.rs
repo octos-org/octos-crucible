@@ -18,6 +18,7 @@ mod plan;
 mod publish;
 mod run;
 mod score;
+mod submit;
 mod taskset_cmd;
 mod worker;
 mod zipdir;
@@ -199,6 +200,13 @@ enum Cmd {
     /// and recorded as `download` in the manifest. Skipped (exit 0) when the
     /// credential has no download password.
     DownloadZip(Box<DownloadZipArgs>),
+    /// Submit an evaluation, like the website (token from CRUCIBLE_TOKEN).
+    Submit {
+        #[command(subcommand)]
+        cmd: submit::SubmitCmd,
+    },
+    /// Show (or wait for) an evaluation's status and scores.
+    Status(submit::StatusArgs),
     /// The Worker's internal endpoints (token from CRUCIBLE_WORKER_TOKEN).
     Worker {
         /// The Worker (`https://...`; only its origin is used).
@@ -613,6 +621,8 @@ async fn run(cmd: Cmd) -> Result<()> {
             eprintln!("download zip stored ({} bytes)", zip.len());
             Ok(())
         }
+        Cmd::Submit { cmd } => submit::submit(cmd).await,
+        Cmd::Status(a) => submit::status_cmd(a).await,
         Cmd::Worker {
             worker_url,
             eval_id,

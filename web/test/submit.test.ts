@@ -27,6 +27,9 @@ function fakeBackend(pub: { key_id: string; public_key: string }) {
     evals: async () => [],
     evalDetail: async () => ({ eval_id: "x", status: "queued" }),
     download: async () => {},
+    tokens: async () => [],
+    createToken: async () => ({ id: "0".repeat(16), name: "cli", created_at: "", token: "crt_" }),
+    deleteToken: async () => {},
   };
   return { b, calls };
 }

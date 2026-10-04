@@ -1,7 +1,7 @@
 // Fixed data for developing without a Worker. Shapes follow the API contract.
 
 import { ApiError, type Backend } from "./api";
-import type { EvalDetail, EvalSummary, Manifest, StageEntry, TaskSet } from "./types";
+import type { ApiToken, EvalDetail, EvalSummary, Manifest, StageEntry, TaskSet } from "./types";
 import { currentKey } from "./keys";
 import { toHex } from "./crypto";
 
@@ -189,6 +189,8 @@ const DETAILS: Record<string, EvalDetail> = {
   [RUNNING.eval_id!]: { eval_id: RUNNING.eval_id!, status: "running:stage-2", run_url: "https://github.com/octos-org/octos-crucible/actions", manifest: RUNNING },
 };
 
+let TOKENS: ApiToken[] = [];
+
 const delay = <T>(v: T, ms = 250) => new Promise<T>((r) => setTimeout(() => r(structuredClone(v)), ms));
 
 export const mockBackend: Backend = {
@@ -220,6 +222,17 @@ export const mockBackend: Backend = {
     const s = EVALS.find((e) => e.eval_id === id);
     if (!s) return Promise.reject(new ApiError(404, "not_found", "评测不存在"));
     return delay({ eval_id: id, status: s.status });
+  },
+  tokens: () => delay(TOKENS),
+  async createToken(name) {
+    const id = toHex(crypto.getRandomValues(new Uint8Array(8)));
+    const t = { id, name: name.trim() || "cli", created_at: new Date().toISOString() };
+    TOKENS = [t, ...TOKENS];
+    return delay({ ...t, token: `crt_${id}_${toHex(crypto.getRandomValues(new Uint8Array(32)))}` });
+  },
+  async deleteToken(id) {
+    TOKENS = TOKENS.filter((t) => t.id !== id);
+    await delay(null);
   },
   async download() {
     await delay(null);

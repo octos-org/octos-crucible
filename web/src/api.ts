@@ -3,11 +3,13 @@
 // `crucible.mock` sessionStorage flag is set), for development.
 
 import type {
+  ApiToken,
   CreateEval,
   EvalDetail,
   EvalSummary,
   Me,
   Mode,
+  NewApiToken,
   TaskSet,
 } from "./types";
 import type { PublicKeyInfo } from "./crypto";
@@ -86,6 +88,10 @@ export interface Backend {
   evalDetail(id: string): Promise<EvalDetail>;
   /** Start the download of the password zip. */
   download(id: string): Promise<void>;
+  /** Personal API tokens for `crucible submit` (session only). */
+  tokens(): Promise<ApiToken[]>;
+  createToken(name: string): Promise<NewApiToken>;
+  deleteToken(id: string): Promise<void>;
 }
 
 async function request(path: string, init: RequestInit = {}): Promise<Response> {
@@ -141,6 +147,16 @@ export const httpBackend: Backend = {
     }),
   evals: () => json("/evals"),
   evalDetail: (id) => json(`/evals/${enc(id)}`),
+  tokens: () => json("/tokens"),
+  createToken: (name) =>
+    json("/tokens", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(name.trim() ? { name: name.trim() } : {}),
+    }),
+  async deleteToken(id) {
+    await request(`/tokens/${enc(id)}`, { method: "DELETE" });
+  },
   async download(id) {
     // The endpoint needs the Bearer header, so a plain link cannot be used.
     // If the Worker answers JSON {url} we navigate there; otherwise fetch
