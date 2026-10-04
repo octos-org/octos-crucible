@@ -9,11 +9,13 @@
 use serde_json::Value;
 
 use crate::http::{Backend, Row, SqlArg, Stmt};
+use crate::leaderboard::{BoardInfo, Candidate};
 use crate::model::{
     Budget, EvalRecord, EvalSummary, Mode, StoredResults, UploadKind, UploadRecord, UserTaskset,
     score_of, shown_status,
 };
 use crate::tokens::{TokenRecord, TokenSummary};
+use crucible_core::taskset::ScoreFormat;
 
 type R<T> = Result<T, String>;
 
@@ -169,6 +171,14 @@ fn token_of(r: &Row) -> R<TokenRecord> {
         created_at: text(r, "created_at").unwrap_or_default(),
     })
 }
+
+/// Leaderboard rows: public evals (the partial index), done and scored, of
+/// owners not banned, on built-in or public user tasksets.
+const PUBLIC_DONE: &str = "FROM evals e JOIN results r ON r.eval_id = e.eval_id \
+     LEFT JOIN bans b ON b.github_id = e.owner_id \
+     LEFT JOIN user_tasksets t ON t.id = e.taskset \
+     WHERE e.score_public = 1 AND r.status = 'done' AND r.total_score IS NOT NULL \
+     AND b.github_id IS NULL AND (t.id IS NULL OR (t.public = 1 AND t.status = 'ready'))";
 
 // ---- statements (shared by the handlers and the KV migration) ----------
 
@@ -649,6 +659,96 @@ impl<B: Backend> Db<'_, B> {
                 })
             })
             .collect()
+    }
+
+    // ---- leaderboard ----------------------------------------------------
+
+    /// `GET /leaderboard/:taskset`: the newest public, done, scored evals
+    /// (through the partial index `evals_public_taskset`), plus the newest
+    /// one's display snapshot (total, stage).
+    pub async fn leaderboard_candidates(
+        &self,
+        taskset: &str,
+        limit: usize,
+    ) -> R<(Vec<Candidate>, Option<ScoreFormat>, Option<ScoreFormat>)> {
+        let rows = self
+            .rows(
+                &format!(
+                    "SELECT e.eval_id, e.owner_id, e.owner_login, e.model, e.created_at, \
+                     e.created_s, r.total_score, r.display, \
+                     json_extract(r.manifest, '$.agent.name') AS agent, \
+                     json_extract(r.manifest, '$.agent.version') AS agent_version, \
+                     json_extract(r.manifest, '$.scoring.display.stage') AS stage_display \
+                     {PUBLIC_DONE} AND e.taskset = ?1 \
+                     ORDER BY e.created_s DESC, e.eval_id LIMIT ?2"
+                ),
+                args![taskset, limit as u64],
+            )
+            .await?;
+        let display = rows.first().and_then(|r| json_col(r, "display"));
+        let stage_display = rows.first().and_then(|r| json_col(r, "stage_display"));
+        let cands = rows
+            .iter()
+            .filter_map(|r| {
+                Some(Candidate {
+                    eval_id: text(r, "eval_id")?,
+                    owner_id: uint(r, "owner_id")?,
+                    login: text(r, "owner_login")?,
+                    agent: text(r, "agent").unwrap_or_default(),
+                    agent_version: text(r, "agent_version").unwrap_or_default(),
+                    model: text(r, "model"),
+                    total_score: real(r, "total_score")?,
+                    created_at: text(r, "created_at").unwrap_or_default(),
+                    created_s: uint(r, "created_s").unwrap_or(0),
+                })
+            })
+            .collect();
+        Ok((cands, display, stage_display))
+    }
+
+    /// The stored manifests of these evals (at most 100: D1's bound
+    /// parameter limit).
+    pub async fn manifests(&self, ids: &[&str]) -> R<Vec<(String, Value)>> {
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let marks: Vec<String> = (1..=ids.len()).map(|i| format!("?{i}")).collect();
+        let rows = self
+            .rows(
+                &format!(
+                    "SELECT eval_id, manifest FROM results WHERE eval_id IN ({})",
+                    marks.join(", ")
+                ),
+                ids.iter().map(|&i| SqlArg::from(i)).collect(),
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| Some((text(r, "eval_id")?, json_col(r, "manifest")?)))
+            .collect())
+    }
+
+    /// `GET /leaderboard`: tasksets with public, done, scored evals.
+    pub async fn leaderboards(&self) -> R<Vec<BoardInfo>> {
+        let rows = self
+            .rows(
+                &format!(
+                    "SELECT e.taskset, COUNT(*) AS n, MAX(e.created_at) AS latest {PUBLIC_DONE} \
+                     GROUP BY e.taskset ORDER BY MAX(e.created_s) DESC LIMIT 200"
+                ),
+                vec![],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| {
+                Some(BoardInfo {
+                    taskset: text(r, "taskset")?,
+                    evals: uint(r, "n")?,
+                    latest_at: text(r, "latest").unwrap_or_default(),
+                })
+            })
+            .collect())
     }
 
     // ---- migration ------------------------------------------------------

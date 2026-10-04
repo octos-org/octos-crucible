@@ -174,6 +174,46 @@ export interface Manifest {
   total_score?: number | null;
 }
 
+// --- leaderboard (GET /leaderboard, GET /leaderboard/:taskset) ---
+
+export interface LeaderboardInfo {
+  taskset: string;
+  /** Public, done evals on it. */
+  evals: number;
+  latest_at: string;
+}
+
+export interface LeaderboardStage {
+  stage: string;
+  /** Mean over replicas; null when no replica scored the stage. */
+  score: number | null;
+  max: number | null;
+}
+
+export interface LeaderboardEntry {
+  rank: number;
+  login: string;
+  agent: string;
+  agent_version: string;
+  model?: string | null;
+  total_score: number;
+  stages: LeaderboardStage[];
+  replicas: number;
+  wall_s?: number | null;
+  cost_usd?: number | null;
+  created_at: string;
+  eval_id: string;
+}
+
+export interface Leaderboard {
+  taskset: string;
+  direction: "higher" | "lower";
+  /** Total's display (newest public eval's snapshot); absent = 0–1 ratio. */
+  display?: ScoreFormat | null;
+  stage_display?: ScoreFormat | null;
+  entries: LeaderboardEntry[];
+}
+
 /** A personal API token for the command line (GET /tokens). */
 export interface ApiToken {
   id: string;

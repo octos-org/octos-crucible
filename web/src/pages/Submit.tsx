@@ -394,7 +394,7 @@ export function Submit() {
           />
           <span>
             公开分数
-            <small class="muted">公开分数和统计数据；产出和日志始终不公开。</small>
+            <small class="muted">公开后会出现在排行榜上，显示你的 GitHub 用户名、agent 名、模型和分数；产出和日志始终不公开。</small>
           </span>
         </label>
         <label class={`check ${err("consent") ? "has-error" : ""}`}>

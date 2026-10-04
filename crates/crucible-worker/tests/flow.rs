@@ -53,7 +53,10 @@ struct FakeGitHub {
 /// value, expiry (unix seconds)
 type KvEntry = (Vec<u8>, Option<u64>);
 
-const SCHEMA: &str = include_str!("../migrations/0001_init.sql");
+const SCHEMA: &str = concat!(
+    include_str!("../migrations/0001_init.sql"),
+    include_str!("../migrations/0002_leaderboard.sql")
+);
 
 struct Mock {
     kv: RefCell<BTreeMap<String, KvEntry>>,
@@ -2025,4 +2028,105 @@ fn migrate_kv_to_d1() {
     let ts = json_of(&t.as_user("GET", "/tasksets/u-0123456789abcdef", &alice, b""));
     assert_eq!(ts["status"], "ready");
     assert_eq!(upload_as(&t, &token(43, "bob"), &site).status, 409);
+}
+
+/// Submits an app-mode eval of stage 1 and posts a done result whose
+/// total is `passed`/2 (agent `agent`).
+fn scored_eval(t: &T, tok: &str, id: &str, public: bool, agent: &str, passed: u32) {
+    let hash = json_of(&upload_as(t, tok, &sealed(id.as_bytes())))["hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let eval = json!({
+        "mode": "app", "eval_id": id, "upload_hash": hash, "taskset": "github-full",
+        "stages": 1, "score_public": public, "consent": true
+    });
+    let r = t.as_user("POST", "/evals", tok, &serde_json::to_vec(&eval).unwrap());
+    assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+    let mut m = app_manifest(passed);
+    m["eval_id"] = json!(id);
+    m["agent"]["name"] = json!(agent);
+    m["replicas"][0]["stages"][0]["score"]["total"] = json!(2);
+    let r = t.as_user(
+        "POST",
+        &format!("/internal/results/{id}"),
+        WORKER_TOKEN,
+        &serde_json::to_vec(&m).unwrap(),
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    t.mock.now.set(t.mock.now.get() + 10);
+}
+
+#[test]
+fn leaderboard() {
+    let t = T::new();
+    let alice = token(42, "octocat");
+    let bob = token(43, "bob");
+    let id = |n: u8| format!("{n:08x}-1f3c-4d2a-9e8b-7c6d5e4f3a21");
+    scored_eval(&t, &alice, &id(1), true, "x", 1);
+    scored_eval(&t, &alice, &id(2), true, "x", 2); // alice's best x
+    scored_eval(&t, &alice, &id(3), false, "x", 2); // private: never shown
+    scored_eval(&t, &bob, &id(4), false, "y", 2); // private
+    scored_eval(&t, &bob, &id(5), true, "y", 1);
+    // Anonymous.
+    let r = t.call("GET", "/leaderboard/github-full", &[], b"");
+    assert_eq!(r.status, 200);
+    let b = json_of(&r);
+    assert_eq!(b["direction"], "higher");
+    let rows: Vec<(u64, &str, &str, f64)> = b["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            (
+                e["rank"].as_u64().unwrap(),
+                e["login"].as_str().unwrap(),
+                e["eval_id"].as_str().unwrap(),
+                e["total_score"].as_f64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            (1, "octocat", id(2).as_str(), 1.0),
+            (2, "bob", id(5).as_str(), 0.5)
+        ]
+    );
+    let e = &b["entries"][0];
+    assert_eq!(e["agent"], "x");
+    assert_eq!(
+        e["stages"],
+        json!([{"stage": "stage-1", "score": 2.0, "max": 2.0}])
+    );
+    assert_eq!(e["replicas"], 1);
+    let text = String::from_utf8_lossy(&r.body);
+    assert!(!text.contains(&id(3)) && !text.contains(&id(4)));
+    assert_eq!(
+        json_of(&t.call("GET", "/leaderboard", &[], b"")),
+        json!([{"taskset": "github-full", "evals": 3, "latest_at": b["entries"][1]["created_at"]}])
+    );
+    // Cached for 5 minutes.
+    scored_eval(&t, &bob, &id(6), true, "y", 2);
+    assert_eq!(
+        json_of(&t.call("GET", "/leaderboard/github-full", &[], b"")),
+        b
+    );
+    t.mock.now.set(t.mock.now.get() + 301);
+    let b = json_of(&t.call("GET", "/leaderboard/github-full", &[], b""));
+    assert_eq!(b["entries"][1]["rank"], 1); // tied with alice, later
+    assert_eq!(b["entries"][1]["eval_id"], id(6).as_str());
+    // A banned owner drops out.
+    t.mock
+        .sql("INSERT INTO bans VALUES (43, 1, 'now', NULL); DELETE FROM cache;");
+    let b = json_of(&t.call("GET", "/leaderboard/github-full", &[], b""));
+    assert_eq!(b["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        t.call("GET", "/leaderboard/Bad..Name", &[], b"").status,
+        404
+    );
+    assert_eq!(
+        json_of(&t.call("GET", "/leaderboard/nothing-here", &[], b""))["entries"],
+        json!([])
+    );
 }

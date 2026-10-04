@@ -16,6 +16,7 @@ pub mod dispatch;
 pub mod github;
 pub mod http;
 pub mod keys;
+pub mod leaderboard;
 pub mod model;
 pub mod session;
 pub mod shard;

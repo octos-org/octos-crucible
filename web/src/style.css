@@ -796,3 +796,42 @@ table.compare td {
 .delta.same {
   color: var(--muted);
 }
+
+/* --- leaderboard --- */
+
+table.board tr.clickable {
+  cursor: pointer;
+}
+
+table.board tr.clickable:hover,
+table.board tr.clickable:focus-visible,
+table.board tr.open {
+  background: var(--wait-bg);
+  outline: none;
+}
+
+table.board td.strong {
+  font-weight: 600;
+}
+
+table.board tr.detail td {
+  white-space: normal;
+  padding: 10px 0 14px;
+}
+
+.kv {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 16px;
+  margin: 0;
+  font-size: 13px;
+}
+
+.kv dt {
+  color: var(--muted);
+}
+
+.kv dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
