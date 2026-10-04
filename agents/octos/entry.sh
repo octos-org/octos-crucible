@@ -15,15 +15,17 @@ git config --global --add safe.directory /work 2>/dev/null || true
 echo "Actions ARC-Bench workspace assembled successfully." > /workspace/execution.debug.log
 
 # Fit octos' own time budget into the platform deadline: its wait loop ends
-# at budget + final reserve, then collect + boot gate take up to ~16 min.
+# at budget + final reserve, then collect + boot gate. Those took at most
+# 35 s (median 31 s) over 68 measured stages; the tail keeps 600 s, well
+# above that (the gate's own worst case, all timeouts hit, is ~16 min).
 # Octos raises the budget to 200 s per requirement node if that is larger;
 # the platform stops the container at DEADLINE_S regardless, and octos
 # delivers accepted progress to /work every minute.
 # Short stages (e.g. the 600 s demo-todo smoke task) scale both down so the
-# run still ends near the deadline; ARC-sized stages keep 300 + 1200 s.
+# run still ends near the deadline; ARC-sized stages keep 300 + 600 s.
 deadline=${DEADLINE_S:-3600}
 reserve=$(( deadline / 6 )); [ "$reserve" -gt 300 ] && reserve=300
-tail_s=$(( deadline / 3 )); [ "$tail_s" -gt 1200 ] && tail_s=1200
+tail_s=$(( deadline / 6 )); [ "$tail_s" -gt 600 ] && tail_s=600
 budget=$(( deadline - reserve - tail_s ))
 floor=$(( deadline / 2 )); [ "$floor" -gt 600 ] && floor=600
 [ "$budget" -lt "$floor" ] && budget=$floor
