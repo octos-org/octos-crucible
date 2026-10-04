@@ -2,11 +2,8 @@ id: ROOT
 name: Todo - Stage 3
 type: FOLDER
 dependencies: []
-description: The todo application already exists from the previous stages (home page
-  `/` with the “Todo” heading, “New task” input, “Add” button, a server-stored task
-  list where each task has a checkbox named by its text and a “Delete <text>”
-  button, and the “Remaining: N” counter). Everything it does must keep working.
-  This stage adds list filters, clearing completed tasks and a statistics page.
+description: |-
+  The todo application already exists from the previous stages (home page `/` with the “Todo” heading, “New task” input, “Add” button, a server-stored task list where each task has a checkbox named by its text and a “Delete <text>” button, and the “Remaining: N” counter). Everything it does must keep working. This stage adds list filters, clearing completed tasks and a statistics page.
 children:
 - id: REQ-7
   name: Filters
