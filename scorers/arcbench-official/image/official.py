@@ -193,7 +193,11 @@ def result(official, status, detail, visibility, out, task_id, submission_id):
 def main(argv):
     cmd = argv[1] if len(argv) > 1 else ""
     if cmd == "unpack":
-        return unpack(argv[2], argv[3])
+        try:
+            return unpack(argv[2], argv[3])
+        except Exception as e:  # noqa: BLE001 - not the zip's fault: system_error
+            say(f"unpack error: {type(e).__name__}: {e}")
+            return 5
     if cmd == "build":
         return build()
     if cmd == "serve":
