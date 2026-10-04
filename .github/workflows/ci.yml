@@ -34,3 +34,5 @@ jobs:
         run: cargo test --workspace --locked
       - name: wasm check (crucible-core)
         run: cargo check -p crucible-core --target wasm32-unknown-unknown --locked
+      - name: skill.md matches the CLI
+        run: cargo build -p crucible-cli --locked && CRUCIBLE=target/debug/crucible tools/check-skill.sh

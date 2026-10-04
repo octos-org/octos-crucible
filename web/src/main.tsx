@@ -43,12 +43,17 @@ function useRoute(): Route {
   return route;
 }
 
+const SKILL_URL = new URL(`${import.meta.env.BASE_URL}skill.md`, location.origin).href;
+
 function Login() {
   const mock = isMock();
   return (
     <main class="login">
       <h1>octos-crucible</h1>
       <p class="lead">评测 coding agent：上传 agent 或产出，按阶段运行、打分，给出分数、用时、token 和等价花销。</p>
+      <p class="small">
+        让你的 agent 读这个：<a class="link" href={SKILL_URL}>{SKILL_URL}</a>
+      </p>
       {mock ? (
         <button
           class="btn primary"
