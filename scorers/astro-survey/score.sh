@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Astro-survey scorer: run one GOSIM Agentic Observer project (the artifact
 # zip) against one v4 task card (the tests dir) with the starter kit's own
-# engine, and write result.json (crucible-core ScoreResult).
+# engine, and write result.json v2 (docs/scorer-contract.md §4): score = the
+# engine's survey score, items = its five components.
 #
 #   score.sh --artifact agent.zip --tests CARD_DIR --out result.json
 #            [--visibility public|hidden] [--artifacts DIR]
@@ -85,11 +86,11 @@ STATUS="" DETAIL=""
 if [ -n "${CRUCIBLE_SCORER_IMAGE:-}" ]; then
   IMAGE="$CRUCIBLE_SCORER_IMAGE"
   docker image inspect "$IMAGE" >/dev/null 2>&1 || docker pull -q "$IMAGE" >/dev/null 2>&1 \
-    || { STATUS=system_error; DETAIL="scorer image unavailable: $IMAGE"; }
+    || { STATUS=error; DETAIL="scorer image unavailable: $IMAGE"; }
 else
   IMAGE="crucible-scorer-astro-survey:local"
   docker build -q -t "$IMAGE" "$HERE/image" >"$WORK/scorer-build.log" 2>&1 \
-    || { STATUS=system_error; DETAIL="scorer image failed to build"; }
+    || { STATUS=error; DETAIL="scorer image failed to build"; }
 fi
 
 LOCKDOWN=(--network none --read-only --security-opt no-new-privileges --cap-drop ALL
@@ -100,7 +101,7 @@ if [ -z "$STATUS" ]; then
   docker volume create --label "$LABEL" "$PIPES" >/dev/null \
     && docker run --rm --network none --label "$LABEL" -v "$PIPES:/pipes" --entrypoint sh "$IMAGE" -c \
       "mkfifo -m 600 /pipes/to_agent /pipes/from_agent && chown -R $RUN_AS /pipes && chmod 700 /pipes" \
-    || { STATUS=system_error; DETAIL="could not set up the agent pipes"; }
+    || { STATUS=error; DETAIL="could not set up the agent pipes"; }
 fi
 
 if [ -z "$STATUS" ]; then
@@ -109,7 +110,7 @@ if [ -z "$STATUS" ]; then
     --tmpfs /work:rw,exec,size=512m,uid="${RUN_AS%%:*}",gid="${RUN_AS##*:}" \
     -v "$ARTIFACT:/in/agent.zip:ro" -v "$PIPES:/pipes" \
     --entrypoint python3 "$IMAGE" /opt/scorer/agent_entry.py /in/agent.zip >/dev/null \
-    || { STATUS=system_error; DETAIL="could not start the agent container"; }
+    || { STATUS=error; DETAIL="could not start the agent container"; }
 fi
 
 if [ -z "$STATUS" ]; then
@@ -128,12 +129,12 @@ if [ -z "$STATUS" ]; then
   docker rm -f "$AGENT_CTR" >/dev/null 2>&1 || true
   if [ ! -s "$WORK/out/result.json" ]; then
     if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
-      STATUS=failed; DETAIL="survey run exceeded ${RUN_TIMEOUT_S}s"
+      STATUS=scored; DETAIL="survey run exceeded ${RUN_TIMEOUT_S}s"
     else
-      STATUS=system_error; DETAIL="the survey engine wrote no result"
+      STATUS=error; DETAIL="the survey engine wrote no result"
     fi
   elif [ "$agent_rc" = "64" ]; then
-    STATUS=failed; DETAIL="agent zip is not a valid observer project (see docs/astro-survey.md)"
+    STATUS=scored; DETAIL="agent zip is not a valid observer project (see docs/astro-survey.md)"
   fi
 fi
 
@@ -147,10 +148,10 @@ fi
 
 if [ -n "$STATUS" ]; then
   {
-    printf '{\n  "visibility": "%s",\n  "status": "%s",\n  "passed": 0,\n  "total": 0,\n  "detail": "%s"' "$VISIBILITY" "$STATUS" "$DETAIL"
+    printf '{\n  "schema": 2,\n  "visibility": "%s",\n  "status": "%s",\n  "detail": "%s"' "$VISIBILITY" "$STATUS" "$DETAIL"
+    if [ "$STATUS" = error ]; then printf ',\n  "error": "system"'; else printf ',\n  "score": 0'; fi
     [ -n "$TASK_ID" ] && printf ',\n  "task_id": "%s"' "$TASK_ID"
     [ -n "$SUBMISSION_ID" ] && printf ',\n  "submission_id": "%s"' "$SUBMISSION_ID"
-    [ "$VISIBILITY" = "public" ] && printf ',\n  "tests": []'
     printf '\n}\n'
   } >"$OUT" || exit 1
 else

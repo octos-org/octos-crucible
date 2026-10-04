@@ -571,4 +571,56 @@ mod tests {
         ));
         assert!(serde_json::from_str::<OutputKind>("\"web_app\"").is_err());
     }
+
+    /// The repository's tasksets parse, validate, and snapshot as intended.
+    #[test]
+    fn builtin_tasksets() {
+        let hello: TaskSet =
+            serde_json::from_str(include_str!("../../../tasksets/hello-world/taskset.json")).unwrap();
+        hello.validate(MAX_TOTAL_TIME_S).unwrap();
+        let sc = hello.scoring();
+        assert_eq!(sc.aggregate.stages, StagesAgg::Ratio);
+        assert_eq!(sc.display.stage.as_ref().unwrap().format, NumFormat::Fraction);
+        assert_eq!(sc.display.total.as_ref().unwrap().fmt(1.0, None), "100.0%");
+        assert_eq!(sc.plugins[0].version, "1");
+
+        let astro: TaskSet =
+            serde_json::from_str(include_str!("../../../tasksets/astro-practice/taskset.json"))
+                .unwrap();
+        astro.validate(MAX_TOTAL_TIME_S).unwrap();
+        let sc = astro.scoring();
+        assert_eq!(sc.aggregate.stages, StagesAgg::Sum);
+        let stage = sc.display.stage.as_ref().unwrap();
+        assert_eq!(stage.name, "观测得分");
+        assert_eq!(stage.fmt(4458.556163, None), "4458.56 分");
+        assert_eq!(sc.plugins[0].version, "2");
+        // Serialized and read back: the object form survives.
+        let back: TaskSet = serde_json::from_str(&serde_json::to_string(&astro).unwrap()).unwrap();
+        assert_eq!(back, astro);
+    }
+
+    #[test]
+    fn scoring_checks() {
+        let mut t: TaskSet = serde_json::from_str(&github()).unwrap();
+        t.schema = 2;
+        t.aggregate = serde_json::from_str(r#"{"stages":"weighted","weights":{"stage-9":1}}"#).unwrap();
+        assert!(matches!(t.validate(1 << 20), Err(TaskSetError::Scoring(_))));
+        t.aggregate = serde_json::from_str(r#"{"stages":"weighted","weights":{"stage-2":1}}"#).unwrap();
+        t.validate(1 << 20).unwrap();
+        t.display.stage = Some(ScoreFormat {
+            name: "x\u{7}".into(),
+            ..ScoreFormat::default()
+        });
+        assert!(matches!(t.validate(1 << 20), Err(TaskSetError::Scoring(_))));
+        t.schema = 3;
+        assert_eq!(t.validate(1 << 20), Err(TaskSetError::Schema));
+        assert!(serde_json::from_str::<Aggregate>(r#""mean""#).is_err());
+        assert!(serde_json::from_str::<Aggregate>(r#"{"stage":"sum"}"#).is_err());
+        let f = ScoreFormat {
+            format: NumFormat::Fraction,
+            decimals: 0,
+            ..ScoreFormat::default()
+        };
+        assert_eq!(f.fmt(27.0, Some(30.0)), "27/30");
+    }
 }
