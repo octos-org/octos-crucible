@@ -102,10 +102,7 @@ impl Archive {
     /// Parse and verify an uncompressed `docker save` archive.
     pub fn parse(data: Vec<u8>) -> Result<Archive> {
         if data.len() as u64 > MAX_IMAGE_BYTES {
-            bail!(
-                "the image is larger than {} MB",
-                MAX_IMAGE_BYTES >> 20
-            );
+            bail!("the image is larger than {} MB", MAX_IMAGE_BYTES >> 20);
         }
         let files = tar_index(&data)?;
         let get = |n: &str| -> Result<&[u8]> {
@@ -114,8 +111,8 @@ impl Archive {
                 .ok_or_else(|| anyhow!("image archive: {n} missing"))?;
             Ok(&data[*o..*o + *l])
         };
-        let entries: Vec<Entry> =
-            serde_json::from_slice(get("manifest.json")?).context("image archive: manifest.json")?;
+        let entries: Vec<Entry> = serde_json::from_slice(get("manifest.json")?)
+            .context("image archive: manifest.json")?;
         let [e] = entries.as_slice() else {
             bail!("image archive: expected exactly one image");
         };

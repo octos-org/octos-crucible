@@ -1,0 +1,51 @@
+name: plugin-build
+
+# The build job of plugin-pack.yml (docs/plugins.md §14.3), a reusable
+# workflow so that the one-run key arrives as a workflow_call secret (GitHub
+# masks it; a job output passed through `env` would be printed in the log).
+#
+# Holds only that key, permissions {}: builds the uploaded plugin's image
+# (its own Dockerfile runs here) with RUN steps on a sandbox network whose
+# only way out is the egress proxy (config/egress.json), self-tests it, and
+# hands over the image and the outcome sealed to the platform key
+# (artifact plugin-outcome).
+
+on:
+  workflow_call:
+    secrets:
+      run_key:
+        description: "the package's one-run key"
+        required: true
+
+permissions: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions: {}
+    env:
+      H: ${{ github.workspace }}/plugin-build
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: plugin-build
+          path: ${{ github.workspace }}/plugin-build
+
+      # `crucible step plugin-build`: its step spec lists only the one-run
+      # key, and it removes every secret variable from its environment first.
+      - name: Build and self-test
+        env:
+          RUN_KEY: ${{ secrets.run_key }}
+        run: |
+          set -euo pipefail
+          chmod 0755 "$H/bin/crucible"
+          "$H/bin/crucible" step plugin-build --handoff "$H" --out "$RUNNER_TEMP/outcome"
+
+      # Sealed to the platform key: safe in a public repository's artifacts.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: plugin-outcome
+          path: ${{ runner.temp }}/outcome
+          retention-days: 1
+          if-no-files-found: error

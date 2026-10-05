@@ -139,7 +139,10 @@ pub async fn open(a: Box<OpenArgs>, s: &Secrets) -> Result<()> {
     let tmp = tempfile::tempdir()?;
     let checked = crate::user_plugin::unpack(&zip, tmp.path());
     let (manifest, review) = match (checked, &worker) {
-        (Ok((root, m)), _) => (m, crate::user_plugin::review_material(&root, REVIEW_BUDGET)?),
+        (Ok((root, m)), _) => (
+            m,
+            crate::user_plugin::review_material(&root, REVIEW_BUDGET)?,
+        ),
         (Err(_), None) => bail!("the plugin was refused (the reason is not logged)"),
         (Err(e), Some(w)) => {
             println!("::error::the plugin was refused (the reason goes to the uploader)");
@@ -203,8 +206,9 @@ pub async fn build(a: BuildArgs, s: &Secrets) -> Result<()> {
     super::check_caps(super::spec("plugin-build"), exec.caps())?;
     let info: Value = serde_json::from_slice(&std::fs::read(h.join("plugin.json"))?)?;
     let pinned: UserPlugin = serde_json::from_value(info["plugin"].clone())?;
-    let platform: crucible_crypto::PublicKey =
-        std::fs::read_to_string(h.join("platform.pub"))?.trim().parse()?;
+    let platform: crucible_crypto::PublicKey = std::fs::read_to_string(h.join("platform.pub"))?
+        .trim()
+        .parse()?;
     let zip = crucible_crypto::open(&keys, &std::fs::read(h.join("package.sealed"))?)
         .context("opening the package")?;
     drop(keys);
@@ -238,9 +242,14 @@ pub async fn build(a: BuildArgs, s: &Secrets) -> Result<()> {
     let egress = egress_summary(&egress_log);
     // Allowed hosts are allowlist entries; denied ones only go to the
     // uploader.
+    let hosts: Vec<&str> = egress["allowed"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
     eprintln!(
-        "build egress: allowed {:?}, denied {} connection(s)",
-        egress["allowed"], egress["denied"]
+        "build egress (through the proxy only): allowed hosts [{}], denied {} connection(s)",
+        hosts.join(", "),
+        egress["denied"]
     );
     outcome["plugin_id"] = json!(pinned.name);
     outcome["package"] = json!(pinned.blob.sha256);
@@ -336,7 +345,10 @@ async fn keep_image(
     let r = selftest(h, root, image)?;
     let id = archive.id.clone();
     let gz = crate::image_archive::gzip(&archive.into_bytes())?;
-    std::fs::write(out.join("image.sealed"), crucible_crypto::seal(platform, &gz)?)?;
+    std::fs::write(
+        out.join("image.sealed"),
+        crucible_crypto::seal(platform, &gz)?,
+    )?;
     Ok(json!({
         "status": "ready",
         "selftest": summary(&r),
@@ -568,7 +580,8 @@ mod tests {
     async fn forged_outcomes_are_refused() {
         let platform = crucible_crypto::PrivateKey::generate();
         let (_sd, s) = secrets(&platform);
-        let good = json!({"status": "failed", "error": "x", "plugin_id": ID, "package": "a".repeat(64)});
+        let good =
+            json!({"status": "failed", "error": "x", "plugin_id": ID, "package": "a".repeat(64)});
         // Sealed to the platform key and about this plugin: accepted.
         let (_d, a) = setup(&good, &platform.public());
         let b = verify(&a, ID, &s).await.unwrap();

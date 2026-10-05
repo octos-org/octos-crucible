@@ -92,7 +92,9 @@ pub fn check_dockerfile(text: &str) -> Result<()> {
                 for a in args.iter().filter(|a| !a.starts_with("--")) {
                     let a = a.trim_matches(|c| c == '"' || c == '[' || c == ']' || c == ',');
                     if a.contains("://") || a.starts_with("git@") {
-                        bail!("Dockerfile: ADD of a URL or git repository is not allowed (download it in a RUN step, through the build proxy)");
+                        bail!(
+                            "Dockerfile: ADD of a URL or git repository is not allowed (download it in a RUN step, through the build proxy)"
+                        );
                     }
                 }
             }
@@ -118,9 +120,7 @@ fn check_base(image: &str, stages: &[String]) -> Result<()> {
     let has_registry =
         image.contains('/') && (first.contains('.') || first.contains(':') || first == "localhost");
     if has_registry && !BASE_REGISTRIES.contains(&first) {
-        bail!(
-            "Dockerfile: FROM {image}: base images may come only from Docker Hub or ghcr.io"
-        );
+        bail!("Dockerfile: FROM {image}: base images may come only from Docker Hub or ghcr.io");
     }
     Ok(())
 }
@@ -210,7 +210,10 @@ pub async fn build(
     let r = match lim.timeout {
         Some(t) => match tokio::time::timeout(t, exec.build(&b, log.path())).await {
             Ok(r) => r,
-            Err(_) => Err(anyhow!("the build took longer than {} minutes", t.as_secs() / 60)),
+            Err(_) => Err(anyhow!(
+                "the build took longer than {} minutes",
+                t.as_secs() / 60
+            )),
         },
         None => exec.build(&b, log.path()).await,
     };
