@@ -2,7 +2,7 @@
 
 与 `crucible eval local` 是同一个驱动、同样的步骤顺序（generate × 遍数 → handoff → score-tests × 遍数 → publish），区别只在**每一步由 Nomad 派出去**：每步一个 `type = "batch"` 的 job，job 里唯一的 task 用 `raw_exec` 在节点上运行 `crucible step <名字>`。步骤里要起的容器仍由**节点上的 Docker** 启动（沙箱槽位、网络规则、清理与单机完全相同），Nomad 只管排队、选节点、记时间。设计见 `docs/executors.md` §3.3 的"整步托管"、§4.3、§5.4。
 
-目前是原型验证阶段：没有为防攻击额外加限制，已有的沙箱隔离保留；密钥用本机钥匙（`crucible keys gen`），结果不进排行榜。
+目前是原型验证阶段：已有的沙箱隔离保留，可选 gVisor（见下）；密钥用本机钥匙（`crucible keys gen`），结果不进排行榜。
 
 ## 安装（单节点，Ubuntu）
 
@@ -66,6 +66,8 @@ crucible eval nomad --root <仓库> --taskset hello-world --agent builtin:octos 
 | `--sandbox-pool` | `default` | generate、score-tests 的节点池 |
 
 结果与单机一样在 `--out`（默认 `./crucible-evals`）`/<eval id>/`，eval id 默认 `nomad-<时间>-<随机>`；`steps.json` 的时间取 Nomad 记录的 task 开始/结束时间，manifest 记 `timing_source: nomad`。各步的标准输出与错误在步骤结束后从 Nomad 取回，打印到驱动的标准错误。
+
+**gVisor**：驱动的环境里设了 `CRUCIBLE_DOCKER_RUNTIME=runsc` 时，它随 `HOME`、`PATH` 一起传给每个步骤，节点上的 Docker 用 gVisor 起步骤的所有容器（每个节点都要装好并在 `daemon.json` 注册，见 `docs/executors.md` §3.6）。
 
 ## 每一步怎样提交
 

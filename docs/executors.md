@@ -333,6 +333,31 @@ Nomad 自己没有 NetworkPolicy 这样的通用网络规则，隔离最终都�
 
 插件拿到的输入（产出、隐藏材料、交互记录）先复制到插件 uid 可读的临时目录再只读挂载，不与步骤进程共享其他目录。三个后端都能满足这两条，因此目前没有拒绝 model 插件的后端；若以后接入的后端做不到（例如只能在步骤自己的网络命名空间或同一 uid 里起容器），该后端必须拒绝运行 `model: true` 的用户插件，记为平台错误，不降级运行。
 
+### 3.6 隔离加固：gVisor、用户命名空间、挂载
+
+**gVisor（Docker 类后端：GitHub 自托管、单机、Nomad）。** `CRUCIBLE_DOCKER_RUNTIME=runsc` 时，Docker 后端起的每个容器（agent、被测应用、测试、打分器、交互运行器）都加 `--runtime=runsc`，在 gVisor 的用户态内核里运行；不设时与原来完全相同。运行时必须已在 Docker 里注册，否则 `crucible eval local` 一开始、各步骤起第一个容器前就报错（列出 `docker info` 里有的运行时）。Nomad 驱动把这个变量传给每个步骤，节点上都要装好。注册方法（`/etc/docker/daemon.json`，`sudo systemctl reload docker` 即生效，不重启容器）：
+
+```json
+{"runtimes": {"runsc": {"path": "/usr/local/bin/runsc", "runtimeArgs": ["--host-fifo=open", "--directfs=false"]}}}
+```
+
+两个参数都是为了跨沙箱的 FIFO（巡天的 agent 与引擎各在一个容器里，经一对 FIFO 对话）：`--host-fifo=open` 允许沙箱打开宿主机上的 FIFO（默认不允许）；gVisor 默认的 directfs 下，两个沙箱经同一对 FIFO 双向传大块数据会卡住（实测 70 KB 以上），`--directfs=false` 改由 gofer 中转后正常。与 runc 相比的差别，坩埚已处理：
+
+- Docker 自定义网络的内置 DNS（127.0.0.11）靠容器网络命名空间里的 iptables 转发，gVisor 自己的网络栈看不到它，名字解析不了：容器加入命名网络时，坩埚把网络里正在运行的成员的名字和别名写进 `/etc/hosts`（`--add-host`），与 Kubernetes 后端的 `hostAliases` 相同。
+- 沙箱里 `mkfifo` 建出的 FIFO 只在那个沙箱里：巡天的 FIFO 改由脚本在宿主机上建。
+- `--network container:<名字>`（ARC 官方打分器）在 gVisor 下不成立（每个沙箱一套网络栈，共享不了 127.0.0.1），直接拒绝；这个打分器要么不开 gVisor，要么用 Kubernetes 后端（同一 Pod 在同一个 gVisor 沙箱里）。
+- 不在 gVisor 里的：`docker build`（BuildKit 用 runc 跑 `RUN`）、`sandbox-net.sh` 的探测容器。沙箱网络的 iptables 在宿主机一侧，与运行时无关，自检照常。
+
+magicbook 实测（Docker 29.8，gVisor release-20260928.0）：开 runsc 后 hello-world app 1.0，巡天 L1 app 4458.556163（不带与带假模型凭据两种，后者 score-tests 建沙箱、自检通过），与 runc 相同；ARC 官方打分器按上面拒绝（记系统错误）；运行时名字写错时 `eval local` 立即报错。
+
+**用户命名空间（userns-remap）与 rootless Docker：没有做，原因如下。**
+
+- `userns-remap` 是整个 Docker 守护进程的设置（这台机器上所有容器，包括别人的），要重启守护进程；Docker 没有按容器开启的用户命名空间（Podman 的 `--userns=auto`、Kubernetes 的 `hostUsers: false` 才有）。开启后容器里的 uid 1000 在宿主机上是 10xxxx：步骤挂进去的目录（工作目录、测试材料、结果目录，属于调用者）它读写不了，写出来的文件步骤又删不掉，每个挂载都得先 chown/ACL 到下级 uid 段；对单个容器用 `--userns=host` 豁免又等于没开。
+- rootless Docker 的容器网络在 RootlessKit 自己的网络命名空间里：`sandbox-net.sh` 在宿主机 `DOCKER-USER`/`INPUT` 链上的规则看不到容器流量，计量代理和出网代理监听的网桥地址也不在宿主机上，沙箱网络要整套重做。
+- 现有的做法已经覆盖了用户命名空间主要防的东西：agent、测试都以非 root 运行，cap-drop ALL、no-new-privileges，以 root 运行的只有题目方给的被测应用和 ARC 官方 runner（没有宿主机目录挂载）。要更强隔离用上面的 gVisor。
+
+**挂载。** 检查结果：Docker 的 tmpfs（`--tmpfs` 和 `--mount type=tmpfs`）默认就是 `nosuid,nodev,noexec`（巡天 agent 的 `/work` 明确要 `exec`）；只读挂载在新内核上是递归只读；agent 的 `/req`、测试材料都是只读。新增：Docker 后端拒绝把机器本身的路径挂进容器（`/`、`/proc`、`/sys`、`/dev`、`/run`、`/etc`、`/boot`、`/root`、Docker/containerd/kubelet/k3s/Nomad 的状态目录、任何 socket，按解析符号链接后的路径判断），对插件脚本经 `crucible ctr` 给的 `-v`/`--mount` 同样生效。Kubernetes 后端本来就只允许评测卷下的路径。
+
 ---
 
 ## 4. 密钥与交接在各后端

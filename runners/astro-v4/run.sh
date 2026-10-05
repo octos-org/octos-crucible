@@ -71,7 +71,6 @@ mkdir -p "$OUT" || exit 1
 OUT="$(cd "$OUT" && pwd -P)"
 
 RUN_ID="$(date +%s)$$${RANDOM}"
-PIPES="crucible-astro-pipes-$RUN_ID"
 AGENT_CTR="crucible-astro-agent-$RUN_ID"
 ENGINE_CTR="crucible-astro-engine-$RUN_ID"
 LABEL="crucible.runner.run=$RUN_ID"
@@ -81,11 +80,11 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/crucible-astro.XXXXXX")" || exit 1
 WORK="$(cd "$WORK" && pwd -P)"
 mkdir -p "$WORK/out"
 [ "$RUN_AS" = "1000:1000" ] && chmod -R a+rwX "$WORK"
+PIPES="$WORK/pipes"
 
 # shellcheck disable=SC2317,SC2329 # invoked via trap
 cleanup() {
   ctr rm -f "$AGENT_CTR" "$ENGINE_CTR" >/dev/null 2>&1 || true
-  ctr volume rm -f "$PIPES" >/dev/null 2>&1 || true
   rm -rf "$WORK" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -113,10 +112,11 @@ else
 fi
 
 if [ -z "$STATUS" ]; then
-  # Private volume with the two FIFOs, owned by the run uid.
-  ctr volume create --label "$LABEL" "$PIPES" >/dev/null \
-    && ctr run --rm --network none --label "$LABEL" -v "$PIPES:/pipes" --entrypoint sh "$IMAGE" -c \
-      "mkfifo -m 600 /pipes/to_agent /pipes/from_agent && chown -R $RUN_AS /pipes && chmod 700 /pipes" \
+  # Private directory with the two FIFOs, owned by the run uid. Made here,
+  # not in a container: a FIFO made inside a gVisor sandbox exists only in
+  # that sandbox.
+  { mkdir -m 700 "$PIPES" && mkfifo -m 600 "$PIPES/to_agent" "$PIPES/from_agent" \
+    && { [ "$(id -u)" != 0 ] || chown -R "$RUN_AS" "$PIPES"; }; } \
     || { STATUS=error; DETAIL="could not set up the agent pipes"; }
 fi
 

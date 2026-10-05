@@ -318,6 +318,10 @@ pub async fn eval_local(a: LocalArgs) -> Result<()> {
     if !cfg!(target_os = "linux") {
         bail!("eval local needs Linux (Docker with iptables); see docs/executors.md");
     }
+    crate::executor::docker::check_runtime()?;
+    if let Some(r) = crate::executor::docker::runtime() {
+        eprintln!("containers run under the {r} runtime (CRUCIBLE_DOCKER_RUNTIME)");
+    }
     let exe = std::env::current_exe()?;
     run_eval(a, Backend::Local, exe).await
 }
