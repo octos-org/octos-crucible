@@ -1,0 +1,43 @@
+{
+  "schema": 1,
+  "name": "helpdesk",
+  "description": "Public tuning task close to ARC difficulty: a helpdesk web app built over 2 stages on the same code, with roles and permissions (admin, agent, customer), forms with exact validation messages, ticket lists with filters, a status workflow, internal notes and a dashboard. Requirements and tests are public (source/), written for this platform (not from ARC). Scored with Playwright browser tests (14 / 11).",
+  "scorer": {
+    "name": "playwright"
+  },
+  "aggregate": {
+    "items": "sum",
+    "stages": "ratio"
+  },
+  "total_time_limit_s": 6000,
+  "stages": [
+    {
+      "id": "stage-1",
+      "inputs_blob": {
+        "sha256": "a28ede1810adaaa377b58a21b78cdcf326965bf99a18cc96a5871be64533db3a",
+        "key_id": "1ffa702796eb5ee8"
+      },
+      "tests_blob": {
+        "sha256": "ca2a86d8a8652aacd443b085bf82d7ae9276545291252f6277e2cb7c5d33b4df",
+        "key_id": "1ffa702796eb5ee8"
+      },
+      "packager": "web-app",
+      "time_limit_s": 3000,
+      "expected_total": 14
+    },
+    {
+      "id": "stage-2",
+      "inputs_blob": {
+        "sha256": "86f7523b8df76aeebf4d02e167a0d8a44e3e2a8749e4b5b8b2211b8a1be68b11",
+        "key_id": "1ffa702796eb5ee8"
+      },
+      "tests_blob": {
+        "sha256": "a8bb208e035b7c6e0cbe57cc1a222723ecb8e8a0f124030b39fb2b3366ecf4db",
+        "key_id": "1ffa702796eb5ee8"
+      },
+      "packager": "web-app",
+      "time_limit_s": 3000,
+      "expected_total": 11
+    }
+  ]
+}

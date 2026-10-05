@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "name": "helpdesk",
+  "description": "Public tuning task close to ARC difficulty: a helpdesk web app built over 2 stages on the same code, with roles and permissions (admin, agent, customer), forms with exact validation messages, ticket lists with filters, a status workflow, internal notes and a dashboard. Requirements and tests are public (source/), written for this platform (not from ARC). Scored with Playwright browser tests (14 / 11).",
+  "scorer": {"name": "playwright"},
+  "aggregate": "sum",
+  "total_time_limit_s": 6000,
+  "stages": [
+    {"id": "stage-1", "dir": "help-stage-1", "inputs": ["requirements.yaml"], "tests": ["tests"], "output": "web-app", "time_limit_s": 3000, "expected_total": 14},
+    {"id": "stage-2", "dir": "help-stage-2", "inputs": ["requirements.yaml"], "tests": ["tests"], "output": "web-app", "time_limit_s": 3000, "expected_total": 11}
+  ]
+}

@@ -1,0 +1,96 @@
+id: ROOT
+name: Helpdesk - Stage 2
+type: FOLDER
+dependencies: []
+description: |-
+  The helpdesk application already exists from the previous stage: accounts with the roles admin, agent and customer (seeded: "ada" / "ada-pass" admin, "bob" / "bob-pass" agent, "cy" / "cy-pass" and "dee" / "dee-pass" customers), sign-in at `/login`, the home page `/` with role-dependent links, opening tickets at `/tickets/new` (customers), ticket pages `/tickets/<id>` with "Status:", "Category:", "Priority:" and "Created by:", the ticket list `/tickets` with its "Search" and "Priority filter" filters, and user management at `/users` (admins). Everything it does must keep working. This stage adds assigning tickets, a status workflow, comments with internal notes, a status filter and a dashboard for staff.
+children:
+- id: REQ-4
+  name: Ticket Handling
+  type: FOLDER
+  dependencies: []
+  description: |-
+    What staff and customers can do on a ticket's page.
+  children:
+  - id: REQ-4-1
+    name: Assign a Ticket
+    type: ATOMIC
+    dependencies: []
+    description: |-
+      On a ticket's page every viewer sees "Assigned to: <username>", or "Assigned to: nobody" while the ticket is unassigned (new tickets are unassigned). Admins and agents also see a select labelled "Assignee" listing every agent's username and a button named "Assign"; pressing it assigns the ticket to the chosen agent. Customers do not see the select or the button.
+    scenarios:
+    - name: 'REQ-4-1: Assign a Ticket - Scenario 1'
+      steps:
+      - keyword: GIVEN
+        content: 'The admin "ada" opens a new ticket''s page, which shows "Assigned to: nobody".'
+      - keyword: WHEN
+        content: 'She chooses "bob" in "Assignee" and presses "Assign".'
+      - keyword: THEN
+        content: 'The page shows "Assigned to: bob", also for the customer who created the ticket, who sees no "Assign" button.'
+  - id: REQ-4-2
+    name: Status Workflow
+    type: ATOMIC
+    dependencies: []
+    description: |-
+      A ticket's status is one of "Open", "In progress", "Resolved" and "Closed". On the ticket's page admins and agents see exactly the buttons for the moves allowed from the current status: "Start progress" (Open to In progress), "Resolve" (In progress to Resolved) and "Reopen" (Resolved to Open). The customer who created the ticket sees a button "Close" only while the status is "Resolved" (Resolved to Closed). A closed ticket shows none of these buttons to anyone. After a move the page shows the new "Status: <status>".
+    scenarios:
+    - name: 'REQ-4-2: Status Workflow - Scenario 1'
+      steps:
+      - keyword: GIVEN
+        content: 'The agent "bob" is on the page of an open ticket created by "cy".'
+      - keyword: WHEN
+        content: 'He presses "Start progress" and then "Resolve"; then cy opens the page and presses "Close".'
+      - keyword: THEN
+        content: 'The page shows "Status: Closed" and no workflow buttons; before pressing "Resolve", bob saw no "Start progress" and no "Reopen" button.'
+  - id: REQ-4-3
+    name: Comments and Internal Notes
+    type: ATOMIC
+    dependencies: []
+    description: |-
+      Below the ticket details, anyone who may open the ticket sees the comments as list items "<username>: <text>", oldest first, and a text area labelled "Comment" with a button named "Add comment". An empty or blank comment is not stored and the page shows "Comment cannot be empty". Admins and agents also see a checkbox labelled "Internal note"; a comment added with it ticked is an internal note, shown to admins and agents with the suffix " (internal)" and never shown to customers.
+    scenarios:
+    - name: 'REQ-4-3: Comments and Internal Notes - Scenario 1'
+      steps:
+      - keyword: GIVEN
+        content: 'The customer "cy" created a ticket.'
+      - keyword: WHEN
+        content: 'cy adds the comment "Any news?"; the agent "bob" adds "Customer seems upset" with "Internal note" ticked and "Working on it" without.'
+      - keyword: THEN
+        content: 'bob sees "cy: Any news?", "bob: Customer seems upset (internal)" and "bob: Working on it"; cy sees her comment and "bob: Working on it" but not the internal note.'
+- id: REQ-5
+  name: Staff Overview
+  type: FOLDER
+  dependencies: [REQ-4]
+  description: |-
+    Finding tickets by status and counting them.
+  children:
+  - id: REQ-5-1
+    name: Status Filter
+    type: ATOMIC
+    dependencies: []
+    description: |-
+      The filters on `/tickets` gain a select labelled "Status filter" with the options "All", "Open", "In progress", "Resolved" and "Closed". Pressing "Apply" also keeps only the rows with the chosen status ("All" keeps every status), combined with the search text and the priority filter. The table's "Status" column shows each ticket's current status.
+    scenarios:
+    - name: 'REQ-5-1: Status Filter - Scenario 1'
+      steps:
+      - keyword: GIVEN
+        content: 'The agent "bob" started progress on one of two new tickets.'
+      - keyword: WHEN
+        content: 'He chooses "In progress" in "Status filter" and presses "Apply".'
+      - keyword: THEN
+        content: 'Only that ticket is listed among the two, with "In progress" in its "Status" column.'
+  - id: REQ-5-2
+    name: Dashboard
+    type: ATOMIC
+    dependencies: []
+    description: |-
+      The page `/dashboard` is for admins and agents (customers get HTTP status 403 and "Forbidden"; visitors who are not signed in are sent to `/login`). It shows a level-1 heading "Dashboard" and the texts "Open: N", "In progress: N", "Resolved: N" and "Closed: N", the number of all tickets with each status, and "Assigned to me: N", the number of tickets assigned to the signed-in user that are not closed. The home page shows a link named "Dashboard" to it for admins and agents only.
+    scenarios:
+    - name: 'REQ-5-2: Dashboard - Scenario 1'
+      steps:
+      - keyword: GIVEN
+        content: 'The agent "bob" is on the dashboard, which shows "Open: 3".'
+      - keyword: WHEN
+        content: 'A customer opens a new ticket and an admin assigns it to bob; bob reloads the dashboard.'
+      - keyword: THEN
+        content: 'It shows "Open: 4" and "Assigned to me:" one more than before.'
