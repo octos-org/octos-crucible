@@ -1,0 +1,154 @@
+id: ROOT
+name: Helpdesk - Stage 1
+type: FOLDER
+dependencies: []
+description: |-
+  A helpdesk web application where customers open support tickets and staff handle them. Users have exactly one role: "admin", "agent" or "customer". Everything is stored by the server and survives page reloads. This stage builds accounts and roles, opening tickets, viewing tickets and the list of tickets, and user management. A later stage extends the same application.
+children:
+- id: REQ-1
+  name: Accounts
+  type: FOLDER
+  dependencies: []
+  description: |-
+    Signing in, signing out, the seeded accounts and the role-dependent navigation.
+  children:
+  - id: REQ-1-1
+    name: Seeded Accounts and Sign In
+    type: ATOMIC
+    dependencies: []
+    description: |-
+      These accounts exist from the start (username / password / role): "ada" / "ada-pass" / admin, "bob" / "bob-pass" / agent, "cy" / "cy-pass" / customer, "dee" / "dee-pass" / customer. The page `/login` shows a level-1 heading "Sign in", a text input labelled "Username", a password input labelled "Password" and a button named "Sign in". Correct credentials sign the user in and go to the home page `/`. Wrong credentials keep the visitor on `/login` and show "Invalid username or password". The sign-in survives page reloads. Pages that need a signed-in user send a visitor who is not signed in to `/login`.
+    scenarios:
+    - name: 'REQ-1-1: Seeded Accounts and Sign In - Scenario 1'
+      steps:
+      - keyword: GIVEN
+        content: 'A visitor is on `/login`.'
+      - keyword: WHEN
+        content: 'They sign in as "bob" with "bob-pass".'
+      - keyword: THEN
+        content: 'They are on `/` and signed in as bob, also after a reload.'
+    - name: 'REQ-1-1: Seeded Accounts and Sign In - Scenario 2'
+      steps:
+      - keyword: GIVEN
+        content: 'A visitor is on `/login`.'
+      - keyword: WHEN
+        content: 'They sign in as "cy" with a wrong password.'
+      - keyword: THEN
+        content: 'The text "Invalid username or password" is shown on `/login`.'
+  - id: REQ-1-2
+    name: Home Page and Navigation
+    type: ATOMIC
+    dependencies: [REQ-1-1]
+    description: |-
+      The home page `/` shows a level-1 heading "Helpdesk". A visitor who is not signed in sees a link named "Sign in" leading to `/login`. A signed-in user sees the text "Signed in as <username> (<role>)", for example "Signed in as bob (agent)", a button named "Sign out" and, depending on the role, these links: "Tickets" (every role, to `/tickets`), "New ticket" (customers only, to `/tickets/new`) and "Users" (admins only, to `/users`). A link a role may not use is not shown at all. Pressing "Sign out" signs the user out and shows the "Sign in" link again.
+    scenarios:
+    - name: 'REQ-1-2: Home Page and Navigation - Scenario 1'
+      steps:
+      - keyword: GIVEN
+        content: 'The customer "cy" is signed in and on `/`.'
+      - keyword: THEN
+        content: 'The page shows "Signed in as cy (customer)", the links "Tickets" and "New ticket", and no "Users" link.'
+    - name: 'REQ-1-2: Home Page and Navigation - Scenario 2'
+      steps:
+      - keyword: GIVEN
+        content: 'The admin "ada" is signed in and on `/`.'
+      - keyword: THEN
+        content: 'The page shows the links "Tickets" and "Users" and no "New ticket" link.'
+- id: REQ-2
+  name: Tickets
+  type: FOLDER
+  dependencies: [REQ-1]
+  description: |-
+    Customers open tickets; who may see which ticket depends on the role.
+  children:
+  - id: REQ-2-1
+    name: Open a Ticket
+    type: ATOMIC
+    dependencies: []
+    description: |-
+      The page `/tickets/new` is for customers. It shows a level-1 heading "New ticket" and a form with: a text input labelled "Title"; a select labelled "Category" with the options "Billing", "Technical" and "Account"; a group of radio buttons named "Priority" with the options "Low", "Normal" and "High", where "Normal" is selected by default; a text area labelled "Description"; and a button named "Submit ticket". The title must have 5 to 80 characters after trimming spaces, otherwise the page shows "Title must be 5 to 80 characters". The description must have at least 20 characters after trimming, otherwise the page shows "Description must be at least 20 characters". When there are errors, every applicable message is shown at once, nothing is stored, and the values the customer entered stay in the form. A valid form stores a new ticket with status "Open", created by the signed-in customer, and goes to that ticket's page. A signed-in admin or agent who opens `/tickets/new` gets a page with HTTP status 403 showing "Forbidden".
+    scenarios:
+    - name: 'REQ-2-1: Open a Ticket - Scenario 1'
+      steps:
+      - keyword: GIVEN
+        content: 'The customer "cy" is on `/tickets/new`.'
+      - keyword: WHEN
+        content: 'She enters the title "Hi" and the description "short" and presses "Submit ticket".'
+      - keyword: THEN
+        content: 'Both "Title must be 5 to 80 characters" and "Description must be at least 20 characters" are shown and the title field still holds "Hi".'
+    - name: 'REQ-2-1: Open a Ticket - Scenario 2'
+      steps:
+      - keyword: GIVEN
+        content: 'The customer "cy" is on `/tickets/new`.'
+      - keyword: WHEN
+        content: 'She enters a valid title and description, chooses "Technical" and "High" and presses "Submit ticket".'
+      - keyword: THEN
+        content: 'The new ticket''s page is shown.'
+  - id: REQ-2-2
+    name: Ticket Page
+    type: ATOMIC
+    dependencies: [REQ-2-1]
+    description: |-
+      The page `/tickets/<id>` shows a level-1 heading with exactly the ticket's title and the texts "Status: <status>", "Category: <category>", "Priority: <priority>" and "Created by: <username>", plus the description. Admins and agents may open every ticket; a customer may open only the tickets they created. A customer opening another customer's ticket gets HTTP status 403 and "Forbidden". An id that does not exist gives HTTP status 404 and "Ticket not found".
+    scenarios:
+    - name: 'REQ-2-2: Ticket Page - Scenario 1'
+      steps:
+      - keyword: GIVEN
+        content: 'The customer "cy" created the ticket "Printer is on fire" (Technical, High).'
+      - keyword: WHEN
+        content: 'The agent "bob" opens its page.'
+      - keyword: THEN
+        content: 'He sees the heading "Printer is on fire", "Status: Open", "Category: Technical", "Priority: High" and "Created by: cy"; the customer "dee" opening the same page gets "Forbidden".'
+  - id: REQ-2-3
+    name: Ticket List
+    type: ATOMIC
+    dependencies: [REQ-2-2]
+    description: |-
+      The page `/tickets` shows a level-1 heading "Tickets" and a table with the column headers "Title", "Status", "Priority" and "Created by", one row per ticket the signed-in user may open (a customer sees only their own tickets, admins and agents see all), newest first. The title cell holds a link named with the title that leads to the ticket's page.
+    scenarios:
+    - name: 'REQ-2-3: Ticket List - Scenario 1'
+      steps:
+      - keyword: GIVEN
+        content: 'The customers "cy" and "dee" each created a ticket.'
+      - keyword: WHEN
+        content: 'Each of them and the agent "bob" open `/tickets`.'
+      - keyword: THEN
+        content: 'cy sees only her ticket, dee only hers, bob sees both; the newer ticket is above the older one.'
+  - id: REQ-2-4
+    name: List Filters
+    type: ATOMIC
+    dependencies: [REQ-2-3]
+    description: |-
+      Above the table on `/tickets` there is a text input labelled "Search", a select labelled "Priority filter" with the options "All", "Low", "Normal" and "High", and a button named "Apply". Pressing "Apply" shows only the rows whose title contains the search text (ignoring upper and lower case; an empty search matches every title) and whose priority matches the selected priority ("All" matches every priority). After applying, the inputs keep the chosen values.
+    scenarios:
+    - name: 'REQ-2-4: List Filters - Scenario 1'
+      steps:
+      - keyword: GIVEN
+        content: 'The agent "bob" is on `/tickets` and tickets "Refund please" (Low) and "Refund again" (High) exist.'
+      - keyword: WHEN
+        content: 'He enters "REFUND" in "Search", chooses "High" in "Priority filter" and presses "Apply".'
+      - keyword: THEN
+        content: 'Only "Refund again" is listed.'
+- id: REQ-3
+  name: User Management
+  type: ATOMIC
+  dependencies: [REQ-1]
+  description: |-
+    The page `/users` is for admins; a signed-in agent or customer gets HTTP status 403 and "Forbidden". It shows a level-1 heading "Users", a table with the column headers "Username" and "Role" listing every account, and a form with a text input labelled "Username", a password input labelled "Password", a select labelled "Role" with the options "customer", "agent" and "admin", and a button named "Create user". The username must be 3 to 20 letters or digits ("Username must be 3 to 20 letters or digits"), must not exist yet ("Username already taken"), and the password needs at least 6 characters ("Password must be at least 6 characters"). On errors every applicable message is shown and nothing is stored. A created user appears in the table and can sign in with the given password and role.
+  scenarios:
+  - name: 'REQ-3: User Management - Scenario 1'
+    steps:
+    - keyword: GIVEN
+      content: 'The admin "ada" is on `/users`.'
+    - keyword: WHEN
+      content: 'She creates the user "eve" with password "secret1" and role "agent".'
+    - keyword: THEN
+      content: 'The table lists "eve" with the role "agent", and eve can sign in and sees "Signed in as eve (agent)".'
+  - name: 'REQ-3: User Management - Scenario 2'
+    steps:
+    - keyword: GIVEN
+      content: 'The admin "ada" is on `/users`.'
+    - keyword: WHEN
+      content: 'She tries the username "b!" with the password "123".'
+    - keyword: THEN
+      content: 'Both "Username must be 3 to 20 letters or digits" and "Password must be at least 6 characters" are shown.'
