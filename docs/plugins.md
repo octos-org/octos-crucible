@@ -411,7 +411,7 @@ trait Packager {
 | 文件 | 作用 |
 |---|---|
 | `plugin.json` | 声明，见下表；未知字段拒绝 |
-| `Dockerfile` | 打分器镜像；打分逻辑全在镜像里。建议基础镜像钉 digest |
+| `Dockerfile` | 打分器镜像；打分逻辑全在镜像里。建议基础镜像钉 digest。构建规则见 §14.3：基础镜像只能来自 Docker Hub 或 ghcr.io 且写成字面量（不能用 `$变量`），不能 `ADD` 网址或 git 仓库，不能用 `ONBUILD`；构建用 Docker 经典构建器，不支持 BuildKit 专有语法（`RUN --mount`、heredoc） |
 | 其他文件 | 构建上下文（脚本、模型权重等），解压后不超过 100 MB、2000 个文件，不能有符号链接 |
 | `selftest/artifact`、`selftest/tests/`（可选） | 自检样例：一份产出和一份测试材料。没有时自检用空文件和空目录 |
 
@@ -460,11 +460,15 @@ trait Packager {
 1. 网页“插件”页上传，或 `crucible plugin upload <目录或 zip> --wait`。插件包在浏览器 / 命令行里用平台公钥封好，`POST /uploads`（`X-Upload-Kind: plugin`）后 `POST /plugins`。
 2. Worker 在 D1 表 `user_plugins` 登记 `u-<16 hex>`（`building`，私有），触发 `plugin-pack.yml`：
    - `open`（持平台私钥，不运行插件包里的任何东西）：解密、检查 `plugin.json`、`Dockerfile`、zip 限制；不通过直接把原因回传 Worker。通过后把插件包重新封给一次性钥匙交给下一个 job。
-   - `build`（只有一次性钥匙，`permissions: {}`，GitHub 托管机）：`crucible step plugin-build` 经执行后端构建镜像，再经通用外壳在 `selftest/` 样例（或空输入）上跑一次，能写出合法的 `result.json` 即自检通过。只把结果（`ready` + 自检分数，或失败原因）作为 job output 交出。
-   - `report`（持 Worker 令牌）：回传 Worker。
-3. 状态变为 `ready`（网页和 `crucible plugin status` 显示自检分数），或 `failed`（原因只给上传者看，不进公开日志）。
+   - `build`（只有一次性钥匙，`permissions: {}`，GitHub 托管机）：`crucible step plugin-build` 构建镜像，再经通用外壳在 `selftest/` 样例（或空输入）上跑一次，能写出合法的 `result.json` 即自检通过。构建是隔离的：
+     - `RUN` 步骤接在沙箱网络上（与 agent 运行时同一套 `tools/sandbox-net.sh`），唯一出口是本 job 的出网代理，只放行 `config/egress.json` 白名单里的主机（npm、PyPI）的 HTTPS；代理地址经 `HTTP_PROXY`/`HTTPS_PROXY` 构建参数给出。基础镜像由 Docker 守护进程拉取，`open` 已检查过只来自 Docker Hub 或 ghcr.io；`ADD` 网址被拒（否则守护进程会绕过代理去下载）。
+     - 构建最长 20 分钟、内存 4 GB；镜像（`docker save` 后）不超过 2 GB。
+     - 日志里只打印代理放行过的主机和被拒的连接数；被拒的主机名只回给上传者。
+     - 镜像（`docker save`，gzip）和结果（`ready` + 自检分数和镜像 id，或失败原因）都用平台公钥封好，作为 artifact `plugin-outcome` 交出，不再用 job output。
+   - `report`（持平台私钥、Worker 令牌、存储写权限）：用平台私钥解开结果，核对它属于这个插件 id 和这个插件包（解不开或对不上就按"平台侧失败"登记为 `failed`）；自己从镜像文件算出镜像 id（配置的 SHA-256，并逐层核对摘要），与结果里的一致才把封好的镜像存为块，连同镜像 id 写进登记（`plugin.image = {blob, id}`），回传 Worker。
+3. 状态变为 `ready`（网页和 `crucible plugin status` 显示自检分数和镜像 id），或 `failed`（原因只给上传者看，不进公开日志）。
 
-插件登记后不可修改；要改就重新上传，得到新的 id。
+插件登记后不可修改；要改就重新上传，得到新的 id。镜像只在登记时构建这一次。
 
 ### 14.4 在题目包里使用
 
@@ -472,13 +476,13 @@ trait Packager {
 
 权限：私有插件只有上传者的题目包能用；管理员 `POST /plugins/:id/public` 设为公开后，任何人的题目包都能用。内置题目包不受影响。本地 `crucible taskset validate` 遇到 `u-...` 时先按最宽松的能力放行，真正的检查在登记时做。
 
-评测时：`score`（交接）job 把插件包和隐藏材料一起重新封给一次性钥匙；`score-tests` 解开后经执行后端构建镜像 `crucible-scorer-<id>:run`，再由通用外壳运行。manifest 的 `scoring.plugins` 记下 `u-...` 的名字和版本。
+评测时：`score`（交接）job 把登记时存下的镜像和隐藏材料一起重新封给一次性钥匙；`score-tests` 解开后先核对镜像 id 与题目包里记的一致，再载入为 `crucible-scorer-<id>:run`（Docker 后端 `docker load`；Kubernetes 后端推到集群镜像仓库），由通用外壳运行，不再重新构建。manifest 的 `scoring.plugins` 记下 `u-...` 的名字、版本和镜像 id（`image`）。镜像功能上线前登记的插件没有 `image`，仍按插件包在打分机上构建。
 
 ### 14.5 用户插件能拿到什么
 
 | | 能拿到 | 拿不到 |
 |---|---|---|
-| 构建（`plugin-pack` 的 `build`、`score-tests`） | 自己的插件包、构建时联网 | 平台私钥、Worker 令牌（这两个 job 不持有） |
+| 构建（`plugin-pack` 的 `build`） | 自己的插件包；经出网代理访问白名单软件源 | 平台私钥、Worker 令牌（这个 job 不持有）；白名单以外的网络 |
 | 打分（`score-tests` 的插件容器） | 产出、本阶段隐藏材料、交互运行记录；`model: true` 时计量代理地址 | 平台私钥、Worker 令牌、一次性钥匙、模型 key 本身、网络（除计量代理） |
 
 需要模型时只能经计量代理用提交者的 key，用量记进 `eval_usage.scorer`，计入提交者的预算（§10）。
@@ -487,10 +491,10 @@ trait Packager {
 
 原型阶段只保留已有的沙箱隔离，下面这些记为公开运营前再做：
 
-- 构建：`build` job 构建时可以联网、没有资源和时间上限之外的限制；应改成在隔离的构建器（无出网或只经出网代理白名单）里构建，并限制镜像大小。
-- 镜像可复现：现在每次评测都按插件包重新构建，`Dockerfile` 里没钉死的依赖可能让同一版本打出不同的分；应在登记时构建一次并按 digest 存入镜像仓库，评测时只拉这个 digest。
-- 模型：用户插件 `model: true` 时，插件代码与提交者的计量代理在同一台机器上；容器逃逸即可能拿到提交者的 key。公开运营前应把计量代理与插件容器分到不同机器，或禁止公开插件使用模型。
+- ~~构建可以自由联网~~（已做）：`RUN` 只经出网代理访问白名单软件源，构建限时 20 分钟、镜像不超过 2 GB，见 §14.3。
+- ~~每次评测重新构建~~（已做）：登记时构建一次，镜像加密存为块，题目包和 manifest 记镜像 id，评测只载入这个镜像，见 §14.3、§14.4。
+- ~~模型插件与计量代理同处一个执行上下文~~（已做）：`model: true` 的用户插件以固定的另一个 uid（默认 65532）在独立的网络命名空间里运行，输入复制到它可读的目录；与步骤进程同 uid 时拒绝运行。各后端的等价做法见 `docs/executors.md` §3.5。仍然成立的边界：Docker 和 Nomad 后端里两者在同一台机器上，容器逃逸到宿主机 root 仍可能拿到 key；要分到不同机器需用 Kubernetes 并按 §3.5 配节点池。
 - ~~自检只证明“能写出 result.json”，不检查打分是否合理；公开插件需要人工审核~~ 已做：plugin-pack 回传审核材料（文件清单、Dockerfile、小的文本文件），网页管理员视图可读；`POST /plugins/:id/public` 设为公开必须带审核清单确认（源码、Dockerfile、hidden 时不泄露测试内容、模型用法四项全勾），审核人与时间记入 `approval`（`docs/api.md`）。
-- 失败原因和自检结果经 job output 交给 `report` job，`build` job 里的代码可以伪造它们（只影响这个插件自己的登记结果）；应改为封给平台公钥的文件。
+- ~~自检结果经 job output 交出~~（已做）：改为封给平台公钥的文件，`report` 解开后核对插件 id、插件包和镜像 id（镜像 id 由 `report` 自己从镜像算出）才登记。仍然成立的边界：能控制 `build` 机器的人可以用公钥封一份假的自检分数，但改不了镜像 id 与镜像内容的对应关系，也改不了评测时实际运行的镜像。
 - 用户插件的 `detail`、`items` 由插件自己写，hidden 时是否泄露测试内容由插件作者负责；公开题目包引用的插件需要审核这一点。
 - 资源：插件容器的内存、CPU、时间上限是固定值，没有按用户或题目包计配额。~~上传频率没有限制~~ 已做：Worker 按用户限制 24 小时内的上传次数与字节、插件与题目包登记数、评测数和同时进行的评测数，超限返回 429 并写明恢复时间；管理员可按用户调整或豁免（`docs/api.md`“配额”）。登记超过 2 小时仍在构建/打包的由每小时的定时任务标为失败并写明原因。

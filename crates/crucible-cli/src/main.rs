@@ -14,6 +14,7 @@ mod build;
 mod cred;
 mod ctr;
 mod executor;
+mod image_archive;
 mod k8s_eval;
 mod keys;
 mod local;
@@ -1196,6 +1197,7 @@ async fn taskset(cmd: TasksetCmd) -> Result<()> {
                             sha256: "0".repeat(64),
                             key_id: "0".repeat(16),
                         },
+                        image: None,
                         runs_taskset_code: false,
                         model: true,
                         accepts: vec![],

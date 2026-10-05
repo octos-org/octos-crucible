@@ -322,6 +322,9 @@ pub struct PluginVersion {
     pub kind: String,
     pub name: String,
     pub version: String,
+    /// Uploaded plugins: the image id scoring ran (`sha256:...`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
 }
 
 /// The display of evaluations that predate `scoring`: test counts per
@@ -562,10 +565,17 @@ impl TaskSet {
             let version = pinned
                 .or_else(|| self.plugin(kind, name).ok().map(|p| p.version))
                 .unwrap_or_else(|| "unknown".into());
+            let image = self
+                .user_plugins
+                .iter()
+                .find(|u| u.kind == kind && u.name == name)
+                .and_then(|u| u.image.as_ref())
+                .map(|i| i.id.clone());
             let v = PluginVersion {
                 kind: kind.as_str().into(),
                 name: name.into(),
                 version,
+                image,
             };
             if !out.contains(&v) {
                 out.push(v);

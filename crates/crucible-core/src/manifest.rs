@@ -462,6 +462,7 @@ mod tests {
                     kind: "scorer".into(),
                     name: "x".into(),
                     version: "1".into(),
+                    image: None,
                 }],
             }),
             replicas: reps,

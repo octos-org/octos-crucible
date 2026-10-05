@@ -215,6 +215,8 @@ impl DockerExecutor {
         }
         if b.no_network {
             a.push("--network=none".into());
+        } else if let Some(n) = &b.network {
+            a.push(format!("--network={n}"));
         }
         if let Some(p) = &b.platform {
             a.extend(["--platform".into(), p.clone()]);
@@ -469,7 +471,10 @@ impl Executor for DockerExecutor {
     async fn build(&self, b: &BuildSpec, log: &Path) -> Result<()> {
         let f = std::fs::File::create(log)?;
         let mut cmd = Command::new("docker");
-        if let Some(v) = buildkit_env() {
+        if b.network.is_some() {
+            // A named network for RUN steps: the classic builder only.
+            cmd.env("DOCKER_BUILDKIT", "0");
+        } else if let Some(v) = buildkit_env() {
             cmd.env("DOCKER_BUILDKIT", v);
         }
         let st = tokio::process::Command::from(cmd)
@@ -503,6 +508,31 @@ impl Executor for DockerExecutor {
 
     async fn image_rm(&self, image: &str) {
         let _ = docker_out(&["image", "rm", "-f", image]).await;
+    }
+
+    async fn image_save(&self, image: &str, to: &Path) -> Result<()> {
+        let to = to.display().to_string();
+        docker_out(&["save", "-o", &to, image]).await.map(|_| ())
+    }
+
+    async fn image_load(&self, from: &Path, tag: &str) -> Result<()> {
+        let from = from.display().to_string();
+        let out = docker_out(&["load", "-q", "-i", &from]).await?;
+        // "Loaded image: <ref>" or "Loaded image ID: sha256:...".
+        let loaded = out
+            .lines()
+            .filter_map(|l| {
+                l.strip_prefix("Loaded image ID: ")
+                    .or_else(|| l.strip_prefix("Loaded image: "))
+            })
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("docker load: no image in its output"))?
+            .trim()
+            .to_owned();
+        if loaded != tag {
+            docker_out(&["tag", &loaded, tag]).await?;
+        }
+        Ok(())
     }
 
     async fn prune_build_cache(&self) {

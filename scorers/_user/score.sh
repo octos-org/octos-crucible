@@ -17,7 +17,9 @@
 # Inputs are read-only, /out and /tmp are its only writable places; no
 # network (or, with a model, only the meter); read-only root, no
 # capabilities, no-new-privileges, memory / CPU / process limits, a non-root
-# uid, CRUCIBLE_USER_SCORER_TIMEOUT_S (default 1200) of wall clock.
+# uid, CRUCIBLE_USER_SCORER_TIMEOUT_S (default 1200) of wall clock. With a
+# model the uid is CRUCIBLE_MODEL_PLUGIN_UID (default 65532), never this
+# step's own (the meter's): refused if they are equal.
 #
 # Exit status: 0 = result.json written (an error result when the plugin
 # wrote none), 2 = usage error. Containers: `crucible ctr` ($CRUCIBLE).
@@ -80,16 +82,35 @@ cleanup() { ctr rm -f "$NAME" >/dev/null 2>&1; rm -rf "$WORK"; }
 trap cleanup EXIT
 if [ "$(id -u)" = "0" ]; then RUN_AS="1000:1000"; chmod a+rwx "$WORK"; else RUN_AS="$(id -u):$(id -g)"; fi
 
+WITH_MODEL=""
+[ -n "$NETWORK" ] && [ -n "$MODEL_URL" ] && [ -n "$MODEL" ] && WITH_MODEL=1
+if [ -n "$WITH_MODEL" ]; then
+  # A plugin with the submitter's model never runs as the user of this
+  # step (whose process holds the meter and the credential): its own uid,
+  # its own network namespace (the sandbox network reaches only the meter
+  # port). Its inputs are copied where that uid can read them.
+  MODEL_UID="${CRUCIBLE_MODEL_PLUGIN_UID:-65532}"
+  case "$MODEL_UID" in ''|*[!0-9]*) die_usage "CRUCIBLE_MODEL_PLUGIN_UID must be a number" ;; esac
+  [ "$(id -u)" != "$MODEL_UID" ] \
+    || fail "a plugin with a model must run as another user than the scoring step (uid $MODEL_UID); refusing"
+  RUN_AS="$MODEL_UID:$MODEL_UID"
+  IN="$WORK/in"
+  mkdir -p "$IN" && cp "$ARTIFACT" "$IN/artifact" && cp -R "$TESTS" "$IN/tests" || exit 1
+  ARTIFACT="$IN/artifact" TESTS="$IN/tests"
+  if [ -n "$RUN" ]; then cp -R "$RUN" "$IN/run" || exit 1; RUN="$IN/run"; fi
+  chmod -R a+rX "$IN" && chmod a+rwx "$WORK" || exit 1
+fi
 mounts=(-v "$ARTIFACT:/in/artifact:ro" -v "$TESTS:/in/tests:ro" -v "$WORK:/out")
 args=(--artifact /in/artifact --tests /in/tests --out /out/result.json --visibility "$VISIBILITY")
 if [ -n "$OPTIONS" ]; then
   cp "$OPTIONS" "$WORK/options.json" || exit 1
+  chmod a+r "$WORK/options.json"
   args+=(--options /out/options.json)
 fi
 if [ -n "$RUN" ]; then mounts+=(-v "$(cd "$RUN" && pwd -P):/in/run:ro"); args+=(--run /in/run); fi
 net=(--network none)
 envs=(-e HOME=/tmp)
-if [ -n "$NETWORK" ] && [ -n "$MODEL_URL" ] && [ -n "$MODEL" ]; then
+if [ -n "$WITH_MODEL" ]; then
   net=(--network "$NETWORK" --dns 127.0.0.1)
   envs+=(-e "OPENAI_BASE_URL=$MODEL_URL" -e OPENAI_API_KEY=dummy)
   args+=(--model-base-url "$MODEL_URL" --model "$MODEL")

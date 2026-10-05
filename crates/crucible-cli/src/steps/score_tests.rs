@@ -83,16 +83,44 @@ async fn score_tests(a: &Args, s: &Secrets, phase: &std::cell::Cell<&'static str
         }
         let tag = format!("crucible-{}-{}:run", v.kind, p.name);
         if p.is_user() {
-            let sealed = h.join("plugins").join(format!("{}.sealed", p.name));
+            let d = h.join("plugins");
+            let image = d.join(format!("{}.image.sealed", p.name));
+            if image.is_file() {
+                // Built once at registration: load exactly that image.
+                let want = ts
+                    .user_plugins
+                    .iter()
+                    .find(|u| u.name == p.name)
+                    .and_then(|u| u.image.as_ref())
+                    .map(|i| i.id.clone())
+                    .ok_or_else(|| anyhow!("{} {}: no image id", v.kind, p.name))?;
+                let gz = crucible_crypto::open(&keys, &std::fs::read(&image)?)
+                    .map_err(|_| anyhow!("{} {}: image missing in the handoff", v.kind, p.name))?;
+                let archive =
+                    crate::image_archive::Archive::parse(crate::image_archive::gunzip(&gz)?)?;
+                drop(gz);
+                if archive.id != want {
+                    bail!("{} {}: the image is not {want}", v.kind, p.name);
+                }
+                let tar = tempfile::NamedTempFile::new()?;
+                std::fs::write(tar.path(), archive.into_bytes())?;
+                exec.image_load(tar.path(), &exec.image_ref(&tag))
+                    .await
+                    .map_err(|e| anyhow!("{} {}: loading the image: {e:#}", v.kind, p.name))?;
+                eprintln!("{} {} (uploaded) image {want} loaded", v.kind, p.name);
+                continue;
+            }
+            // Registered before images were kept: built from the package.
+            let sealed = d.join(format!("{}.sealed", p.name));
             let zip = crucible_crypto::open(&keys, &std::fs::read(&sealed)?)
                 .map_err(|_| anyhow!("{} {}: package missing in the handoff", v.kind, p.name))?;
             let tmp = tempfile::tempdir()?;
             let (root, _) = crate::user_plugin::unpack(&zip, tmp.path())?;
             drop(zip);
-            crate::user_plugin::build(&exec, &root, &tag)
+            crate::user_plugin::build(&exec, &root, &tag, Default::default())
                 .await
                 .map_err(|e| anyhow!("{} {}: {e:#}", v.kind, p.name))?;
-            eprintln!("{} {} (uploaded) ready", v.kind, p.name);
+            eprintln!("{} {} (uploaded) built from its package", v.kind, p.name);
             continue;
         }
         let dir = h.join(&p.implementation);

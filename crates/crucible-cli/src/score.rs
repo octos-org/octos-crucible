@@ -766,8 +766,9 @@ pub async fn score(o: &ScoreOpts<'_>) -> Result<Vec<(u32, String, ScoreResult)>>
 /// Re-seal what the scoring machine needs to a fresh one-run key:
 /// `<out>/tests/<stage>.sealed` (the stage's tests zip) and
 /// `<out>/results/<replica>/<stage>/checkpoint.sealed` (an empty directory
-/// when the stage ran but left no checkpoint), and `<out>/plugins/<id>.sealed`
-/// (each uploaded plugin's package). Nothing else of `results` (logs,
+/// when the stage ran but left no checkpoint), and each uploaded plugin's
+/// image `<out>/plugins/<id>.image.sealed` (or, registered before images
+/// were kept, its package `<out>/plugins/<id>.sealed`). Nothing else of `results` (logs,
 /// agent facts) is copied.
 pub async fn handoff(
     ts: &TaskSet,
@@ -780,16 +781,18 @@ pub async fn handoff(
 ) -> Result<()> {
     let reps = replicas(results)?;
     std::fs::create_dir_all(out.join("tests"))?;
-    // Uploaded plugins: their packages, built into images on the scoring
-    // machine (the package may be private to its uploader).
+    // Uploaded plugins: the image registration built (loaded, never
+    // rebuilt, on the scoring machine), or for plugins registered before
+    // images were kept, the package. Either may be private to its uploader.
     for u in &ts.user_plugins {
-        let plain = store.get_sealed(&u.blob, keys).await?;
         let d = out.join("plugins");
         std::fs::create_dir_all(&d)?;
-        std::fs::write(
-            d.join(format!("{}.sealed", u.name)),
-            crucible_crypto::seal(to, &plain)?,
-        )?;
+        let (blob, file) = match &u.image {
+            Some(i) => (&i.blob, format!("{}.image.sealed", u.name)),
+            None => (&u.blob, format!("{}.sealed", u.name)),
+        };
+        let plain = store.get_sealed(blob, keys).await?;
+        std::fs::write(d.join(file), crucible_crypto::seal(to, &plain)?)?;
     }
     for &i in stages {
         let stage = &ts.stages[i];

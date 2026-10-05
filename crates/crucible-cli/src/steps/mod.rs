@@ -177,7 +177,7 @@ pub const STEPS: &[StepSpec] = &[
         secrets: &[Secret::RunKey],
         needs: Needs {
             containers: true,
-            sandbox_net: false,
+            sandbox_net: true,
             internet: true,
             pool: Pool::Sandbox,
         },
@@ -185,9 +185,9 @@ pub const STEPS: &[StepSpec] = &[
     },
     StepSpec {
         name: "plugin-report",
-        inputs: &["plugin-outcome"],
+        inputs: &["plugin-build", "plugin-outcome"],
         output: "none",
-        secrets: &[Secret::WorkerToken],
+        secrets: &[Secret::PlatformKey, Secret::WorkerToken, Secret::StoreWrite],
         needs: TRUSTED,
         retry: true,
     },
@@ -400,7 +400,7 @@ pub enum StepCmd {
     PluginOpen(Box<plugin::OpenArgs>),
     /// Uploaded plugin, 2/3: build its image and self-test it; holds only the one-run key.
     PluginBuild(Box<plugin::BuildArgs>),
-    /// Uploaded plugin, 3/3: deliver the outcome to the Worker.
+    /// Uploaded plugin, 3/3: check the sealed outcome, store the image, register it with the Worker.
     PluginReport(Box<plugin::ReportArgs>),
     /// Validate the eval.yml inputs (IN_* env); write job outputs.
     Plan {
@@ -609,7 +609,14 @@ mod tests {
             .collect();
         assert_eq!(
             holders,
-            ["pack", "plugin-open", "generate", "handoff", "publish"]
+            [
+                "pack",
+                "plugin-open",
+                "plugin-report",
+                "generate",
+                "handoff",
+                "publish"
+            ]
         );
         // An uploaded plugin is built where no platform secret is.
         assert_eq!(spec("plugin-build").secrets, &[Secret::RunKey]);
