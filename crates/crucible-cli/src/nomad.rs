@@ -169,7 +169,9 @@ pub struct Ended {
 impl Nomad {
     pub fn new(a: &NomadArgs) -> Result<Nomad> {
         let mut env = Vec::new();
-        for k in ["HOME", "PATH"] {
+        // CRUCIBLE_DOCKER_RUNTIME: the nodes' Docker runs the step's
+        // containers under it (gVisor), as with `eval local`.
+        for k in ["HOME", "PATH", "CRUCIBLE_DOCKER_RUNTIME"] {
             if let Some(v) = std::env::var_os(k) {
                 env.push((k.to_string(), v.to_string_lossy().into_owned()));
             }

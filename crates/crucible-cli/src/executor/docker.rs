@@ -14,6 +14,12 @@
 //! and nothing needs a lock file. The proxies of each slot listen on its
 //! own host address, so the ports stay the same.
 //!
+//! `CRUCIBLE_DOCKER_RUNTIME` (e.g. `runsc`, gVisor) runs every container
+//! of this backend under that OCI runtime instead of Docker's default; it
+//! must be registered with the daemon (`docker info`), or nothing starts.
+//! Host paths of the machine itself (`/etc`, `/proc`, Docker's socket and
+//! state, ...) are never mounted ([`check_host_mount`]).
+//!
 //! Internal networks (`net_create`) are `docker network create --internal`
 //! on a bridge named after the network ([`bridge_name`]); with
 //! `CRUCIBLE_SCORER_FIREWALL=1` (CI machines, passwordless sudo) iptables
@@ -81,18 +87,202 @@ fn label_args(a: &mut Vec<String>, labels: &[(String, String)]) {
     }
 }
 
+/// `CRUCIBLE_DOCKER_RUNTIME`: the OCI runtime of every container (unset
+/// or empty: Docker's default).
+pub fn runtime() -> Option<String> {
+    std::env::var("CRUCIBLE_DOCKER_RUNTIME")
+        .ok()
+        .filter(|r| !r.is_empty())
+}
+
+/// Check `CRUCIBLE_DOCKER_RUNTIME` once per process: a plain name that the
+/// daemon has registered (`docker info` .Runtimes).
+pub fn check_runtime() -> Result<()> {
+    static CHECKED: std::sync::OnceLock<std::result::Result<(), String>> =
+        std::sync::OnceLock::new();
+    let Some(r) = runtime() else {
+        return Ok(());
+    };
+    CHECKED
+        .get_or_init(|| {
+            if !r.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)) {
+                return Err(format!("CRUCIBLE_DOCKER_RUNTIME={r:?}: not a runtime name"));
+            }
+            let out = docker()
+                .args(["info", "--format", "{{json .Runtimes}}"])
+                .stdin(Stdio::null())
+                .output()
+                .map_err(|e| format!("docker info: {e}"))?;
+            let rts: serde_json::Value =
+                serde_json::from_slice(&out.stdout).unwrap_or(serde_json::Value::Null);
+            if rts.get(&r).is_none() {
+                return Err(format!(
+                    "CRUCIBLE_DOCKER_RUNTIME={r}: the Docker daemon has no such runtime \
+                     (docker info lists {}); install it and register it in /etc/docker/daemon.json, \
+                     see docs/executors.md",
+                    rts.as_object()
+                        .map(|o| o.keys().cloned().collect::<Vec<_>>().join(", "))
+                        .unwrap_or_default()
+                ));
+            }
+            Ok(())
+        })
+        .clone()
+        .map_err(|e| anyhow::anyhow!(e))
+}
+
+/// Host paths that are the machine itself, never a step's files: the
+/// root, kernel and device views, configuration, and the container
+/// runtimes' sockets and state.
+const HOST_DENY: &[&str] = &[
+    "/proc",
+    "/sys",
+    "/dev",
+    "/run",
+    "/var/run",
+    "/etc",
+    "/boot",
+    "/root",
+    "/var/lib/docker",
+    "/var/lib/containerd",
+    "/var/lib/kubelet",
+    "/var/lib/rancher",
+    "/var/lib/nomad",
+];
+
+/// A host path a container may mount: not `/`, not under [`HOST_DENY`],
+/// not a socket (after resolving links).
+pub fn check_host_mount(p: &Path) -> Result<()> {
+    let real = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let machine = |x: &Path| x == Path::new("/") || HOST_DENY.iter().any(|d| x.starts_with(d));
+    let denied = machine(p)
+        || machine(&real)
+        || std::fs::metadata(&real).is_ok_and(|m| {
+            use std::os::unix::fs::FileTypeExt;
+            m.file_type().is_socket()
+        });
+    if denied || !real.is_absolute() {
+        bail!("{}: not a path a container may mount", p.display());
+    }
+    Ok(())
+}
+
+/// What every container of this backend must satisfy before it starts.
+fn check(c: &ContainerSpec) -> Result<()> {
+    for m in &c.mounts {
+        if let MountSrc::Host(p) = &m.src {
+            check_host_mount(p)?;
+        }
+    }
+    if let Some(r) = runtime() {
+        if r != "runc" && matches!(c.network, Network::Container(_)) {
+            bail!(
+                "--network container:<name> under CRUCIBLE_DOCKER_RUNTIME={r}: each sandbox has \
+                 its own network stack, so the two containers would not share 127.0.0.1; \
+                 run this plugin without the runtime, or on the Kubernetes backend"
+            );
+        }
+        check_runtime()?;
+    }
+    Ok(())
+}
+
+/// The names (container name, aliases) and addresses of the running
+/// members of network `net`, from `docker inspect` lines `<name> <json of
+/// .NetworkSettings.Networks>`.
+pub fn member_hosts(net: &str, inspect: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for line in inspect.lines() {
+        let Some((name, nets)) = line.trim().split_once(' ') else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(nets) else {
+            continue;
+        };
+        let n = &v[net];
+        let Some(ip) = n["IPAddress"].as_str().filter(|ip| !ip.is_empty()) else {
+            continue;
+        };
+        let mut names = vec![name.trim_start_matches('/').to_owned()];
+        for a in n["Aliases"].as_array().into_iter().flatten() {
+            if let Some(a) = a.as_str() {
+                names.push(a.to_owned());
+            }
+        }
+        for h in names {
+            if !h.is_empty() && !out.iter().any(|(x, _)| x == &h) {
+                out.push((h, ip.to_owned()));
+            }
+        }
+    }
+    out
+}
+
+/// Under a runtime with its own network stack (gVisor's netstack),
+/// Docker's embedded DNS (127.0.0.11, an iptables redirect inside the
+/// container's network namespace) does not answer: a container on a named
+/// network gets the names of the network's running members in /etc/hosts
+/// instead (as the Kubernetes backend does with `hostAliases`).
+async fn sandboxed_hosts(c: &ContainerSpec) -> Vec<(String, String)> {
+    let Network::Named { name, .. } = &c.network else {
+        return Vec::new();
+    };
+    if runtime().is_none_or(|r| r == "runc") {
+        return Vec::new();
+    }
+    let filter = format!("network={name}");
+    let Ok(ids) = docker_out(&["ps", "-q", "--filter", &filter]).await else {
+        return Vec::new();
+    };
+    let ids: Vec<&str> = ids.split_whitespace().collect();
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    let mut a = vec![
+        "inspect",
+        "--format",
+        "{{.Name}} {{json .NetworkSettings.Networks}}",
+    ];
+    a.extend(ids);
+    docker_out(&a)
+        .await
+        .map(|out| member_hosts(name, &out))
+        .unwrap_or_default()
+}
+
 #[derive(Default)]
 pub struct DockerExecutor;
 
 impl DockerExecutor {
     /// `docker run -d` arguments of a container.
+    #[cfg(test)]
     pub fn run_args(c: &ContainerSpec) -> Vec<String> {
         Self::run_args_with(c, true, false)
     }
 
-    /// `docker run` arguments: detached, or attached (`rm`: `--rm`).
+    /// `docker run` arguments: detached, or attached (`rm`: `--rm`), under
+    /// [`runtime`].
+    #[cfg(test)]
     pub fn run_args_with(c: &ContainerSpec, detach: bool, rm: bool) -> Vec<String> {
+        Self::run_args_rt(c, detach, rm, runtime().as_deref(), &[])
+    }
+
+    /// The same under OCI runtime `rt` (`None`: Docker's default), with
+    /// `hosts` (name, IP) in its /etc/hosts.
+    pub fn run_args_rt(
+        c: &ContainerSpec,
+        detach: bool,
+        rm: bool,
+        rt: Option<&str>,
+        hosts: &[(String, String)],
+    ) -> Vec<String> {
         let mut a: Vec<String> = vec!["run".into()];
+        if let Some(r) = rt {
+            a.push(format!("--runtime={r}"));
+        }
+        for (h, ip) in hosts {
+            a.push(format!("--add-host={h}:{ip}"));
+        }
         if detach {
             a.push("-d".into());
         }
@@ -419,11 +609,25 @@ impl Executor for DockerExecutor {
     }
 
     async fn start(&self, c: &ContainerSpec) -> Result<String> {
-        docker_out(&strs(&Self::run_args(c))).await
+        check(c)?;
+        let hosts = sandboxed_hosts(c).await;
+        docker_out(&strs(&Self::run_args_rt(
+            c,
+            true,
+            false,
+            runtime().as_deref(),
+            &hosts,
+        )))
+        .await
     }
 
     async fn run_attached(&self, c: &ContainerSpec, rm: bool) -> Result<i32> {
-        exec_docker(&Self::run_args_with(c, false, rm), &[])
+        check(c)?;
+        let hosts = sandboxed_hosts(c).await;
+        exec_docker(
+            &Self::run_args_rt(c, false, rm, runtime().as_deref(), &hosts),
+            &[],
+        )
     }
 
     async fn wait(&self, id: &str) -> Result<Option<i64>> {
@@ -643,6 +847,49 @@ mod tests {
         let log = std::fs::read_to_string(&path).unwrap();
         assert!(log.contains("to-stdout"), "{log}");
         assert!(log.contains("to-stderr"), "{log}");
+    }
+
+    #[test]
+    fn a_runtime_comes_first_and_machine_paths_are_refused() {
+        let c = ContainerSpec {
+            image: "img".into(),
+            network: Network::None,
+            ..Default::default()
+        };
+        let hosts = [("app".to_string(), "172.18.0.2".to_string())];
+        assert_eq!(
+            DockerExecutor::run_args_rt(&c, true, false, Some("runsc"), &hosts)[..4],
+            ["run", "--runtime=runsc", "--add-host=app:172.18.0.2", "-d"]
+        );
+        assert_eq!(
+            DockerExecutor::run_args_rt(&c, true, false, None, &[])[..2],
+            ["run", "-d"]
+        );
+        let inspect = r#"/crucible-app-1 {"crucible-net-1":{"IPAddress":"172.18.0.2","Aliases":["app","crucible-app-1"]}}
+/other {"bridge":{"IPAddress":"172.17.0.3","Aliases":null}}"#;
+        assert_eq!(
+            member_hosts("crucible-net-1", inspect),
+            [
+                ("crucible-app-1".to_string(), "172.18.0.2".to_string()),
+                ("app".into(), "172.18.0.2".into())
+            ]
+        );
+        for bad in [
+            "/",
+            "/etc",
+            "/etc/passwd",
+            "/proc/1",
+            "/var/run/docker.sock",
+            "/var/lib/docker/volumes",
+            "/root",
+        ] {
+            assert!(check_host_mount(Path::new(bad)).is_err(), "{bad}");
+        }
+        let d = tempfile::tempdir().unwrap();
+        assert!(check_host_mount(d.path()).is_ok());
+        let mut m = c.clone();
+        m.mounts = vec![crate::executor::Mount::host(Path::new("/etc"), "/x", true)];
+        assert!(check(&m).is_err());
     }
 
     #[test]
