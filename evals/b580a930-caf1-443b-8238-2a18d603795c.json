@@ -1,0 +1,463 @@
+{
+  "schema": 2,
+  "eval_id": "b580a930-caf1-443b-8238-2a18d603795c",
+  "created_at": "2026-10-05T00:55:08Z",
+  "taskset": "math-proof-demo",
+  "agent": {
+    "name": "math-prover",
+    "version": "1",
+    "package": {
+      "sha256": "558b47af668fa72b49e7d13faf549487a5fcdba7e47b5be5ea956330489178c4",
+      "key_id": "1ffa702796eb5ee8"
+    }
+  },
+  "model": "glm-5.3",
+  "mode": "agent",
+  "owner": {
+    "github_id": 58540850,
+    "login": "BH3GEI"
+  },
+  "score_public": true,
+  "stages_run": 2,
+  "run": {
+    "repository": "octos-org/octos-crucible",
+    "run_id": 37249041219,
+    "run_attempt": 1
+  },
+  "replicas": [
+    {
+      "replica": 1,
+      "job": {
+        "job_id": 111572847176,
+        "started_at": "2026-10-05T00:51:13Z",
+        "completed_at": "2026-10-05T00:53:09Z",
+        "wall_s": 116.0,
+        "run_step_started_at": "2026-10-05T00:51:17Z",
+        "run_step_completed_at": "2026-10-05T00:53:07Z",
+        "run_step_wall_s": 110.0
+      },
+      "stages": [
+        {
+          "stage": "p1",
+          "score": {
+            "status": "scored",
+            "score": 7.0,
+            "max": 7.0,
+            "passed": true,
+            "items": [
+              {
+                "name": "item 1",
+                "score": 4.0,
+                "max": 4.0
+              },
+              {
+                "name": "item 2",
+                "score": 2.0,
+                "max": 2.0
+              },
+              {
+                "name": "item 3",
+                "score": 1.0,
+                "max": 1.0
+              }
+            ]
+          },
+          "wall_s": 27.5,
+          "usage": {
+            "requests": 1,
+            "prompt_tokens": 135,
+            "cached_tokens": 0,
+            "completion_tokens": 2310,
+            "reasoning_tokens": 1097
+          },
+          "cost_usd": 0.010353,
+          "output": {
+            "sha256": "bc9050366d18dfe79494ae2352c26365e61629e95cb35566c63d0d0530be7784",
+            "key_id": "1ffa702796eb5ee8"
+          },
+          "logs": {
+            "sha256": "c9c6c70cb8b9b5280279b05d53a105618d4045de3a8b97d79896bc3d1866e324",
+            "key_id": "1ffa702796eb5ee8"
+          },
+          "ended": "exited",
+          "exit_code": 0,
+          "checkpoint_source": "final",
+          "eval_usage": {
+            "scorer": {
+              "usage": {
+                "requests": 3,
+                "prompt_tokens": 5358,
+                "cached_tokens": 4032,
+                "completion_tokens": 1360,
+                "reasoning_tokens": 899
+              },
+              "cost_usd": 0.008889
+            }
+          }
+        },
+        {
+          "stage": "p2",
+          "score": {
+            "status": "scored",
+            "score": 7.0,
+            "max": 7.0,
+            "passed": true,
+            "items": [
+              {
+                "name": "item 1",
+                "score": 2.0,
+                "max": 2.0
+              },
+              {
+                "name": "item 2",
+                "score": 2.0,
+                "max": 2.0
+              },
+              {
+                "name": "item 3",
+                "score": 3.0,
+                "max": 3.0
+              }
+            ]
+          },
+          "wall_s": 62.4,
+          "usage": {
+            "requests": 1,
+            "prompt_tokens": 166,
+            "cached_tokens": 0,
+            "completion_tokens": 5776,
+            "reasoning_tokens": 3597
+          },
+          "cost_usd": 0.025647,
+          "output": {
+            "sha256": "90ae14c477719e5bd5c3b8296dd94aae11817cbec804369e671b92c803498fa9",
+            "key_id": "1ffa702796eb5ee8"
+          },
+          "logs": {
+            "sha256": "5fddacf12608a91453a4e706c6948525588555ee34e3c4853105401abb5bb7f6",
+            "key_id": "1ffa702796eb5ee8"
+          },
+          "ended": "exited",
+          "exit_code": 0,
+          "checkpoint_source": "final",
+          "eval_usage": {
+            "scorer": {
+              "usage": {
+                "requests": 3,
+                "prompt_tokens": 8436,
+                "cached_tokens": 6144,
+                "completion_tokens": 1622,
+                "reasoning_tokens": 1029
+              },
+              "cost_usd": 0.011943
+            }
+          }
+        }
+      ]
+    },
+    {
+      "replica": 2,
+      "job": {
+        "job_id": 111572847196,
+        "started_at": "2026-10-05T00:51:09Z",
+        "completed_at": "2026-10-05T00:53:01Z",
+        "wall_s": 112.0,
+        "run_step_started_at": "2026-10-05T00:51:19Z",
+        "run_step_completed_at": "2026-10-05T00:52:59Z",
+        "run_step_wall_s": 100.0
+      },
+      "stages": [
+        {
+          "stage": "p1",
+          "score": {
+            "status": "scored",
+            "score": 7.0,
+            "max": 7.0,
+            "passed": true,
+            "items": [
+              {
+                "name": "item 1",
+                "score": 4.0,
+                "max": 4.0
+              },
+              {
+                "name": "item 2",
+                "score": 2.0,
+                "max": 2.0
+              },
+              {
+                "name": "item 3",
+                "score": 1.0,
+                "max": 1.0
+              }
+            ]
+          },
+          "wall_s": 15.4,
+          "usage": {
+            "requests": 1,
+            "prompt_tokens": 135,
+            "cached_tokens": 0,
+            "completion_tokens": 1241,
+            "reasoning_tokens": 416
+          },
+          "cost_usd": 0.005649,
+          "output": {
+            "sha256": "d181d51559ce97376f7ca6e7e527f9463587cf31a1327ee7e476fb97496412f5",
+            "key_id": "1ffa702796eb5ee8"
+          },
+          "logs": {
+            "sha256": "dad15dd37247e03ae5d83d27e455fd448ee56fe3d21af38b03a715bdedaf612b",
+            "key_id": "1ffa702796eb5ee8"
+          },
+          "ended": "exited",
+          "exit_code": 0,
+          "checkpoint_source": "final",
+          "eval_usage": {
+            "scorer": {
+              "usage": {
+                "requests": 3,
+                "prompt_tokens": 4194,
+                "cached_tokens": 2688,
+                "completion_tokens": 1377,
+                "reasoning_tokens": 907
+              },
+              "cost_usd": 0.008866
+            }
+          }
+        },
+        {
+          "stage": "p2",
+          "score": {
+            "status": "scored",
+            "score": 7.0,
+            "max": 7.0,
+            "passed": true,
+            "items": [
+              {
+                "name": "item 1",
+                "score": 2.0,
+                "max": 2.0
+              },
+              {
+                "name": "item 2",
+                "score": 2.0,
+                "max": 2.0
+              },
+              {
+                "name": "item 3",
+                "score": 3.0,
+                "max": 3.0
+              }
+            ]
+          },
+          "wall_s": 61.9,
+          "usage": {
+            "requests": 1,
+            "prompt_tokens": 166,
+            "cached_tokens": 0,
+            "completion_tokens": 6399,
+            "reasoning_tokens": 4787
+          },
+          "cost_usd": 0.028388,
+          "output": {
+            "sha256": "f7a31e8d9f081ea5cf19590edffedb116956f73d1dac07e48d3d873d716aabe4",
+            "key_id": "1ffa702796eb5ee8"
+          },
+          "logs": {
+            "sha256": "f63046257a58a8c9b9627b68600d09724cd3bca3ebfddfe8b3cd3dd06aad33ac",
+            "key_id": "1ffa702796eb5ee8"
+          },
+          "ended": "exited",
+          "exit_code": 0,
+          "checkpoint_source": "final",
+          "eval_usage": {
+            "scorer": {
+              "usage": {
+                "requests": 3,
+                "prompt_tokens": 6759,
+                "cached_tokens": 5120,
+                "completion_tokens": 2679,
+                "reasoning_tokens": 2009
+              },
+              "cost_usd": 0.015413
+            }
+          }
+        }
+      ]
+    },
+    {
+      "replica": 3,
+      "job": {
+        "job_id": 111572847189,
+        "started_at": "2026-10-05T00:51:08Z",
+        "completed_at": "2026-10-05T00:52:50Z",
+        "wall_s": 102.0,
+        "run_step_started_at": "2026-10-05T00:51:12Z",
+        "run_step_completed_at": "2026-10-05T00:52:48Z",
+        "run_step_wall_s": 96.0
+      },
+      "stages": [
+        {
+          "stage": "p1",
+          "score": {
+            "status": "scored",
+            "score": 7.0,
+            "max": 7.0,
+            "passed": true,
+            "items": [
+              {
+                "name": "item 1",
+                "score": 4.0,
+                "max": 4.0
+              },
+              {
+                "name": "item 2",
+                "score": 2.0,
+                "max": 2.0
+              },
+              {
+                "name": "item 3",
+                "score": 1.0,
+                "max": 1.0
+              }
+            ]
+          },
+          "wall_s": 29.7,
+          "usage": {
+            "requests": 1,
+            "prompt_tokens": 135,
+            "cached_tokens": 0,
+            "completion_tokens": 2748,
+            "reasoning_tokens": 1680
+          },
+          "cost_usd": 0.01228,
+          "output": {
+            "sha256": "90126fbe6735719411913ee65c49136e7dee1d0a977a665ec91308459a24de30",
+            "key_id": "1ffa702796eb5ee8"
+          },
+          "logs": {
+            "sha256": "fbed35a414567838b84be0d5373541d337113047aaa9fbf8eb38976ee11782f7",
+            "key_id": "1ffa702796eb5ee8"
+          },
+          "ended": "exited",
+          "exit_code": 0,
+          "checkpoint_source": "final",
+          "eval_usage": {
+            "scorer": {
+              "usage": {
+                "requests": 3,
+                "prompt_tokens": 4923,
+                "cached_tokens": 3200,
+                "completion_tokens": 1027,
+                "reasoning_tokens": 550
+              },
+              "cost_usd": 0.007763
+            }
+          }
+        },
+        {
+          "stage": "p2",
+          "score": {
+            "status": "scored",
+            "score": 7.0,
+            "max": 7.0,
+            "passed": true,
+            "items": [
+              {
+                "name": "item 1",
+                "score": 2.0,
+                "max": 2.0
+              },
+              {
+                "name": "item 2",
+                "score": 2.0,
+                "max": 2.0
+              },
+              {
+                "name": "item 3",
+                "score": 3.0,
+                "max": 3.0
+              }
+            ]
+          },
+          "wall_s": 45.7,
+          "usage": {
+            "requests": 1,
+            "prompt_tokens": 166,
+            "cached_tokens": 0,
+            "completion_tokens": 4791,
+            "reasoning_tokens": 2865
+          },
+          "cost_usd": 0.021313,
+          "output": {
+            "sha256": "7feb55947dcfb690131b22688505a1cf5399bd2fbee3c2068a57dd0261348782",
+            "key_id": "1ffa702796eb5ee8"
+          },
+          "logs": {
+            "sha256": "712ed8be51f64d9f77e7c7cdca5ecb9efecfdc9f07af611cc60094bc858ce589",
+            "key_id": "1ffa702796eb5ee8"
+          },
+          "ended": "exited",
+          "exit_code": 0,
+          "checkpoint_source": "final",
+          "eval_usage": {
+            "scorer": {
+              "usage": {
+                "requests": 3,
+                "prompt_tokens": 7701,
+                "cached_tokens": 5312,
+                "completion_tokens": 1722,
+                "reasoning_tokens": 1115
+              },
+              "cost_usd": 0.012303
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "scoring": {
+    "aggregate": {
+      "items": "sum",
+      "stages": "sum"
+    },
+    "display": {
+      "stage": {
+        "name": "证明得分",
+        "unit": "分",
+        "direction": "higher",
+        "min": 0.0,
+        "max": 7.0,
+        "decimals": 1,
+        "format": "number"
+      },
+      "total": {
+        "name": "总分",
+        "unit": "分",
+        "direction": "higher",
+        "min": 0.0,
+        "max": 14.0,
+        "decimals": 1,
+        "format": "number"
+      }
+    },
+    "plugins": [
+      {
+        "kind": "scorer",
+        "name": "llm-judge",
+        "version": "1"
+      },
+      {
+        "kind": "runner",
+        "name": "workdir",
+        "version": "1"
+      },
+      {
+        "kind": "packager",
+        "name": "files",
+        "version": "1"
+      }
+    ]
+  },
+  "total_score": 14.0
+}
