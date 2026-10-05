@@ -202,6 +202,13 @@ workflow（持私钥，不运行上传的代码）解密 zip、检查、按阶�
 
 manifest（`schema: 2`）的阶段分数 `replicas[].stages[].score` 是 result v2 去掉文本字段：`{status: "scored"|"error", error?, score?, max?, passed?, items?}`；旧 manifest（`schema: 1`）里是 `{status: passed|failed|system_error|rejected, passed, total}`，读取方按 `docs/scorer-contract.md` §4 的换算表读，数据不改写。新 manifest 另有 `scoring`：`{aggregate, display: {stage, total}, plugins: [{kind, name, version}]}`，是 publish 时从题目包取的快照，题目包以后改了展示方式，旧评测不受影响。阶段条目可以有 `eval_usage: {interactive?: {usage, cost_usd}, scorer?: {usage, cost_usd}}`：打分 job 里交互运行和模型评判用掉的模型（提交者的 key），与 `usage`（agent 产出阶段）分开记，网页也分开展示（`docs/plugins.md` §10）。
 
+**失败原因**（网页详情页“失败原因”卡片、`crucible status` 都会显示）：
+- `replicas[].failure`：这一遍为什么没有可用结果，只是类别，可以出现在公开日志与数据分支：`agent package could not be fetched`、`agent image build failed`、`platform setup failed`、`agent run failed`（生成 job，`crucible step generate`）；`scorer image build failed`、`scoring failed`（打分 job，`crucible step score-tests`，写 `failure.json` 随 `scores-r*` 上传）；以及 `stage <id> did not run`、`stage <id> left no checkpoint`、`stage <id> was not scored (the scoring job failed)`。
+- `replicas[].failure_detail`：只给提交者看的细节（错误链、agent 镜像构建日志的末尾，最多约 8000 字）。只来自生成 job（那台机器上没有测试），在 `agent.sealed` 里加密传到 publish；公开日志只打印类别，数据分支上的 manifest 去掉这个字段。
+- `replicas[].stages[].reason`：阶段报错或得 0 分时打分器给的说明（例如 `app build failed`、`no Dockerfile at the root of the submitted app`、`the output is not in the format the stage asks for`）。打分器以 `--visibility hidden` 运行，这段说明是固定文字，不含测试内容；没有说明时只写 `output rejected` / `scoring error`。
+
+所有遍都失败时（例如 agent 镜像都没建成）publish 照常回传 manifest，状态为 `failed`，没有产出时跳过下载包。
+
 ### `GET /evals/:id`（仅 owner 或管理员，否则 403）
 ```json
 {"eval_id": "...", "status": "running:stage-2", "run_url": "https://github.com/.../actions/runs/1",

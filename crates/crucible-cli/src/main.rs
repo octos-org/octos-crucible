@@ -1274,7 +1274,10 @@ pub async fn download_zip(
         eprintln!("no download password: skipping the download zip");
         return Ok(());
     };
-    let zip = publish::download_zip(results, keys, &password)?;
+    let Some(zip) = publish::download_zip(results, keys, &password)? else {
+        eprintln!("no stage outputs: skipping the download zip");
+        return Ok(());
+    };
     drop(password);
     let sha256 = store.put(&zip).await?;
     let mut m: crucible_core::Manifest = serde_json::from_slice(&std::fs::read(manifest)?)?;
@@ -1388,7 +1391,15 @@ fn agent_ref(
         }
     }
     if facts.is_null() {
-        bail!("no replica left agent facts (agent.sealed)");
+        // Every replica failed before the package was fetched: the
+        // manifest still goes out, with the failure.
+        eprintln!("no replica left agent facts");
+        return Ok(crucible_core::manifest::AgentRef {
+            name: "unknown".into(),
+            version: "0".into(),
+            package: None,
+            commit: None,
+        });
     }
     let text = |v: &serde_json::Value| v.as_str().map(|s| s.chars().take(100).collect::<String>());
     // Builtin agents: the source commit the build was pinned to (checked

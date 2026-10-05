@@ -863,6 +863,34 @@ pub fn render(d: &Value) -> String {
         Some(t) => out += &format!("total  {}\n", total_fmt.fmt(t, None)),
         None => out += "total  —\n",
     }
+    out += &render_failures(replicas);
+    out
+}
+
+/// Why replicas or stages have no result: the category, the stage
+/// reasons, and the end of the details (only the submitter sees these).
+fn render_failures(replicas: &[Value]) -> String {
+    let mut out = String::new();
+    for r in replicas {
+        let n = r["replica"].as_u64().unwrap_or(0);
+        if let Some(f) = r["failure"].as_str() {
+            out += &format!("\nfailed r{n}: {f}\n");
+            if let Some(d) = r["failure_detail"].as_str() {
+                let lines: Vec<&str> = d.lines().collect();
+                for l in &lines[lines.len().saturating_sub(40)..] {
+                    out += &format!("  | {l}\n");
+                }
+            }
+        }
+        for s in r["stages"].as_array().into_iter().flatten() {
+            if let Some(why) = s["reason"].as_str() {
+                out += &format!(
+                    "reason r{n} {}: {why}\n",
+                    s["stage"].as_str().unwrap_or("?")
+                );
+            }
+        }
+    }
     out
 }
 
@@ -987,5 +1015,20 @@ mod tests {
         });
         let s = render(&d);
         assert!(s.contains("4458.56") && s.contains("total  4458.56"), "{s}");
+        // Failures: category, details, stage reasons.
+        let d = json!({
+            "eval_id": "e", "status": "failed",
+            "manifest": {"replicas": [
+                {"replica": 1, "failure": "agent image build failed",
+                 "failure_detail": "build failed\n--- build log (end) ---\nERROR: unknown instruction: FORM",
+                 "stages": []},
+                {"replica": 2, "stages": [{"stage": "stage-1", "reason": "app build failed",
+                  "score": {"status": "scored", "score": 0, "max": 1}, "usage": {}}]}
+            ]}
+        });
+        let s = render(&d);
+        assert!(s.contains("failed r1: agent image build failed"), "{s}");
+        assert!(s.contains("  | ERROR: unknown instruction: FORM"), "{s}");
+        assert!(s.contains("reason r2 stage-1: app build failed"), "{s}");
     }
 }
