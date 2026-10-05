@@ -1,0 +1,284 @@
+{
+  "schema": 2,
+  "eval_id": "91619a71-9b13-4060-a799-17366f732920",
+  "created_at": "2026-10-05T01:03:13Z",
+  "taskset": "hello-world",
+  "agent": {
+    "name": "octos-pr269",
+    "version": "2c9b67a",
+    "package": {
+      "sha256": "392e1c6634595bc290c780054634a7bfe0e2eb5f88a5d4aed1ea83c56ce5fa7c",
+      "key_id": "1ffa702796eb5ee8"
+    },
+    "commit": "2c9b67af758a8446ed1f0f49814743ceb68a2485"
+  },
+  "model": "glm-5.3-flash",
+  "mode": "agent",
+  "owner": {
+    "github_id": 58540850,
+    "login": "BH3GEI"
+  },
+  "score_public": true,
+  "stages_run": 2,
+  "run": {
+    "repository": "octos-org/octos-crucible",
+    "run_id": 37249445447,
+    "run_attempt": 1
+  },
+  "replicas": [
+    {
+      "replica": 1,
+      "job": {
+        "job_id": 111574060350,
+        "started_at": "2026-10-05T00:57:40Z",
+        "completed_at": "2026-10-05T01:00:56Z",
+        "wall_s": 196.0,
+        "run_step_started_at": "2026-10-05T00:57:44Z",
+        "run_step_completed_at": "2026-10-05T01:00:54Z",
+        "run_step_wall_s": 190.0
+      },
+      "stages": [
+        {
+          "stage": "stage-1",
+          "score": {
+            "status": "scored",
+            "score": 1.0,
+            "max": 1.0,
+            "passed": true
+          },
+          "wall_s": 55.8,
+          "usage": {
+            "requests": 8,
+            "prompt_tokens": 30777,
+            "cached_tokens": 27136,
+            "completion_tokens": 351,
+            "reasoning_tokens": 14
+          },
+          "cost_usd": 0.001536,
+          "output": {
+            "sha256": "706622ed1cf856ee9c216f2d1c1e88e0d5c0d55c5d3daa8b0569440b0b455f89",
+            "key_id": "1ffa702796eb5ee8"
+          },
+          "logs": {
+            "sha256": "8a48378ca2d936b723719e759b0455737011cead9dc3c0ec807cba37bb141afd",
+            "key_id": "1ffa702796eb5ee8"
+          },
+          "ended": "exited",
+          "exit_code": 1,
+          "checkpoint_source": "final"
+        },
+        {
+          "stage": "stage-2",
+          "score": {
+            "status": "scored",
+            "score": 1.0,
+            "max": 1.0,
+            "passed": true
+          },
+          "wall_s": 62.4,
+          "usage": {
+            "requests": 8,
+            "prompt_tokens": 29706,
+            "cached_tokens": 24768,
+            "completion_tokens": 560,
+            "reasoning_tokens": 6
+          },
+          "cost_usd": 0.001764,
+          "output": {
+            "sha256": "bea14b10626df853fd46f020cdee5212e26d2065048e78dbabd96c0a5e30fae2",
+            "key_id": "1ffa702796eb5ee8"
+          },
+          "logs": {
+            "sha256": "f398f06e9a851853eb286e2c864552e8ae09c32ad3d37002bb95abd60306824e",
+            "key_id": "1ffa702796eb5ee8"
+          },
+          "ended": "exited",
+          "exit_code": 1,
+          "checkpoint_source": "final"
+        }
+      ]
+    },
+    {
+      "replica": 2,
+      "job": {
+        "job_id": 111574060384,
+        "started_at": "2026-10-05T00:57:40Z",
+        "completed_at": "2026-10-05T01:01:34Z",
+        "wall_s": 234.0,
+        "run_step_started_at": "2026-10-05T00:57:46Z",
+        "run_step_completed_at": "2026-10-05T01:01:30Z",
+        "run_step_wall_s": 224.0
+      },
+      "stages": [
+        {
+          "stage": "stage-1",
+          "score": {
+            "status": "scored",
+            "score": 1.0,
+            "max": 1.0,
+            "passed": true
+          },
+          "wall_s": 69.8,
+          "usage": {
+            "requests": 8,
+            "prompt_tokens": 30420,
+            "cached_tokens": 29248,
+            "completion_tokens": 1067,
+            "reasoning_tokens": 55
+          },
+          "cost_usd": 0.001587,
+          "output": {
+            "sha256": "de61004143167e9d10062ed0ae92a594d9d4bf75bc3dba304c8e4d3ec0708113",
+            "key_id": "1ffa702796eb5ee8"
+          },
+          "logs": {
+            "sha256": "0a9beafa9a302b59213b109a24c98968bcbf0fec9f0671a0f1d5fc794e398be5",
+            "key_id": "1ffa702796eb5ee8"
+          },
+          "ended": "exited",
+          "exit_code": 1,
+          "checkpoint_source": "final"
+        },
+        {
+          "stage": "stage-2",
+          "score": {
+            "status": "scored",
+            "score": 1.0,
+            "max": 1.0,
+            "passed": true
+          },
+          "wall_s": 56.5,
+          "usage": {
+            "requests": 7,
+            "prompt_tokens": 26519,
+            "cached_tokens": 25216,
+            "completion_tokens": 479,
+            "reasoning_tokens": 7
+          },
+          "cost_usd": 0.001191,
+          "output": {
+            "sha256": "f02771c2a2b3aaa9c4119937890ac92117e2687664e74e9c6b7e817fd36d4f33",
+            "key_id": "1ffa702796eb5ee8"
+          },
+          "logs": {
+            "sha256": "0fac7d91bfa39e06dc29046ae34eb24c9f9e7e0baef152601dd8c2b0610cfc11",
+            "key_id": "1ffa702796eb5ee8"
+          },
+          "ended": "exited",
+          "exit_code": 1,
+          "checkpoint_source": "final"
+        }
+      ]
+    },
+    {
+      "replica": 3,
+      "job": {
+        "job_id": 111574060332,
+        "started_at": "2026-10-05T00:57:40Z",
+        "completed_at": "2026-10-05T01:01:07Z",
+        "wall_s": 207.0,
+        "run_step_started_at": "2026-10-05T00:57:48Z",
+        "run_step_completed_at": "2026-10-05T01:01:04Z",
+        "run_step_wall_s": 196.0
+      },
+      "stages": [
+        {
+          "stage": "stage-1",
+          "score": {
+            "status": "scored",
+            "score": 1.0,
+            "max": 1.0,
+            "passed": true
+          },
+          "wall_s": 57.8,
+          "usage": {
+            "requests": 6,
+            "prompt_tokens": 24286,
+            "cached_tokens": 21824,
+            "completion_tokens": 759,
+            "reasoning_tokens": 0
+          },
+          "cost_usd": 0.001404,
+          "output": {
+            "sha256": "59fcd70770795d0442f0665c61e363d88ff4a80d6dcd0cd12125cac9e9bdab91",
+            "key_id": "1ffa702796eb5ee8"
+          },
+          "logs": {
+            "sha256": "38a1d86b2bf01a563ca936fda531e78ff3c63153becfe591b8cedfd03adc2db1",
+            "key_id": "1ffa702796eb5ee8"
+          },
+          "ended": "exited",
+          "exit_code": 1,
+          "checkpoint_source": "final"
+        },
+        {
+          "stage": "stage-2",
+          "score": {
+            "status": "scored",
+            "score": 1.0,
+            "max": 1.0,
+            "passed": true
+          },
+          "wall_s": 59.4,
+          "usage": {
+            "requests": 7,
+            "prompt_tokens": 26739,
+            "cached_tokens": 23360,
+            "completion_tokens": 704,
+            "reasoning_tokens": 37
+          },
+          "cost_usd": 0.00156,
+          "output": {
+            "sha256": "53a0e3c260d2e32bc50d9edd15874b4bf9030031b66d383f30b18027a2edba9a",
+            "key_id": "1ffa702796eb5ee8"
+          },
+          "logs": {
+            "sha256": "d1f445e4c025c30d56d5f1eb7666baa852fa35baf7aaea283b3ce5cbbecd1f3b",
+            "key_id": "1ffa702796eb5ee8"
+          },
+          "ended": "exited",
+          "exit_code": 1,
+          "checkpoint_source": "final"
+        }
+      ]
+    }
+  ],
+  "scoring": {
+    "aggregate": {
+      "items": "sum",
+      "stages": "ratio"
+    },
+    "display": {
+      "stage": {
+        "direction": "higher",
+        "decimals": 0,
+        "format": "fraction"
+      },
+      "total": {
+        "direction": "higher",
+        "min": 0.0,
+        "max": 1.0,
+        "decimals": 1,
+        "format": "percent"
+      }
+    },
+    "plugins": [
+      {
+        "kind": "scorer",
+        "name": "playwright",
+        "version": "1"
+      },
+      {
+        "kind": "runner",
+        "name": "workdir",
+        "version": "1"
+      },
+      {
+        "kind": "packager",
+        "name": "web-app",
+        "version": "1"
+      }
+    ]
+  },
+  "total_score": 1.0
+}
