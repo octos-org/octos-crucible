@@ -132,13 +132,18 @@ workflow（持私钥，不运行上传的代码）解密 zip、检查、按阶�
 
 ### `GET /plugins`（无需登录；带令牌时多返回自己上传的）
 按上传时间倒序，最多 50 个：匿名只看到已公开且可用的；带令牌时另有自己上传的（任何状态）；管理员加 `?all=1` 看到全部。每项：
-`{"id": "u-...", "title": "<plugin.json 的 name>", "owner_login", "public", "status": "building|ready|failed", "error"?, "kind"?, "version"?, "description"?, "runs_taskset_code"?, "model"?, "accepts"?, "selftest"?: {"status", "score", "max", "detail"}, "created_at", "updated_at"}`。`kind` 之后的字段在 `ready` 之后才有。
+`{"id": "u-...", "title": "<plugin.json 的 name>", "owner_login", "public", "status": "building|ready|failed", "error"?, "kind"?, "version"?, "description"?, "runs_taskset_code"?, "model"?, "accepts"?, "selftest"?: {"status", "score", "max", "detail"}, "reviewable"?, "approval"?: {"by_id", "by_login", "at", "checked", "note"}, "created_at", "updated_at"}`。`kind` 之后的字段在 `ready` 之后才有；`reviewable` 表示有审核材料，`approval` 是设为公开时的审核记录。
 
 ### `GET /plugins/:id`
 仅上传者、管理员，或已公开的插件可见，否则 404。→ 同上面列表里的一项。
 
+### `GET /plugins/:id/review`（仅上传者和管理员）
+审核材料：`{"id", "status", "review": {"files": [{"path", "size"}], "dockerfile", "texts": [{"path", "content"}], "truncated"?} | null, "approval", "checklist": ["source", "dockerfile", "detail_leak", "model_use"]}`。材料由 plugin-pack 的 report 步骤解开插件包后回传（Worker 自己打不开加密的包）：完整文件清单、Dockerfile、小的文本文件；Dockerfile 与文本合计最多保留 64K 字符，超出截断并标 `truncated`。审核材料上线前登记的插件为 `null`。其他人 404。
+
 ### `POST /plugins/:id/public`（仅管理员）
-`{"public": true|false}` → `{"id", "public"}`。只有 `ready` 的插件能设为公开（否则 409）。
+设为公开：`{"public": true, "review": {"checked": ["source", "dockerfile", "detail_leak", "model_use"], "note": "<可选，≤1000 字符>"}}`；撤回公开：`{"public": false}`。→ `{"id", "public"}`。
+
+设为公开前管理员应读过 `GET /plugins/:id/review`，并逐项确认审核清单：`source` 源码与说明一致、无可疑下载/外联/混淆；`dockerfile` 基础镜像可信、只装声明的依赖；`detail_leak` hidden 时 `detail`/`items` 不泄露测试内容；`model_use` 声明了模型时用法合理。缺 `review` 或清单不全返回 400（错误信息列出未勾选项）。审核人、时间、清单与备注记入 `approval`（撤回公开时保留）。只有 `ready` 的插件能设为公开（否则 409）。
 
 ### 使用
 用户题目包的 `scorer.name` 写 `u-...`。`taskset-pack` 用 `GET /internal/plugins/:id?taskset=<题目包 id>` 取插件的固定形式（插件 `ready`，且题目包上传者是插件上传者或插件已公开，否则 403），写进 `taskset.json` 的 `user_plugins`；`POST /internal/tasksets/:id` 时 Worker 按 D1 再核对一次（不符返回 400）。
@@ -248,7 +253,7 @@ workflow 通过 `/internal/status` 上报的精确状态优先。估计值只能
 | `GET /internal/tasksets/:id?github_id=N` | `:id` 为 `u-<16 hex>`。→ 该题目包的 `taskset.json`；未就绪 409；该用户既不是上传者、题目包也未公开时 403。 |
 | `POST /internal/tasksets/:id` | taskset-pack 的结果：`{"status": "ready", "taskset": {...}}`（`name` 必须等于 id，打分器必须是用户可用的，校验通过）或 `{"status": "failed", "error": "<≤500 字符>"}`。只接受一次（之后 409）。 |
 | `GET /internal/plugins/:id?taskset=T` | `:id`、`T` 都是 `u-<16 hex>`。→ 插件的固定形式 `{"kind", "name", "version", "blob", "runs_taskset_code", "model", "accepts"}`；插件未就绪 409；题目包 `T` 的上传者既不是插件上传者、插件也未公开时 403。 |
-| `POST /internal/plugins/:id` | plugin-pack 的结果：`{"status": "ready", "plugin": {...}, "title", "description", "selftest"}`（`plugin.name` 必须等于 id，`plugin.blob.sha256` 必须是上传的 hash）或 `{"status": "failed", "error": "<≤500 字符>"}`。只接受一次（之后 409）。 |
+| `POST /internal/plugins/:id` | plugin-pack 的结果（≤ 128 KB）：`{"status": "ready", "plugin": {...}, "title", "description", "selftest", "review"?}`（`review` 为审核材料，格式见 `GET /plugins/:id/review`，可缺）（`plugin.name` 必须等于 id，`plugin.blob.sha256` 必须是上传的 hash）或 `{"status": "failed", "error": "<≤500 字符>"}`。只接受一次（之后 409）。 |
 | `POST /internal/results/:id` | 请求体是一个 crucible-core `Manifest`（`eval_id` 必须与 URL 一致；`download` 就是 Manifest 自带的字段，由 `crucible download-zip` 写入），外加两个可选的顶层字段：`download: {"sha256": "<密码 zip 的哈希>"}`，以及 `status`（默认 `done`；如果只是回传部分结果、run 还在继续，可填 `running:<阶段>` 或 `scoring`）。不超过 1,900,000 字节（D1 单行上限 2 MB）。Worker 把 manifest（去掉这两个字段）存进 `results` 表（只写这一行）；进入终态时删除凭据。终态结果只会被新的终态结果替换，之后到达的部分结果会被忽略。→ `200 {"ok":true,"status"}`。幂等：再次回传相同内容时什么也不写，照样返回 200。 |
 
 ## 触发参数（workflow_dispatch）
@@ -288,7 +293,7 @@ workflow 通过 `/internal/status` 上报的精确状态优先。估计值只能
 | `evals` | 主键 `eval_id`；提交参数、`status`、`run_id`、`run_url`、`run_completed_s`、时间 | `(owner_id, created_s DESC)`（本人列表）、`(created_s DESC)`（管理员 `?all=1`）、`(taskset, created_s DESC) WHERE score_public = 1`（排行榜） |
 | `results` | 主键 `eval_id`；`manifest`（JSON）、`download_sha256`、`status`、`total_score`、`display`、`updated_at` | 主键（列表 JOIN） |
 | `user_tasksets` | 主键 `id`；用户题目包 | `(owner_id)`、`(public, status)` |
-| `user_plugins` | 主键 `id`；用户插件：`status`、`public`、`title`、`plugin`（固定形式 JSON）、`info`（说明与自检结果） | `(owner_id)`、`(public, status)` |
+| `user_plugins` | 主键 `id`；用户插件：`status`、`public`、`title`、`plugin`（固定形式 JSON）、`info`（说明与自检结果）、`review`（审核材料 JSON）、`approval`（设为公开时的审核记录 JSON） | `(owner_id)`、`(public, status)` |
 | `tokens` | 主键 `id`；`owner_id, login, name, hash, created_at`（hash = SHA-256(令牌)） | `(owner_id)` |
 | `bans` | 主键 `github_id`；`by_id, at, reason` | 主键 |
 | `cache` | 主键 `key`；`tasksets`、`leaderboard`、`leaderboard/<题目包>`（5 分钟）、`release/<tag>`（不过期） | 主键 |

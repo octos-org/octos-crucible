@@ -478,6 +478,13 @@ pub struct UserPluginRecord {
     /// `{"description", "selftest"}` (ready only).
     #[serde(default)]
     pub info: Option<Value>,
+    /// Material for the admin review (ready only; absent for plugins
+    /// registered before reviews existed).
+    #[serde(default)]
+    pub review: Option<PluginReview>,
+    /// Who made it public after the review checklist, when, and the note.
+    #[serde(default)]
+    pub approval: Option<Value>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -523,7 +530,82 @@ impl UserPluginRecord {
         if !info["selftest"].is_null() {
             v["selftest"] = info["selftest"].clone();
         }
+        v["reviewable"] = self.review.is_some().into();
+        if let Some(a) = &self.approval {
+            v["approval"] = a.clone();
+        }
         v
+    }
+}
+
+/// The review checklist an admin confirms before making a plugin public
+/// (`POST /plugins/:id/public`); every item must be checked.
+pub const REVIEW_CHECKLIST: [&str; 4] = ["source", "dockerfile", "detail_leak", "model_use"];
+
+/// Total characters of review text the Worker keeps.
+pub const MAX_REVIEW_TEXT: usize = 64 * 1024;
+const MAX_REVIEW_FILES: usize = 2000;
+
+/// What the admin reads before making a plugin public: the package's file
+/// list, its Dockerfile and its small text files, as plugin-pack's report
+/// step delivered them (the Worker cannot open the sealed package).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginReview {
+    #[serde(default)]
+    pub files: Vec<ReviewFile>,
+    #[serde(default)]
+    pub dockerfile: String,
+    #[serde(default)]
+    pub texts: Vec<ReviewText>,
+    /// Set by the Worker when it cut texts to fit.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewFile {
+    pub path: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewText {
+    pub path: String,
+    pub content: String,
+}
+
+impl PluginReview {
+    /// Bounded: at most [`MAX_REVIEW_FILES`] entries, paths of 300
+    /// characters, and [`MAX_REVIEW_TEXT`] characters of Dockerfile plus
+    /// texts in all (what does not fit is dropped and `truncated` set).
+    fn bounded(mut self) -> Result<PluginReview, ApiError> {
+        if self.files.len() > MAX_REVIEW_FILES || self.texts.len() > MAX_REVIEW_FILES {
+            return Err(ApiError::bad_request("review: too many files"));
+        }
+        let bad =
+            |p: &str| p.is_empty() || p.chars().count() > 300 || p.chars().any(char::is_control);
+        if self.files.iter().any(|f| bad(&f.path)) || self.texts.iter().any(|t| bad(&t.path)) {
+            return Err(ApiError::bad_request("review: bad path"));
+        }
+        let mut left = MAX_REVIEW_TEXT;
+        let cut = |s: &mut String, left: &mut usize, truncated: &mut bool| {
+            let n = s.chars().count();
+            if n > *left {
+                *s = s.chars().take(*left).collect();
+                *truncated = true;
+            }
+            *left -= s.chars().count();
+        };
+        let mut truncated = self.truncated;
+        cut(&mut self.dockerfile, &mut left, &mut truncated);
+        for t in &mut self.texts {
+            cut(&mut t.content, &mut left, &mut truncated);
+        }
+        self.truncated = truncated;
+        Ok(self)
     }
 }
 
@@ -533,9 +615,13 @@ pub enum PluginResult {
         plugin: Box<crucible_core::plugins::UserPlugin>,
         title: String,
         info: Value,
+        review: Option<PluginReview>,
     },
     Failed(String),
 }
+
+/// `POST /internal/plugins/:id` body limit (the review material is most of it).
+pub const MAX_PLUGIN_RESULT: usize = 128 * 1024;
 
 pub fn parse_plugin_result(body: &[u8], id: &str) -> Result<PluginResult, ApiError> {
     #[derive(Deserialize)]
@@ -552,9 +638,11 @@ pub fn parse_plugin_result(body: &[u8], id: &str) -> Result<PluginResult, ApiErr
         selftest: Option<Value>,
         #[serde(default)]
         error: Option<String>,
+        #[serde(default)]
+        review: Option<PluginReview>,
     }
-    if body.len() > 64 * 1024 {
-        return Err(ApiError::too_large(64 * 1024));
+    if body.len() > MAX_PLUGIN_RESULT {
+        return Err(ApiError::too_large(MAX_PLUGIN_RESULT));
     }
     let b: Body = serde_json::from_slice(body)
         .map_err(|e| ApiError::bad_request(format!("invalid request body: {e}")))?;
@@ -582,6 +670,7 @@ pub fn parse_plugin_result(body: &[u8], id: &str) -> Result<PluginResult, ApiErr
                     "description": text(b.description, 300),
                     "selftest": selftest,
                 }),
+                review: b.review.map(PluginReview::bounded).transpose()?,
             })
         }
         (PL_FAILED, None, Some(e)) => Ok(PluginResult::Failed(e.chars().take(500).collect())),

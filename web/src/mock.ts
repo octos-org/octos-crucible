@@ -228,6 +228,23 @@ export const mockBackend: Backend = {
     PLUGINS.unshift({ id, owner_login: "demo-user", public: false, status: "building", created_at: now, updated_at: now });
     return delay({ id, status: "building" });
   },
+  async pluginReview(id) {
+    return delay({
+      id,
+      status: "ready",
+      review: {
+        files: [
+          { path: "Dockerfile", size: 120 },
+          { path: "plugin.json", size: 180 },
+          { path: "score.py", size: 900 },
+        ],
+        dockerfile: "FROM python:3.12-slim\nCOPY score.py /opt/scorer/score.py\nENTRYPOINT [\"python3\", \"/opt/scorer/score.py\"]",
+        texts: [{ path: "score.py", content: "import json, sys\n# ..." }],
+      },
+      approval: null,
+      checklist: ["source", "dockerfile", "detail_leak", "model_use"],
+    });
+  },
   async setPluginPublic(id, on) {
     const p = PLUGINS.find((x) => x.id === id);
     if (p) p.public = on;

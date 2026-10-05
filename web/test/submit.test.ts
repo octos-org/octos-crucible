@@ -50,6 +50,7 @@ function fakeBackend(pub: { key_id: string; public_key: string }) {
       return { id: "u-fedcba9876543210", status: "building" };
     },
     setPluginPublic: async (id, on) => ({ id, public: on }),
+    pluginReview: async () => { throw new Error("unused"); },
   };
   return { b, calls };
 }
