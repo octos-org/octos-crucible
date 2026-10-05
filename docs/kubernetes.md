@@ -2,7 +2,7 @@
 
 原生 Kubernetes 后端：每次评测一个命名空间，每个步骤一个 Job，步骤里起的每个容器（agent、应用、测试、打分器）都是一个 Pod，网络隔离用 NetworkPolicy，镜像用集群内的 BuildKit 构建、存在集群内的镜像仓库。步骤顺序与 `crucible eval local`、`crucible eval nomad` 相同（generate × 遍数 → handoff → score-tests × 遍数 → publish）。设计见 `docs/executors.md` §3.2、§4.2、§5.3。
 
-目前是原型验证阶段：没有为防攻击额外加限制，已有的隔离都保留；密钥用本机钥匙（`crucible keys gen`），结果不进排行榜。数据和存储都在集群自己的卷上，不用付费服务。
+目前是原型验证阶段：密钥用本机钥匙（`crucible keys gen`），结果不进排行榜。数据和存储都在集群自己的卷上，不用付费服务。隔离加固见"安全加固"：评测命名空间强制 Pod Security `restricted`，多节点时可信步骤与沙箱步骤强制分节点池，可选 RuntimeClass（gVisor、Kata）。
 
 ## 组成
 
@@ -67,11 +67,13 @@ crucible eval k8s --root <仓库> --taskset hello-world --agent builtin:octos \
 | `--volume-size` | `20Gi` | 每次评测的卷大小 |
 | `--storage-class` | 集群默认 | 卷的存储类 |
 | `--rwx` | 否 | 卷是 ReadWriteMany（共享存储类）：步骤和它起的 Pod 可以落在池内任意节点（见"多节点"） |
-| `--trusted-selector` | 任意节点 | handoff、publish 和装载 Pod 的节点，`键=值[,键=值]` |
-| `--sandbox-selector` | 任意节点 | generate、score-tests 以及它们起的所有 Pod 的节点 |
+| `--trusted-selector` | 单节点：任意；多节点：`crucible/pool=trusted` | handoff、publish 和装载 Pod 的节点，`键=值[,键=值]` |
+| `--sandbox-selector` | 单节点：任意；多节点：`crucible/pool=sandbox` | generate、score-tests 以及它们起的所有 Pod 的节点 |
 | `--pids-limited` | 否 | 声明节点限制了每个 Pod 的进程数（kubelet `pod-max-pids`）；不声明时起容器的步骤拒绝运行 |
 | `--crucible-bin` | 驱动自己 | 拷到卷上的 `crucible`（Linux） |
 | `--step-timeout-s` | 21600 | 每步上限（Job 的 `activeDeadlineSeconds`） |
+| `--pod-security` | `restricted` | 评测命名空间强制的 Pod Security 级别：`restricted` 或 `baseline`（见"安全加固"） |
+| `--runtime-class` | 无 | 步骤起的所有 Pod 用这个 RuntimeClass（例如 `gvisor`、`kata`）；集群里必须已有 |
 
 `--store` 不可用：每次评测的存储（`dir:`）就在评测目录里、跟着卷走。结果在 `--out`（默认 `./crucible-evals`）`/<eval id>/`：`gen`、`scores`、`publish`（manifest，`timing_source: k8s`）、`store`、`steps.json`（时间取 Pod 里容器的开始/结束时间）。各步输出实时打印到驱动的标准错误。eval id 默认 `k8s-<时间>-<随机>`。
 
@@ -81,11 +83,12 @@ crucible eval k8s --root <仓库> --taskset hello-world --agent builtin:octos \
 
 **命名空间** `crucible-e-<eval id>`（每次评测一个，结束即删，卷一起删）：
 
+- 标签 `pod-security.kubernetes.io/enforce|warn|audit=<--pod-security>`（`enforce-version=latest`）：不合规的 Pod 被 API server 直接拒绝。
 - `default-deny`：选中所有 Pod，入站、出站都为空；`steps-out`：步骤 Pod 可以出站（模型上游、git、API server、BuildKit）。
 - PVC `data`：评测卷。驱动先经一个装载 Pod（`kubectl exec ... tar`）把本地评测目录拷进去：步骤根目录（agents、scorers、runners、tools、config 的拷贝）、generate 专用的根目录（只有 agents 和 config）、题目包 `taskset.json`、本次评测的 `dir:` 存储（题目包块、上传的产出，都是封好的）、`bin/crucible`。结束时只取回 `gen`、`scores`、`publish`、`store`；交接包、工作目录、临时文件不离开集群。
 - ServiceAccount `crucible-step`，用 RoleBinding 绑到 ClusterRole `crucible-step`：只能管**本命名空间**的 Pod（建、删、看、日志、打标签）和 NetworkPolicy，没有 Secret 权限。
 
-**每步一个 Job**（`backoffLimit: 0`，失败不由 Kubernetes 重试）：Pod 以 1000:1000 非 root 运行，drop ALL，`allowPrivilegeEscalation: false`，卷挂在 `/crucible`，`TMPDIR` 在卷上。只有起容器的步骤（generate、score-tests）挂服务账号令牌、带执行后端的设置（`CRUCIBLE_EXECUTOR=k8s` 等，Pod IP / 节点名经 downward API）；handoff、publish 没有任何集群凭据。
+**每步一个 Job**（`backoffLimit: 0`，失败不由 Kubernetes 重试）：Pod 以 1000:1000 非 root 运行，drop ALL，`allowPrivilegeEscalation: false`，`seccompProfile: RuntimeDefault`（满足 `restricted`），卷挂在 `/crucible`，`TMPDIR` 在卷上。只有起容器的步骤（generate、score-tests）挂服务账号令牌、带执行后端的设置（`CRUCIBLE_EXECUTOR=k8s` 等，Pod IP / 节点名经 downward API）；handoff、publish 没有任何集群凭据。
 
 **密钥**：每步一个 Secret，内容按 `crucible step list` 里这一步的清单生成，清单外的密钥直接报错；Pod 里每个密钥用 `subPath` 挂成 `/run/crucible/secrets/<名字>`（目录里没有别的文件；`crucible step` 自己也拒绝清单外的文件）。所以 `score-tests` 只可能拿到一次性钥匙（单元测试锁住）。步骤结束（无论成败）驱动删 Job 和 Secret。步骤是一个接一个跑的，一个起容器的步骤运行时命名空间里只有它自己的 Secret。
 
@@ -95,9 +98,9 @@ crucible eval k8s --root <仓库> --taskset hello-world --agent builtin:octos \
 
 | 容器规格 | Pod |
 |---|---|
-| `--user uid:gid` | `runAsUser`、`runAsGroup`，非 0 时 `runAsNonRoot` |
-| `--cap-drop` / `--cap-add` | `capabilities.drop` / `add`（agent：drop ALL） |
-| `no-new-privileges` | `allowPrivilegeEscalation: false` |
+| `--user uid:gid` | `runAsUser`、`runAsGroup`，非 0 时 `runAsNonRoot`；`restricted` 下不给或给 0 时改为 1000:1000 |
+| `--cap-drop` / `--cap-add` | `capabilities.drop` / `add`（agent：drop ALL）；`restricted` 下一律 drop ALL，只保留 `--cap-add NET_BIND_SERVICE` |
+| `no-new-privileges` | `allowPrivilegeEscalation: false`；`restricted` 下总是 false |
 | — | `seccompProfile: RuntimeDefault`、`automountServiceAccountToken: false`、`enableServiceLinks: false`、`restartPolicy: Never` |
 | `--read-only` | `readOnlyRootFilesystem` |
 | `--memory`、`--cpus` | `limits`，`requests` 与之相同 |
@@ -107,10 +110,25 @@ crucible eval k8s --root <仓库> --taskset hello-world --agent builtin:octos \
 | 宿主机路径挂载 | 评测卷的 `subPath`；不在卷下的路径直接报错 |
 | 命名卷 | 卷上的 `.volumes/<名字>` |
 | `--platform` | `nodeSelector kubernetes.io/arch` |
+| `--network container:<名字>` | `<名字>` 那个 Pod 里的**临时容器**（ephemeral container），见下 |
+| — | `--runtime-class` 给了时 `runtimeClassName` |
 | — | 节点：默认与步骤 Pod 同一节点（节点亲和，ReadWriteOnce 卷可用）；`--rwx` 时沙箱池内任意节点，但挂了命名卷的容器仍与步骤同节点（命名卷里可能是 FIFO，只在一个节点内相通，例如 astro-v4 的 agent 与引擎） |
 | — | `--sandbox-selector` 的 `nodeSelector`，加上同名同值的 `NoSchedule` 容忍 |
 
 agent 的工作目录、HOME、`/req` 都是卷上的目录，步骤进程直接读工作目录打快照，不需要边车容器。
+
+挂载了"装有 FIFO 的目录"或命名卷的容器，在 `--rwx` 时也钉在步骤所在节点（FIFO 只在一个节点内相通，例如 astro-v4 的 agent 与引擎）。
+
+### 共享网络命名空间（`--network container:<名字>`）
+
+Kubernetes 里只有同一个 Pod 的容器共享网络命名空间，运行中的 Pod 也不能再加普通容器，所以加入另一个容器网络的容器（ARC 官方打分器的测试容器）变成那个容器所在 Pod 的**临时容器**（`pods/ephemeralcontainers` 子资源）：
+
+- 与宿主容器同一网络命名空间，用 `127.0.0.1` 访问它，与 Docker 的 `--network container:` 相同；Pod 的 NetworkPolicy、DNS、RuntimeClass、节点都不变，所以隔离不变（ARC 的应用 Pod 是 `--network none`，测试容器加入后同样出不去）。
+- 临时容器只能用 Pod 已有的卷，而且不能用 `subPath`，所以每个 Pod 都带 4 个空的 `emptyDir`（`guest-0..3`）备用：加入者的每个挂载和 tmpfs 各占一个；加入前由一个辅助临时容器（坩埚自己的 busybox 命令，非 root）把评测卷上对应目录的内容拷进去，加入者结束后再把可写挂载的内容拷回评测卷（`ctr run` 前台运行时；后台运行的加入者写的东西不拷回）。只支持目录挂载，最多 4 个。`--shm-size` 不另设，用 Pod 的 `/dev/shm`（Playwright 的 Chromium 默认不用 `/dev/shm`）。宿主是 `--init`（共享进程命名空间）时拒绝加入，否则宿主进程能看到辅助容器的挂载。
+- 临时容器不能设资源：加入前把宿主容器的 `limits`/`requests` 原地加上它的（`pods/resize`，Kubernetes 1.33 起默认可用），整个 Pod 的上限 = 两者之和，与 Docker 下两个容器各自的上限之和相同；只是两者不再各有上限。改不了时打警告，测试容器与宿主共用宿主的上限。
+- 它的名字记在宿主 Pod 的标签 `guest.crucible/<名字>=1` 上，`ctr logs/inspect/rm` 按名字找得到；临时容器不能单独删除或停止，进程结束或宿主 Pod 删除时结束（`ctr rm` 对它不做事）。
+
+步骤的 ClusterRole 因此多了 `pods/ephemeralcontainers`、`pods/resize` 的 `patch`（`deploy/k8s/crucible-system.yaml`，升级时重新 `kubectl apply` 一次）。
 
 ## 网络隔离
 
@@ -131,12 +149,75 @@ kubectl -n crucible-system exec deploy/registry -- registry garbage-collect /etc
 
 BuildKit 是无根模式（需要非受限的 seccomp/AppArmor 以使用用户命名空间），构建缓存在它自己的 `emptyDir` 里，Pod 重建即清空。
 
+## 安全加固
+
+### Pod Security `restricted`
+
+评测命名空间带 `pod-security.kubernetes.io/enforce=restricted`（`--pod-security`，默认 `restricted`）：API server 拒绝任何不满足 [restricted 标准](https://kubernetes.io/docs/concepts/security/pod-security-standards/#restricted) 的 Pod（以 root 运行、加 capability、允许提权、没有 RuntimeDefault seccomp 等），包括坩埚自己或插件出错时起的。坩埚的 Pod 本来就满足（步骤 Job、装载 Pod、`netgate`、探测 Pod）；步骤起的容器按"容器怎样变成 Pod"的表调整：一律 `allowPrivilegeEscalation: false`、drop ALL（只留 `NET_BIND_SERVICE`）、`runAsNonRoot`，要 root 或用镜像默认用户的改以 1000:1000（步骤自己的 uid）运行，日志里记一行 `pod security restricted: <容器> runs as 1000:1000`。
+
+对插件的影响：
+
+- 巡天（astro-v4）：原来用一个 root 容器建 FIFO 再 chown，改为由脚本在步骤里（宿主机上）直接建，各后端都不再需要 root 容器。
+- Playwright 打分器的被测应用：镜像没设 `USER` 时以 1000 运行。hello-world 照常；运行时要写镜像里 root 目录的应用会出错，用 `--pod-security baseline`。
+- ARC 官方打分器：构建、启动容器在官方 runner 里以 root 运行（npm 读 `/root/.npmrc`，root 解包时 chown）。`restricted` 下它们以 1000 运行、没有 capability；`official.py` 只在非 root 时把 npm 的用户配置指向镜像里同一份 `.npmrc` 的可读副本、`HOME` 指向可写目录，其余照旧。Docker 后端仍以 root 运行，行为不变。
+
+`--pod-security baseline` 时不做上述调整，容器按自己的参数运行（与 Docker 后端相同），命名空间强制 `baseline`（仍禁止特权容器、宿主机命名空间、hostPath 等）。
+
+### 节点池（多节点时强制分开）
+
+驱动在建命名空间前读集群节点：
+
+- **单节点**：可信步骤与沙箱步骤只能在同一节点，照常运行，日志记 `node pools: single node <节点>: trusted and sandbox steps share it`。
+- **多节点**：必须分池。`--trusted-selector` / `--sandbox-selector` 不给时默认 `crucible/pool=trusted` / `crucible/pool=sandbox`；两个池都要有节点、不能有节点同时属于两池、每个沙箱节点都要带同名污点 `NoSchedule`（其他工作负载不会落到跑不可信代码的节点上），评测卷要 `--rwx`（同一评测的步骤在不同节点上）。任何一条不满足就拒绝运行，报错里给出 `kubectl label` / `kubectl taint` 命令。满足时日志列出两个池的节点。
+
+### RuntimeClass（gVisor、Kata）
+
+`--runtime-class <名字>`：驱动先确认集群里有这个 RuntimeClass，步骤起的所有 Pod（agent、被测应用、测试、打分器、沙箱探测 Pod）都带 `runtimeClassName`，在用户态内核（gVisor）或轻量虚拟机（Kata）里运行；步骤 Pod 本身不用（它只跑坩埚自己的 `crucible`、`kubectl`、`buildctl`）。NetworkPolicy 在节点一侧执行，与运行时无关，沙箱自检照常在 gVisor 的探测 Pod 里跑。BuildKit 的构建不在其中（与 Docker 后端相同）。
+
+k3s 上装 gVisor（单节点；多节点每个沙箱节点都要装）：
+
+```bash
+# 1. runsc 与 containerd shim（gVisor 的 apt 源或 .deb：https://gvisor.dev/docs/user_guide/install/）
+sudo install -m 0755 runsc containerd-shim-runsc-v1 /usr/local/bin/
+
+# 2. runsc 的设置：FIFO 可跨沙箱打开（巡天的 agent 与引擎）；文件经 gofer 访问
+sudo mkdir -p /etc/containerd
+sudo tee /etc/containerd/runsc.toml <<'EOF'
+[runsc_config]
+  host-fifo = "open"
+  directfs = "false"
+EOF
+
+# 3. 给 k3s 的 containerd 加 runsc 运行时（k3s 用模板生成 config.toml）
+sudo tee /var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.tmpl <<'EOF'
+{{ template "base" . }}
+
+[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runsc]
+  runtime_type = "io.containerd.runsc.v1"
+
+[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runsc.options]
+  TypeUrl = "io.containerd.runsc.v1.options"
+  ConfigPath = "/etc/containerd/runsc.toml"
+EOF
+sudo systemctl restart k3s
+
+# 4. RuntimeClass
+kubectl apply -f - <<'EOF'
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata: {name: gvisor}
+handler: runsc
+EOF
+```
+
+两项设置的原因：`host-fifo=open` 让沙箱打开宿主机上的 FIFO（默认不允许）；gVisor 默认的 directfs 下，两个沙箱经同一对宿主机 FIFO 双向传大块数据会卡住（实测 70 KB 以上），`directfs=false` 改由 gofer 中转后正常。FIFO 必须在沙箱外建（沙箱里 `mkfifo` 建出的只在那个沙箱里存在），所以巡天的 FIFO 由脚本在步骤里建。
+
 ## 多节点（含单机模拟）
 
-默认（不带下面的参数）与单节点完全相同：ReadWriteOnce 卷，步骤起的 Pod 都和步骤在同一节点，不分节点池。多节点时：
+单节点时：ReadWriteOnce 卷，步骤起的 Pod 都和步骤在同一节点，不分节点池。多节点时必须：
 
-- **评测卷用 ReadWriteMany**：`--rwx --storage-class <共享存储类>`（NFS、CephFS 等集群自己的存储）。这样起的 Pod 不再钉在步骤所在节点，由调度器在沙箱池里放；只有挂命名卷的容器仍与步骤同节点（命名卷可能装 FIFO 这类只在一个节点内有效的东西）。不带 `--rwx` 时，`local-path` 的卷绑定在第一个用它的节点上，整次评测都在那个节点，能用但不分散负载。
-- **节点池**：`--trusted-selector`、`--sandbox-selector` 给步骤 Job（和装载 Pod、步骤起的 Pod）加 `nodeSelector` 和同名同值的 `NoSchedule` 容忍。给沙箱节点打上同样的污点（`kubectl taint node <节点> crucible/pool=sandbox:NoSchedule`），别的工作负载（镜像仓库、BuildKit、CoreDNS、可信步骤）就不会落上去。
+- **评测卷用 ReadWriteMany**：`--rwx --storage-class <共享存储类>`（NFS、CephFS 等集群自己的存储）。这样起的 Pod 不再钉在步骤所在节点，由调度器在沙箱池里放；只有挂命名卷或装有 FIFO 的目录的容器仍与步骤同节点（FIFO 只在一个节点内有效）。多节点不带 `--rwx` 会被拒绝（可信与沙箱步骤在不同节点，ReadWriteOnce 的卷跟不过去）。
+- **节点池**：`--trusted-selector`、`--sandbox-selector`（多节点时默认 `crucible/pool=trusted|sandbox`，并强制检查，见"安全加固"）给步骤 Job（和装载 Pod、步骤起的 Pod）加 `nodeSelector` 和同名同值的 `NoSchedule` 容忍。沙箱节点必须带同样的污点（`kubectl taint node <节点> crucible/pool=sandbox:NoSchedule`），别的工作负载（镜像仓库、BuildKit、CoreDNS、可信步骤）就不会落上去。
 - **网络隔离**跨节点照样成立：NetworkPolicy 按 Pod 标签选择，与节点无关；k3s 的策略控制器在每个节点上执行。沙箱探测 Pod 和 agent Pod 可能与步骤不在同一节点，计量代理地址就是步骤 Pod 的 IP。
 - **镜像仓库**：每个节点都要有同样的 `registries.yaml`（`10.43.200.200:5000` 走 HTTP）；**进程数**：每个节点都设 `pod-max-pids`。
 
@@ -179,15 +260,27 @@ deploy/k8s/sim-multinode.sh down       # 删集群、卷和 kubeconfig
 
 评测卷是 `RWX nfs-rwx`。第一次真跑巡天时 agent 与引擎被分到两个节点，FIFO 不通，得 0 分，于是加了"挂命名卷的容器与步骤同节点"。
 
+**magicbook 实测（安全加固，2026-10-05，k3s v1.36.5，gVisor release-20260928.0）**：
+
+| 项目 | 结果 |
+|---|---|
+| `restricted` 生效 | 评测命名空间里提交一个 `runAsUser: 0`、加 `CHOWN` 的 Pod：`forbidden: violates PodSecurity "restricted:latest"`（列出提权、capability、runAsNonRoot、seccomp 各项） |
+| hello-world app（单节点，`restricted`） | 1.0 |
+| 巡天 L1 app + 假模型凭据（单节点，`restricted`，score-tests 建沙箱） | 4458.556163；沙箱自检 10 项全部拦住 |
+| ARC 官方打分器，选手 001 stage-1（单节点，`restricted`） | 26、29、28、28 / 30；同一台机器 Docker 后端 28、27、27、28、28 / 30。没过的是同一组时间敏感的用例（REQ-2-2-x，单用例 10 s 超时），两边分布一致 |
+| `--runtime-class gvisor`：hello-world、巡天 L1（同上） | 1.0、4458.556163；探测 Pod 在 gVisor 里，10 项全部拦住 |
+| `--runtime-class gvisor`：ARC 001 stage-1 | 21/30：gVisor 下 Chromium 明显变慢，10 s 超时的用例失败更多；时间敏感的打分器不建议开 |
+| 多节点模拟：不带 `--rwx` / 沙箱节点去掉污点 | 都拒绝运行，报错如上 |
+| 多节点模拟：hello-world、巡天 L1 + 假凭据（默认节点池） | 1.0、4458.556163（10 项拦住）；handoff、publish、装载 Pod 在 server，score-tests 与巡天 agent、引擎同在 agent-0（FIFO 目录钉住），被测应用与测试 Pod 分在两个 agent 节点 |
+
 ### 其他注意事项
 
-- **更强的隔离**：可以给 agent、应用、测试 Pod 设 `runtimeClassName: gvisor`/`kata`（未实现）。
 - **镜像仓库**：单副本、HTTP、`local-path` 卷。
 
 ## 已知限制
 
-- 打分器 arcbench-official 的测试容器要加入服务容器的网络命名空间（`--network container:<名字>`），Kubernetes 后端不支持，直接报错；这个打分器目前只能在 Docker 后端（GitHub、自托管、单机、Nomad）上用。
-- 没有给命名空间打 Pod Security Admission `restricted` 标签（ARC 官方打分器的构建容器需要以 root 运行加 CHOWN 等能力；原型阶段只保留现有隔离）。
+- `restricted` 下要求 root 的镜像改以 1000:1000 运行，写镜像里 root 所有的目录会失败（例如被测应用的 Dockerfile 没设 `USER`、运行时往 `/app` 写数据库）。这类评测用 `--pod-security baseline`。
+- 共享网络命名空间的容器（临时容器）不能单独停止，见上。
 - 停止一个容器用的是把 Pod 的 `activeDeadlineSeconds` 改成 1，宽限期固定为 30 秒。
 
 ## 停止与恢复（magicbook 上的做法）

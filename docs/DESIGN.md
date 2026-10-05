@@ -123,6 +123,7 @@ octos-crucible 是评测 agent 的通用平台：任何能在沙箱里运行的 
 - 每个 job 只拿它需要的东西：生成 job 拿不到题目；跑测试的 job（`score-tests`）拿不到任何平台密钥，`permissions: {}`；只有发布 job 有写仓库权限。workflow 顶层 `permissions: {}`。
 - 所有输入经正则校验后通过 env 传入 shell，不做表达式拼接。
 - 用户上传的打分器插件（`docs/plugins.md` §14）：镜像在不持有平台密钥的 job 里构建，`RUN` 步骤只能经出网代理访问白名单软件源，基础镜像只来自 Docker Hub 或 ghcr.io，构建限时、镜像限大小；登记时只构建一次，镜像加密存为块，评测时核对镜像 id 后载入，不再重建。构建结果封给平台公钥交回，由持钥 job 核对后登记。`model: true` 的插件以与计量代理进程不同的 uid、在独立网络命名空间里运行（`docs/executors.md` §3.5）。插件设为公开前须管理员按审核清单读过源码与 Dockerfile。
+- 容器隔离的几层（`docs/executors.md` §3、§3.6，`docs/kubernetes.md`"安全加固"）：网络默认全拒并在每次使用前实测（沙箱自检）；非 root、cap-drop ALL、no-new-privileges、资源上限；机器本身的路径不能挂进容器；Kubernetes 上评测命名空间强制 Pod Security `restricted`，多节点时可信步骤与跑不可信代码的步骤强制分节点池（沙箱节点带污点）；可选用户态内核（gVisor：Docker 用 `CRUCIBLE_DOCKER_RUNTIME=runsc`，Kubernetes 用 `--runtime-class`）或 Kata。Docker 的 userns-remap 与 rootless 没有采用（原因见 executors §3.6）。
 - 已知残余风险：生成 job 里的容器逃逸可拿到该机器上的模型 key 和私钥（打分时的逃逸拿不到，见上）。缓解：机器一次性使用、key 用完即删、钥匙可更换。
 - 已知残余风险：只有一对钥匙，题目包的 inputs 块和 tests 块用同一把公钥加密，生成 job 为了解开 inputs 块持有私钥，因此技术上也能解开 tests 块。"生成 job 拿不到题目"靠的是生成 job 只下载 inputs 块（`crucible taskset inputs` 只读 `inputs_blob`），不是密码学隔离。要做到密码学隔离需为 tests 块单设一把只在打分 job 使用的钥匙。
 
