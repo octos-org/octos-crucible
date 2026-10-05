@@ -23,7 +23,7 @@ use crate::session;
 use crate::shard::{release_tag, sha256_hex};
 use crate::store::{Claim, Db};
 use crate::tokens::{self, TokenRecord, TokenSummary};
-use crate::util::{ct_eq, parse_query, query_get, rfc3339};
+use crate::util::{b64_decode, b64_encode, ct_eq, parse_query, query_get, rfc3339};
 use crucible_core::taskset::is_user_taskset_id;
 
 const OAUTH_COOKIE: &str = "crucible_oauth";
@@ -1176,12 +1176,13 @@ impl<'a, B: Backend> App<'a, B> {
             rec.updated_at = rfc3339(self.b.now_s());
         };
         if let Some(cred) = &v.cred {
-            // Stored exactly as sealed by the page; returned unchanged by
-            // GET /internal/cred/:id until it expires.
-            let put = match std::str::from_utf8(cred) {
-                Ok(text) => self.db().put_cred(&v.eval_id, text, now + CRED_TTL_S).await,
-                Err(_) => Err("sealed credential is not UTF-8".to_owned()),
-            };
+            // Stored exactly as sealed by the page (base64: the sealed
+            // bytes are binary); returned unchanged by GET
+            // /internal/cred/:id until it expires.
+            let put = self
+                .db()
+                .put_cred(&v.eval_id, &b64_encode(cred), now + CRED_TTL_S)
+                .await;
             if let Err(e) = put {
                 fail(&mut rec);
                 let _ = self.db().save_refresh(&rec).await;
@@ -1384,8 +1385,9 @@ impl<'a, B: Backend> App<'a, B> {
             .cred(id, self.b.now_s())
             .await
             .map_err(|e| self.storage_err(e))?
+            .and_then(|c| b64_decode(&c))
             .ok_or_else(|| ApiError::not_found("no credential for this eval"))?;
-        Ok(Resp::bytes(cred.into_bytes()))
+        Ok(Resp::bytes(cred))
     }
 
     async fn internal_delete_cred(&self, req: &Req, id: &str) -> Result<Resp> {

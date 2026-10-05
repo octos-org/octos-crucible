@@ -3,7 +3,7 @@
 -- (wrangler.toml [triggers]) deletes such rows. docs/api.md "D1 表结构".
 CREATE TABLE creds (
   eval_id TEXT PRIMARY KEY,
-  envelope TEXT NOT NULL,              -- the sealed envelope (JSON text), as submitted
+  envelope TEXT NOT NULL,              -- the sealed envelope bytes, standard base64
   expires_s INTEGER NOT NULL           -- unix seconds
 );
 CREATE INDEX creds_expires ON creds (expires_s);
