@@ -451,6 +451,8 @@ fn sealed(payload: &[u8]) -> Vec<u8> {
     let mut b = Envelope::new(keys::current().key_id.clone()).header_line();
     b.extend_from_slice(b"age-encryption.org/v1\n");
     b.extend_from_slice(payload);
+    // Real ciphertext is binary (not UTF-8).
+    b.extend_from_slice(&[0xff, 0xfe, 0x00, 0x80]);
     b
 }
 

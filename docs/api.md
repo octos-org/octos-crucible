@@ -292,7 +292,7 @@ workflow 通过 `/internal/status` 上报的精确状态优先。估计值只能
 | `tokens` | 主键 `id`；`owner_id, login, name, hash, created_at`（hash = SHA-256(令牌)） | `(owner_id)` |
 | `bans` | 主键 `github_id`；`by_id, at, reason` | 主键 |
 | `cache` | 主键 `key`；`tasksets`、`leaderboard`、`leaderboard/<题目包>`（5 分钟）、`release/<tag>`（不过期） | 主键 |
-| `creds` | 主键 `eval_id`；`envelope`（凭据 envelope，原样）、`expires_s`（提交时 + 24 小时）。读时过期即视为不存在；run 结束时删除 | `(expires_s)`（Cron 清理） |
+| `creds` | 主键 `eval_id`；`envelope`（凭据 envelope 字节的标准 base64）、`expires_s`（提交时 + 24 小时）。读时过期即视为不存在；run 结束时删除 | `(expires_s)`（Cron 清理） |
 
 常用查询都走主键或索引：详情 2 次主键查询，列表按 `owner_id` 索引取最多 1000 行并按主键 JOIN `results`；排行榜只读公开评测的部分索引，再按主键 JOIN `results`，最后按主键取上榜的至多 100 份 manifest。
 
