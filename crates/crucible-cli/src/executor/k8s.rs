@@ -1082,6 +1082,9 @@ impl Executor for K8sExecutor {
     }
 
     async fn build(&self, b: &BuildSpec, log: &Path) -> Result<()> {
+        if b.network.is_some() {
+            bail!("builds on a sandbox network are not supported on Kubernetes");
+        }
         let f = std::fs::File::create(log)?;
         let st = tokio::process::Command::new("buildctl")
             .args(buildctl_args(&self.conf, b))
@@ -1146,6 +1149,18 @@ impl Executor for K8sExecutor {
                 .send()
                 .await;
         }
+    }
+
+    async fn image_save(&self, _image: &str, _to: &Path) -> Result<()> {
+        bail!("saving images is not supported on Kubernetes (plugins are registered on Docker)")
+    }
+
+    async fn image_load(&self, from: &Path, tag: &str) -> Result<()> {
+        let r = self.image_ref(tag);
+        let (repo, tag) = registry_path(&self.conf.registry, &r)
+            .ok_or_else(|| anyhow!("{r} is not in the cluster registry"))?;
+        let a = crate::image_archive::Archive::parse(std::fs::read(from)?)?;
+        push_archive(&self.conf.registry, &repo, &tag, &a).await
     }
 
     async fn prune_build_cache(&self) {}
@@ -1289,6 +1304,78 @@ async fn manifest_digest(registry: &str, repo: &str, tag: &str) -> Result<Option
         .get("Docker-Content-Digest")
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned))
+}
+
+/// Push a `docker save` archive to the cluster registry as an OCI image
+/// (config digest = the image id the archive was checked against).
+pub async fn push_archive(
+    registry: &str,
+    repo: &str,
+    tag: &str,
+    a: &crate::image_archive::Archive,
+) -> Result<()> {
+    let client = reqwest::Client::new();
+    let base = format!("http://{registry}/v2/{repo}");
+    let file = |n: &str| a.file(n).ok_or_else(|| anyhow!("{n} missing"));
+    let put = |bytes: Vec<u8>| {
+        let client = client.clone();
+        let base = base.clone();
+        async move {
+            let digest = format!("sha256:{}", crucible_store::sha256_hex(&bytes));
+            let start = client
+                .post(format!("{base}/blobs/uploads/"))
+                .timeout(Duration::from_secs(60))
+                .send()
+                .await?
+                .error_for_status()?;
+            let loc = start
+                .headers()
+                .get("Location")
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| anyhow!("registry: no upload location"))?
+                .to_owned();
+            let url = if loc.starts_with("http") {
+                loc
+            } else {
+                format!("http://{registry}{loc}")
+            };
+            let sep = if url.contains('?') { '&' } else { '?' };
+            let size = bytes.len();
+            client
+                .put(format!("{url}{sep}digest={digest}"))
+                .header("Content-Type", "application/octet-stream")
+                .body(bytes)
+                .timeout(Duration::from_secs(600))
+                .send()
+                .await?
+                .error_for_status()?;
+            Ok::<_, anyhow::Error>((digest, size))
+        }
+    };
+    let cfg = file(&a.config)?.to_vec();
+    let (cd, cs) = put(cfg).await?;
+    let mut layers = Vec::new();
+    for l in &a.layers {
+        let b = file(l)?;
+        let mt = crate::image_archive::layer_media_type(b);
+        let (d, s) = put(b.to_vec()).await?;
+        layers.push(json!({"mediaType": mt, "digest": d, "size": s}));
+    }
+    let m = json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": cd, "size": cs},
+        "layers": layers,
+    });
+    client
+        .put(format!("{base}/manifests/{tag}"))
+        .header("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+        .body(serde_json::to_vec(&m)?)
+        .timeout(Duration::from_secs(60))
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(())
 }
 
 /// Size (compressed layers) and `/agent-build.json` (at most 2000 bytes,

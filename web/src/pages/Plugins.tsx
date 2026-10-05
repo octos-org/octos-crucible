@@ -81,6 +81,12 @@ function PluginCard({ p, admin, onChange }: { p: UserPlugin; admin: boolean; onC
               {st.detail ? `（${st.detail}）` : ""}
             </>
           )}
+          {p.image && (
+            <>
+              {" "}
+              · 镜像 <code title={p.image}>{p.image.slice(0, 19)}</code>
+            </>
+          )}
         </p>
       )}
       {p.approval && (

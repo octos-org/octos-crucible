@@ -523,6 +523,9 @@ impl UserPluginRecord {
             v["runs_taskset_code"] = p.runs_taskset_code.into();
             v["model"] = p.model.into();
             v["accepts"] = serde_json::json!(p.accepts);
+            if let Some(i) = &p.image {
+                v["image"] = i.id.clone().into();
+            }
         }
         if let Some(d) = info["description"].as_str().filter(|d| !d.is_empty()) {
             v["description"] = d.into();

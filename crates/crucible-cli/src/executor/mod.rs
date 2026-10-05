@@ -124,6 +124,10 @@ pub struct BuildSpec {
     pub tag: String,
     /// No network during the build (RUN steps).
     pub no_network: bool,
+    /// RUN steps join this network (a [`Sandbox`]'s: only the step's own
+    /// egress proxy is reachable). Docker's classic builder (BuildKit does
+    /// not take a named network); base images are pulled by the daemon.
+    pub network: Option<String>,
     pub platform: Option<String>,
     pub build_args: Vec<String>,
     pub labels: Vec<(String, String)>,
@@ -223,6 +227,11 @@ pub trait Executor {
     async fn image_exists(&self, image: &str) -> bool;
     async fn image_pull(&self, image: &str) -> Result<()>;
     async fn image_rm(&self, image: &str);
+    /// Write `image` as a `docker save` archive to `to`.
+    async fn image_save(&self, image: &str, to: &Path) -> Result<()>;
+    /// Make the `docker save` archive `from` (checked by
+    /// [`crate::image_archive::Archive`]) available as `tag`.
+    async fn image_load(&self, from: &Path, tag: &str) -> Result<()>;
     /// Clear the build cache (throwaway machines).
     async fn prune_build_cache(&self);
 
@@ -314,6 +323,12 @@ impl Executor for Backend {
     }
     async fn image_rm(&self, image: &str) {
         each!(self, e => e.image_rm(image).await)
+    }
+    async fn image_save(&self, image: &str, to: &Path) -> Result<()> {
+        each!(self, e => e.image_save(image, to).await)
+    }
+    async fn image_load(&self, from: &Path, tag: &str) -> Result<()> {
+        each!(self, e => e.image_load(from, tag).await)
     }
     async fn prune_build_cache(&self) {
         each!(self, e => e.prune_build_cache().await)

@@ -575,6 +575,7 @@ mod tests {
                 sha256: "a".repeat(64),
                 key_id: "1ffa702796eb5ee8".into(),
             },
+            image: None,
             runs_taskset_code: !model,
             model,
             accepts: accepts.iter().map(|s| s.to_string()).collect(),

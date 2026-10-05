@@ -49,6 +49,8 @@ export interface UserPlugin {
   runs_taskset_code?: boolean;
   model?: boolean;
   accepts?: string[];
+  /** Image id (`sha256:...`) built once at registration; scoring loads exactly this image. */
+  image?: string | null;
   selftest?: { status: string; score?: number | null; max?: number | null; detail?: string } | null;
   /** Review material exists (GET /plugins/:id/review). */
   reviewable?: boolean;

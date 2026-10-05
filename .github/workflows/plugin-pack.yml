@@ -5,15 +5,21 @@ name: plugin-pack
 # and the sealed upload (a zip: plugin.json + Dockerfile + build context).
 #
 #   open    holds the platform key, runs nothing from the package: opens
-#           the upload, checks plugin.json / Dockerfile / zip limits,
+#           the upload, checks plugin.json / Dockerfile rules / zip limits,
 #           re-seals the package to a one-run key (safe in a public
-#           repository's artifacts). A refused package is reported here.
+#           repository's artifacts), seals the review material to the
+#           platform key. A refused package is reported here.
 #   build   holds only the one-run key, permissions {}: builds the image
 #           (the plugin's own Dockerfile runs here, on a GitHub-hosted
-#           machine) and self-tests it once through the generic shell
-#           scorers/_user/score.sh. Only a small outcome (ready + self-test
-#           summary, or why it failed) leaves the job, as a job output.
-#   report  holds the Worker token: delivers the outcome.
+#           machine) with RUN steps on a sandbox network whose only way out
+#           is the egress proxy (config/egress.json), 20 min / 2 GB image
+#           at most, and self-tests it once through the generic shell
+#           scorers/_user/score.sh. The image and the outcome leave the job
+#           only sealed to the platform key (artifact plugin-outcome).
+#   report  holds the platform key, the Worker token and store write:
+#           opens and checks the outcome (this plugin, this package),
+#           computes the image id from the image itself, stores the image
+#           (a sealed blob) and registers the plugin with its image.
 #
 # The package's file names, build output and refusal reasons go only to the
 # Worker (the uploader sees them), never to these logs.
@@ -49,7 +55,6 @@ jobs:
       contents: read
     outputs:
       ok: ${{ steps.open.outputs.ok }}
-      plugin: ${{ steps.open.outputs.plugin }}
       worker: ${{ steps.open.outputs.worker }}
       run_key: ${{ steps.open.outputs.run_key }}
     env:
@@ -105,7 +110,6 @@ jobs:
             --root . --store "$STORE" --key-out "$RUNNER_TEMP/run.key" --out "$RUNNER_TEMP/build"
           {
             echo "ok=true"
-            echo "plugin=$(cat "$RUNNER_TEMP/build/plugin.json")"
             echo "worker=$(cat "$RUNNER_TEMP/build/worker" 2>/dev/null || true)"
             echo "run_key=$(cat "$RUNNER_TEMP/run.key")"
           } >> "$GITHUB_OUTPUT"
@@ -136,8 +140,6 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions: {}
-    outputs:
-      outcome: ${{ steps.build.outputs.outcome }}
     env:
       H: ${{ github.workspace }}/plugin-build
     steps:
@@ -149,7 +151,6 @@ jobs:
       # `crucible step plugin-build`: its step spec lists only the one-run
       # key, and it removes every secret variable from its environment first.
       - name: Build and self-test
-        id: build
         env:
           RUN_KEY: ${{ needs.open.outputs.run_key }}
         run: |
@@ -157,30 +158,51 @@ jobs:
           echo "::add-mask::$RUN_KEY"
           chmod 0755 "$H/bin/crucible"
           "$H/bin/crucible" step plugin-build --handoff "$H" --out "$RUNNER_TEMP/outcome"
-          echo "outcome=$(cat "$RUNNER_TEMP/outcome/outcome.json")" >> "$GITHUB_OUTPUT"
+
+      # Sealed to the platform key: safe in a public repository's artifacts.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: plugin-outcome
+          path: ${{ runner.temp }}/outcome
+          retention-days: 1
+          if-no-files-found: error
 
   report:
     needs: [open, build]
     if: always() && needs.open.outputs.ok == 'true' && needs.open.outputs.worker != ''
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    permissions: {}
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      STORE: github:${{ github.repository }}
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: plugin-build
           path: ${{ runner.temp }}/plugin-build
 
-      - name: Report to the Worker
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true
+        with:
+          name: plugin-outcome
+          path: ${{ runner.temp }}/plugin-outcome
+
+      # Nothing from the build job is trusted: plugin-report opens the
+      # outcome with the platform key, checks it is this plugin's and this
+      # package's, and computes the image id from the image itself.
+      - name: Check, store and report
         env:
+          CRUCIBLE_AGE_KEY: ${{ secrets.CRUCIBLE_AGE_KEY }}
           CRUCIBLE_WORKER_TOKEN: ${{ secrets.CRUCIBLE_WORKER_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
           IN_ID: ${{ inputs.plugin_id }}
           IN_WORKER: ${{ needs.open.outputs.worker }}
-          IN_PLUGIN: ${{ needs.open.outputs.plugin }}
-          IN_OUTCOME: ${{ needs.build.outputs.outcome }}
         run: |
           set -euo pipefail
           bin="$RUNNER_TEMP/plugin-build/bin/crucible"
           chmod 0755 "$bin"
+          out=()
+          [ -f "$RUNNER_TEMP/plugin-outcome/outcome.sealed" ] && out=(--outcome "$RUNNER_TEMP/plugin-outcome")
           "$bin" step plugin-report --plugin-id "$IN_ID" --worker-url "$IN_WORKER" \
-            --plugin "$IN_PLUGIN" --outcome "$IN_OUTCOME"
+            --handoff "$RUNNER_TEMP/plugin-build" "${out[@]}" --store "$STORE"

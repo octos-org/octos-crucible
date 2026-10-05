@@ -259,6 +259,7 @@ impl PluginManifest {
             name: id.to_owned(),
             version: self.version.clone(),
             blob,
+            image: None,
             runs_taskset_code: self.runs_taskset_code,
             model: self.model,
             accepts: self.accepts.clone(),
@@ -295,12 +296,38 @@ pub struct UserPlugin {
     pub version: String,
     /// The sealed package (a zip: plugin.json, Dockerfile, build context).
     pub blob: crate::BlobRef,
+    /// The image built once at registration (docs/plugins.md §14.3).
+    /// Absent for plugins registered before images were kept: those are
+    /// built from the package on the scoring machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<PluginImage>,
     #[serde(default = "yes")]
     pub runs_taskset_code: bool,
     #[serde(default)]
     pub model: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accepts: Vec<String>,
+}
+
+/// A user plugin's image as registration built it: `docker save` output
+/// (gzip), sealed and stored as a blob, and its image id (the digest of
+/// its config). Scoring loads exactly this image and checks the id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginImage {
+    pub blob: crate::BlobRef,
+    /// `sha256:<64 hex>`.
+    pub id: String,
+}
+
+impl PluginImage {
+    pub fn is_valid(&self) -> bool {
+        self.blob.is_valid()
+            && self
+                .id
+                .strip_prefix("sha256:")
+                .is_some_and(crate::blob::is_sha256_hex)
+    }
 }
 
 /// `impl` of a user plugin seen as a [`Plugin`].
@@ -320,6 +347,9 @@ impl UserPlugin {
         }
         if !self.blob.is_valid() {
             return Err(format!("{id}: bad blob reference"));
+        }
+        if self.image.as_ref().is_some_and(|i| !i.is_valid()) {
+            return Err(format!("{id}: bad image reference"));
         }
         check_traits(self.runs_taskset_code, self.model, &self.accepts)
             .map_err(|e| format!("{id}: {e}"))
