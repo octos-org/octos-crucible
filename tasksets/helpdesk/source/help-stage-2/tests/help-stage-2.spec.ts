@@ -3,9 +3,10 @@ import { uid, as, newTicket, row } from './support/help';
 
 const btn = (p: Page, name: string) => p.getByRole('button', { name, exact: true });
 async function count(p: Page, label: string): Promise<number> {
-  const el = p.getByText(new RegExp(`^\\s*${label}:\\s*\\d+\\s*$`)).first();
-  await expect(el).toBeVisible();
-  return Number(((await el.textContent()) ?? '').match(/(\d+)/)![1]);
+  // The count may share an element with other text ("Open: 3 In progress: 1"): read it from the page text.
+  const re = new RegExp(`(?:^|[^A-Za-z])${label}:\\s*(\\d+)`);
+  await expect(p.locator('body')).toContainText(new RegExp(`${label}:\\s*\\d+`));
+  return Number((await p.locator('body').innerText()).match(re)![1]);
 }
 
 test('REQ-1..3 still work: tickets, roles and 403 pages', async ({ browser }) => {
@@ -107,6 +108,7 @@ test('REQ-4-3: comments in order; internal notes hidden from customers', async (
   await expect(bob.getByRole('listitem').filter({ hasText: 'bob: Customer seems upset (internal)' })).toHaveCount(1);
   await bob.getByLabel('Comment').fill('Working on it');
   await btn(bob, 'Add comment').click();
+  await expect(bob.getByRole('listitem').filter({ hasText: 'bob: Working on it' })).toHaveCount(1);
   const items = (await bob.getByRole('listitem').allInnerTexts()).map((t) => t.trim());
   const i = (s: string) => items.findIndex((t) => t.includes(s));
   expect(i('cy: Any news?')).toBeGreaterThanOrEqual(0);
