@@ -137,6 +137,7 @@ test('REQ-5-1: status filter combines with search', async ({ browser }) => {
   await newTicket(cy, b);
   await bob.goto(ua);
   await btn(bob, 'Start progress').click();
+  await expect(bob.getByText('Status: In progress')).toBeVisible();
   await bob.goto('/tickets');
   await bob.getByLabel('Search').fill(k);
   await bob.getByLabel('Status filter').selectOption('In progress');
@@ -175,7 +176,7 @@ test('REQ-5-2: dashboard is for staff only', async ({ browser, page }) => {
   await expect(cy.getByRole('link', { name: 'Dashboard', exact: true })).toHaveCount(0);
   const res = await cy.goto('/dashboard');
   expect(res?.status()).toBe(403);
-  await expect(cy.getByText('Forbidden')).toBeVisible();
+  await expect(cy.getByText('Forbidden').first()).toBeVisible();
   const ada = await as(browser, 'ada');
   await expect(ada.getByRole('link', { name: 'Dashboard', exact: true })).toBeVisible();
 });
