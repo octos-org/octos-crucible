@@ -1,4 +1,5 @@
 import type { ComponentChildren } from "preact";
+import { QuotaNote } from "./QuotaNote";
 import { useState } from "preact/hooks";
 import { api } from "../api";
 import { submitEval, STEP_TEXT, type Step } from "../submit";
@@ -140,6 +141,7 @@ export function Submit() {
   return (
     <form class="stack" onSubmit={onSubmit} noValidate>
       <h1>提交评测</h1>
+      <QuotaNote names={["evals_running", "evals_per_day", "uploads_per_day", "upload_bytes_per_day"]} />
 
       <div class="seg" role="tablist" aria-label="提交方式">
         <button

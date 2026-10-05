@@ -178,6 +178,16 @@ crucible status <eval_id> --wait --json
 
 Human-readable page: `https://octos-org.github.io/octos-crucible/#/evals/<eval_id>`.
 
+An evaluation the platform gave up on (no GitHub run started, or no result long after submission) is `failed` with `error` saying why.
+
+### Quotas
+
+```sh
+crucible quota
+```
+
+Per-user limits: uploads and upload bytes in 24 h, evaluations in progress, evaluations in 24 h, plugin and taskset registrations in 24 h. The table shows each limit, what is used, what is left and when the next slot frees. Going over is refused with HTTP 429 `quota_exceeded`; the message names the limit and when it recovers. Ask an administrator to raise it.
+
 ## Read results
 
 Key fields of `crucible status <eval_id> --json`:

@@ -17,7 +17,9 @@ database_name = "octos-crucible"
 database_id = "7d2b7485-932b-44e0-a57f-e47c83651855"
 migrations_dir = "migrations"
 
-# Hourly: delete expired credentials and cache rows (app::scheduled).
+# Hourly: delete expired credentials and cache rows; fail taskset/plugin
+# registrations stuck in packing/building and evals that never started or
+# have no result long after submission (app::scheduled).
 [triggers]
 crons = ["17 * * * *"]
 
@@ -27,6 +29,19 @@ PAGES_URL = "https://octos-org.github.io/octos-crucible/"
 GITHUB_REPO = "octos-org/octos-crucible"
 # Comma-separated GitHub numeric user ids.
 ADMIN_GITHUB_IDS = "58540850"
+# Per-user quotas (docs/api.md "配额"); admins can override per user or
+# exempt (PUT /admin/quotas/:github_id). Administrators are exempt by default.
+QUOTA_UPLOADS_PER_DAY = "50"
+QUOTA_UPLOAD_BYTES_PER_DAY = "524288000"
+QUOTA_EVALS_RUNNING = "3"
+QUOTA_EVALS_PER_DAY = "20"
+QUOTA_PLUGINS_PER_DAY = "10"
+QUOTA_TASKSETS_PER_DAY = "10"
+# The hourly sweep: a registration still packing/building after this many
+# seconds fails (also: an eval with no GitHub run found); an eval not
+# settled STUCK_EVAL_S after submission fails.
+STUCK_REGISTRATION_S = "7200"
+STUCK_EVAL_S = "108000"
 # Optional:
 WORKER_URL = "https://crucible-worker.stratosphericus.workers.dev"
 # EVAL_WORKFLOW = "eval.yml"

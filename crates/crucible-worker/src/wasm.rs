@@ -173,11 +173,16 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> worker::Result<Resp
     to_worker(app::handle(&backend, &cfg, &r).await)
 }
 
-/// Cron Trigger (wrangler.toml `[triggers]`): purge expired rows.
+/// Cron Trigger (wrangler.toml `[triggers]`): purge expired rows, fail
+/// stuck registrations and evals.
 #[event(scheduled)]
 async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
+    let cfg = Config::from_lookup(|name| env.var(name).ok().map(|v| v.to_string()));
+    if let Err(e) = &cfg {
+        console_error!("cron: configuration: {}", e);
+    }
     match env.d1(DB_BINDING) {
-        Ok(db) => app::scheduled(&WorkerBackend { db }).await,
+        Ok(db) => app::scheduled(&WorkerBackend { db }, cfg.ok().as_ref()).await,
         Err(e) => console_error!("cron: no D1 binding: {}", e),
     }
 }

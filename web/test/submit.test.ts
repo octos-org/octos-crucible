@@ -51,6 +51,7 @@ function fakeBackend(pub: { key_id: string; public_key: string }) {
     },
     setPluginPublic: async (id, on) => ({ id, public: on }),
     pluginReview: async () => { throw new Error("unused"); },
+    quota: async () => ({ exempt: true, window_s: 86400, items: [] }),
   };
   return { b, calls };
 }

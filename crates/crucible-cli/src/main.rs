@@ -234,6 +234,9 @@ enum Cmd {
     },
     /// Show (or wait for) an evaluation's status and scores.
     Status(submit::StatusArgs),
+    /// Your quotas: uploads, evals, plugin and taskset registrations, with
+    /// what is used and left (token from CRUCIBLE_TOKEN).
+    Quota(submit::QuotaArgs),
     /// Run a whole evaluation without GitHub (`local`: on this machine;
     /// `nomad`: each step a Nomad job).
     Eval {
@@ -838,6 +841,7 @@ async fn run(cmd: Cmd, secrets: Option<steps::Secrets>) -> Result<()> {
         Cmd::Submit { cmd } => submit::submit(cmd).await,
         Cmd::Plugin { cmd } => submit::plugin_cmd(cmd).await,
         Cmd::Status(a) => submit::status_cmd(a).await,
+        Cmd::Quota(a) => submit::quota_cmd(a).await,
         Cmd::Worker {
             worker_url,
             eval_id,

@@ -15,6 +15,7 @@ import type {
   UploadKind,
   UserPlugin,
   PluginReview,
+  Quota,
   ReviewConfirm,
 } from "./types";
 import type { PublicKeyInfo } from "./crypto";
@@ -85,6 +86,8 @@ export class ApiError extends Error {
 
 export interface Backend {
   me(): Promise<Me>;
+  /** The caller's quotas: limits, used, remaining. */
+  quota(): Promise<Quota>;
   pubkey(): Promise<PublicKeyInfo>;
   /** `all`: admins list every uploaded taskset. */
   tasksets(all?: boolean): Promise<TaskSet[]>;
@@ -149,6 +152,7 @@ const enc = encodeURIComponent;
 
 export const httpBackend: Backend = {
   me: () => json("/me"),
+  quota: () => json("/quota"),
   pubkey: () => json("/pubkey"),
   tasksets: (all) => json(all ? "/tasksets?all=1" : "/tasksets"),
   registerTaskset: (upload_hash) =>

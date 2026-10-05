@@ -215,6 +215,19 @@ const delay = <T>(v: T, ms = 250) => new Promise<T>((r) => setTimeout(() => r(st
 export const mockBackend: Backend = {
   me: () => delay({ github_id: 1, login: "demo-user", is_admin: false }),
   pubkey: () => delay(currentKey()),
+  quota: () =>
+    delay({
+      exempt: false,
+      window_s: 86400,
+      items: [
+        { name: "uploads_per_day", description: "24 小时内上传次数", limit: 50, used: 3, remaining: 47 },
+        { name: "upload_bytes_per_day", description: "24 小时内上传字节数", limit: 524288000, used: 1048576, remaining: 523239424 },
+        { name: "evals_running", description: "同时进行中的评测数", limit: 3, used: 1, remaining: 2 },
+        { name: "evals_per_day", description: "24 小时内评测数", limit: 20, used: 2, remaining: 18 },
+        { name: "plugins_per_day", description: "24 小时内插件登记数", limit: 10, used: 0, remaining: 10 },
+        { name: "tasksets_per_day", description: "24 小时内题目包登记数", limit: 10, used: 0, remaining: 10 },
+      ],
+    }),
   tasksets: () => delay(TASKSETS),
   async registerTaskset() {
     const id = `u-${toHex(crypto.getRandomValues(new Uint8Array(8)))}`;

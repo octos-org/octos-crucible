@@ -36,6 +36,14 @@ pub struct Config {
     /// `/auth/dev-login` and GitHub endpoint overrides; honoured only for
     /// requests to localhost.
     pub dev_auth: bool,
+    /// Default per-user quotas (`QUOTA_*`, docs/api.md "配额").
+    pub quota: crate::quota::Defaults,
+    /// How long a taskset may stay `packing` / a plugin `building` before
+    /// the hourly sweep fails it (`STUCK_REGISTRATION_S`, default 2 h).
+    pub stuck_registration_s: u64,
+    /// An eval not settled this long after its creation is failed by the
+    /// sweep (`STUCK_EVAL_S`, default 30 h).
+    pub stuck_eval_s: u64,
 }
 
 impl std::fmt::Debug for Config {
@@ -138,6 +146,19 @@ impl Config {
         if session_key.len() < 32 {
             return Err("SESSION_HMAC_KEY must be at least 32 bytes".into());
         }
+        let quota = crate::quota::Defaults::from_lookup(&get)?;
+        let secs = |name: &str, default: u64| -> Result<u64, String> {
+            match opt(name) {
+                None => Ok(default),
+                Some(v) => v
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|v| *v >= 600)
+                    .ok_or_else(|| format!("{name} must be a number of seconds >= 600")),
+            }
+        };
+        let stuck_registration_s = secs("STUCK_REGISTRATION_S", 2 * 3600)?;
+        let stuck_eval_s = secs("STUCK_EVAL_S", 30 * 3600)?;
         let worker_token = req("CRUCIBLE_WORKER_TOKEN")?;
         if worker_token.len() < 32 {
             return Err("CRUCIBLE_WORKER_TOKEN must be at least 32 characters".into());
@@ -162,6 +183,9 @@ impl Config {
             session_key,
             worker_token,
             dev_auth,
+            quota,
+            stuck_registration_s,
+            stuck_eval_s,
         })
     }
 
