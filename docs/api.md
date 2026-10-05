@@ -26,7 +26,7 @@ Worker 只经手密文：上传文件和模型凭据都是浏览器用平台公�
 | `payload_too_large` | 413 | |
 | `upstream_error` | 502 | GitHub 调用失败 |
 | `internal` | 500 | 存储错误或配置错误 |
-| `storage_quota` | 503 | 当天的写入额度已用完（免费版 D1 每天 10 万行、KV 每天 1000 次，UTC 0 点重置）；稍后重试 |
+| `storage_quota` | 503 | 当天的写入额度已用完（免费版 D1 每天 10 万行，UTC 0 点重置）；稍后重试 |
 
 - **评测状态**（`status`）只有这几种取值：`queued` | `building` | `running:<阶段名>` | `scoring` | `done` | `failed`。`done` 和 `failed` 是终态。状态只会前进，不会倒退。
 - **eval_id**：前端生成的小写 UUID v4。
@@ -186,7 +186,7 @@ workflow（持私钥，不运行上传的代码）解密 zip、检查、按阶�
 
 此外：`upload_hash` 必须是本人上传的，且上传时的 `X-Upload-Kind` 与 `mode` 一致；`taskset` 必须出现在 `GET /tasksets` 里；`eval_id` 不能重复（409）。
 
-`cred_envelope` 是用平台公钥封装的 JSON `{api_key, endpoint, download_password, eval_id}`，再整体做标准 base64。Worker 无法解密，只检查信封头和 key_id，并限制大小不超过 16 KiB。解码后的字节原样存入 KV `cred/<eval_id>`，24 小时过期。解封以及核对其中的 `eval_id` 由 Actions 中的 `crucible cred open` 负责。
+`cred_envelope` 是用平台公钥封装的 JSON `{api_key, endpoint, download_password, eval_id}`，再整体做标准 base64。Worker 无法解密，只检查信封头和 key_id，并限制大小不超过 16 KiB。解码后的字节原样存入 D1 表 `creds`，24 小时过期（读时过期即视为不存在，每小时的 Cron 删除过期行）。解封以及核对其中的 `eval_id` 由 Actions 中的 `crucible cred open` 负责。
 
 提交之后，Worker 写入 D1 表 `evals` 一行（状态为 `queued`，主键 eval_id 保证不重复），并调用 `workflow_dispatch`（只传非秘密参数，见下文“触发参数”）。触发失败时删除凭据，评测记为 `failed`，接口返回 502。
 
@@ -233,7 +233,7 @@ workflow 通过 `/internal/status` 上报的精确状态优先。估计值只能
 
 | 接口 | 说明 |
 |---|---|
-| `GET /internal/cred/:id` | → `200 application/octet-stream`：KV 中原样保存的 envelope 字节（即 `cred_envelope` 经 base64 解码后的内容）。不存在或已过期返回 404。`crucible cred open` 同时接受原始字节和 base64。 |
+| `GET /internal/cred/:id` | → `200 application/octet-stream`：原样保存的 envelope 字节（即 `cred_envelope` 经 base64 解码后的内容）。不存在或已过期返回 404。`crucible cred open` 同时接受原始字节和 base64。 |
 | `DELETE /internal/cred/:id` | → 204（幂等）。 |
 | `POST /internal/status/:id` | `{"status": "building" \| "running:<阶段名>" \| "scoring" \| "failed"}` → `200 {"ok":true,"status"}`。评测已结束时返回 409；与当前状态相同时不写入，直接返回 200。`building` 不写库（查询时按 GitHub 估计得到的也是 `building`），返回当前状态。其他状态每次更新一行；第一次写入时顺带记下 run（查 GitHub 一次）。 |
 | `GET /internal/tasksets/:id?github_id=N` | `:id` 为 `u-<16 hex>`。→ 该题目包的 `taskset.json`；未就绪 409；该用户既不是上传者、题目包也未公开时 403。 |
@@ -241,7 +241,6 @@ workflow 通过 `/internal/status` 上报的精确状态优先。估计值只能
 | `GET /internal/plugins/:id?taskset=T` | `:id`、`T` 都是 `u-<16 hex>`。→ 插件的固定形式 `{"kind", "name", "version", "blob", "runs_taskset_code", "model", "accepts"}`；插件未就绪 409；题目包 `T` 的上传者既不是插件上传者、插件也未公开时 403。 |
 | `POST /internal/plugins/:id` | plugin-pack 的结果：`{"status": "ready", "plugin": {...}, "title", "description", "selftest"}`（`plugin.name` 必须等于 id，`plugin.blob.sha256` 必须是上传的 hash）或 `{"status": "failed", "error": "<≤500 字符>"}`。只接受一次（之后 409）。 |
 | `POST /internal/results/:id` | 请求体是一个 crucible-core `Manifest`（`eval_id` 必须与 URL 一致；`download` 就是 Manifest 自带的字段，由 `crucible download-zip` 写入），外加两个可选的顶层字段：`download: {"sha256": "<密码 zip 的哈希>"}`，以及 `status`（默认 `done`；如果只是回传部分结果、run 还在继续，可填 `running:<阶段>` 或 `scoring`）。不超过 1,900,000 字节（D1 单行上限 2 MB）。Worker 把 manifest（去掉这两个字段）存进 `results` 表（只写这一行）；进入终态时删除凭据。终态结果只会被新的终态结果替换，之后到达的部分结果会被忽略。→ `200 {"ok":true,"status"}`。幂等：再次回传相同内容时什么也不写，照样返回 200。 |
-| `POST /internal/migrate-kv` | 一次性把旧 KV 中的记录复制到 D1：请求体 `{"cursor"?: "..."}`，每次处理最多 20 个 key，→ `200 {"prefix", "copied", "skipped", "next"}`；`next` 为 null 表示完成，否则带上它再调。依次处理 `upload/`、`evals/`（连同 `results/`，旧记录内嵌的 manifest 也转成结果行）、`tasksets/`、`token/`、`ban/`。D1 中已有的行保持不变（`ON CONFLICT DO NOTHING`），可重复执行；KV 只读不写。由 `worker.yml` 的 `migrate-kv` job 调用。 |
 
 ## 触发参数（workflow_dispatch）
 
@@ -256,7 +255,7 @@ workflow 通过 `/internal/status` 上报的精确状态优先。估计值只能
 | `model` | 模型名 |
 | `endpoint` | `""`（接口地址在加密凭据里） |
 | `replicas` | `"1"`…`"10"` |
-| `cred_source` | `workers-kv` |
+| `cred_source` | `workers-kv`（历史名称，表示“向 Worker 取凭据”；凭据现存 D1） |
 | `eval_id` | UUID v4 |
 | `score_public` | `"true"` / `"false"` |
 | `owner` | `<github_id>:<login>` |
@@ -272,7 +271,7 @@ workflow 通过 `/internal/status` 上报的精确状态优先。估计值只能
 
 ### D1（绑定名 `CRUCIBLE_DB`，数据库 `octos-crucible`）
 
-表结构见 `crates/crucible-worker/migrations/`（`0001_init.sql`、`0002_leaderboard.sql`、`0003_user_plugins.sql`，`wrangler d1 migrations apply` 按序执行）。
+表结构见 `crates/crucible-worker/migrations/`（`0001_init.sql` … `0004_creds.sql`，`wrangler d1 migrations apply` 按序执行）。
 
 | 表 | 内容 | 索引 |
 |---|---|---|
@@ -284,20 +283,17 @@ workflow 通过 `/internal/status` 上报的精确状态优先。估计值只能
 | `tokens` | 主键 `id`；`owner_id, login, name, hash, created_at`（hash = SHA-256(令牌)） | `(owner_id)` |
 | `bans` | 主键 `github_id`；`by_id, at, reason` | 主键 |
 | `cache` | 主键 `key`；`tasksets`、`leaderboard`、`leaderboard/<题目包>`（5 分钟）、`release/<tag>`（不过期） | 主键 |
+| `creds` | 主键 `eval_id`；`envelope`（凭据 envelope，原样）、`expires_s`（提交时 + 24 小时）。读时过期即视为不存在；run 结束时删除 | `(expires_s)`（Cron 清理） |
 
 常用查询都走主键或索引：详情 2 次主键查询，列表按 `owner_id` 索引取最多 1000 行并按主键 JOIN `results`；排行榜只读公开评测的部分索引，再按主键 JOIN `results`，最后按主键取上榜的至多 100 份 manifest。
 
-一次评测的写入（行数，不含索引）：上传 1、提交 1、每个存下来的进度上报 1（agent 模式 `running:<阶段>` × 阶段数 + `scoring`；app 模式 `scoring`）、结果 1。2 个阶段的 agent 评测共 6 行，app 评测 4 行。查询详情/列表不写（只在发现 run 已失败时写 1 行）。
+一次评测的写入（行数，不含索引）：上传 1、提交 1、每个存下来的进度上报 1（agent 模式 `running:<阶段>` × 阶段数 + `scoring`；app 模式 `scoring`）、结果 1；带凭据时另加凭据写入 1、删除 1。2 个阶段的 agent 评测共 8 行，不带凭据的 app 评测 4 行。查询详情/列表不写（只在发现 run 已失败时写 1 行）。
 
-### KV（绑定名 `CRUCIBLE_KV`）
+### 定时清理（Cron Trigger）
 
-只放需要自动过期的数据：
+`wrangler.toml` 的 `[triggers] crons = ["17 * * * *"]`：每小时一次，删除 `creds` 与 `cache` 中已过期的行，日志写 `cron: purged N expired rows`。
 
-| key | 值 | 过期 |
-|---|---|---|
-| `cred/<eval_id>` | 凭据 envelope 字节 | 24 小时；run 结束时删除（先读，存在才删，避免白白消耗写额度） |
-
-每次带凭据的评测 2 次 KV 写（写入 + 删除）。KV 里旧的 `evals/`、`results/`、`upload/`、`tasksets/`、`token/`、`ban/` 等记录不再使用，迁移（`POST /internal/migrate-kv`）后可以保留不动。
+Worker 不再使用 Workers KV（免费版每天 1000 次写入，曾因此整天无法提交）。带凭据的评测额外写 D1 2 行（写入 + 删除）。
 
 ## 管理
 
@@ -313,7 +309,6 @@ workflow 通过 `/internal/status` 上报的精确状态优先。估计值只能
 | 名称 | 类型 | 说明 |
 |---|---|---|
 | `CRUCIBLE_DB` | D1 绑定 | 数据库 `octos-crucible`，`migrations_dir = "migrations"` |
-| `CRUCIBLE_KV` | KV 绑定 | 只存凭据 |
 | `PAGES_ORIGIN` | var | CORS 源，例如 `https://octos-org.github.io` |
 | `PAGES_URL` | var | 登录后跳转的地址，必须以 `PAGES_ORIGIN/` 开头，默认 `PAGES_ORIGIN/` |
 | `GITHUB_REPO` | var | `octos-org/octos-crucible` |
@@ -341,7 +336,6 @@ workflow 通过 `/internal/status` 上报的精确状态优先。估计值只能
 cargo install worker-build --version 0.8.6 --locked
 rustup target add wasm32-unknown-unknown
 cd crates/crucible-worker
-npx wrangler kv namespace create CRUCIBLE_KV     # 把输出的 id 填进 wrangler.toml
 npx wrangler d1 create octos-crucible            # 把 database_id 填进 wrangler.toml
 npx wrangler d1 migrations apply octos-crucible --remote
 # 修改 wrangler.toml 的 [vars]：ADMIN_GITHUB_IDS，需要时也改 PAGES_URL / WORKER_URL
@@ -359,7 +353,7 @@ cd crates/crucible-worker
 cp .dev.vars.example .dev.vars          # 全是假值，GitHub 指向本地 mock
 npx wrangler d1 migrations apply octos-crucible --local
 node dev/mock-github.mjs &              # 127.0.0.1:9911
-npx wrangler dev --port 8787 &
-node dev/e2e.mjs                        # 依次测试：登录 → 上传 → 提交 → 取凭据 → 删除凭据 → 上报进度 → 回传结果 → 查询 → 下载 → 封禁
+npx wrangler dev --test-scheduled --port 8787 &
+node dev/e2e.mjs                        # 依次测试：登录 → 上传 → 提交 → 取凭据 → 删除凭据 → 上报进度 → 回传结果 → 查询 → 下载 → 定时清理 → 封禁
 ```
-CI（`.github/workflows/worker.yml`）在 PR 上运行同样的流程（只构建和测试）；push 到 main 时 `deploy` job 先执行 `wrangler d1 migrations apply octos-crucible --remote`，再 `wrangler deploy`（Cloudflare 令牌需要 Workers 与 D1 的编辑权限）。从 KV 版升级时，部署后执行一次 `gh workflow run worker.yml -f migrate_kv=true`，把旧 KV 记录复制进 D1（可重复执行）。
+CI（`.github/workflows/worker.yml`）在 PR 上运行同样的流程（只构建和测试）；push 到 main 时 `deploy` job 先执行 `wrangler d1 migrations apply octos-crucible --remote`，再 `wrangler deploy`（Cloudflare 令牌需要 Workers 与 D1 的编辑权限；`wrangler deploy` 同时设置 Cron Trigger）。本地 `wrangler dev --test-scheduled` 后可用 `curl 'http://localhost:8787/__scheduled?cron=17+*+*+*+*'` 触发一次清理。

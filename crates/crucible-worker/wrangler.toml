@@ -8,20 +8,18 @@ compatibility_date = "2026-09-01"
 # wasm32-unknown-unknown target.
 command = "worker-build --release"
 
-# Records (evals, results, uploads, tasksets, tokens, bans, caches). Schema:
-# migrations/*.sql, applied by `wrangler d1 migrations apply octos-crucible`.
+# All state (evals, results, uploads, tasksets, tokens, bans, caches and the
+# sealed model credentials). Schema: migrations/*.sql, applied by
+# `wrangler d1 migrations apply octos-crucible`. No Workers KV.
 [[d1_databases]]
 binding = "CRUCIBLE_DB"
 database_name = "octos-crucible"
 database_id = "7d2b7485-932b-44e0-a57f-e47c83651855"
 migrations_dir = "migrations"
 
-# Only the sealed model credential (24 h TTL); also read once by the
-# KV -> D1 migration (POST /internal/migrate-kv).
-[[kv_namespaces]]
-binding = "CRUCIBLE_KV"
-# `wrangler kv namespace create CRUCIBLE_KV` prints the id to put here.
-id = "fe1bef190c3c4a6cbbe7917e68705863"
+# Hourly: delete expired credentials and cache rows (app::scheduled).
+[triggers]
+crons = ["17 * * * *"]
 
 [vars]
 PAGES_ORIGIN = "https://octos-org.github.io"

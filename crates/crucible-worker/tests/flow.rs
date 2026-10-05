@@ -1,5 +1,5 @@
 //! End-to-end flow through the real router with D1 as in-memory SQLite (the
-//! real migration), an in-memory KV and a fake GitHub: login → upload → submit → Actions fetches and deletes the
+//! real migration) and a fake GitHub: login → upload → submit → Actions fetches and deletes the
 //! credential → results → query → download, plus the refusal paths.
 
 use std::cell::{Cell, RefCell};
@@ -11,9 +11,7 @@ use std::task::{Context, Poll, Waker};
 use crucible_core::Envelope;
 use crucible_worker::app::handle;
 use crucible_worker::config::Config;
-use crucible_worker::http::{
-    Backend, HttpRequest, HttpResponse, KvKey, KvPage, PutOptions, Req, Resp, Row, SqlArg, Stmt,
-};
+use crucible_worker::http::{Backend, HttpRequest, HttpResponse, Req, Resp, Row, SqlArg, Stmt};
 use crucible_worker::session::issue_session;
 use crucible_worker::shard::{release_tag, sha256_hex};
 use crucible_worker::store::Db;
@@ -50,29 +48,24 @@ struct FakeGitHub {
     runs: Vec<(u64, String, String, Option<String>)>,
 }
 
-/// value, expiry (unix seconds)
-type KvEntry = (Vec<u8>, Option<u64>);
-
 const SCHEMA: &str = concat!(
     include_str!("../migrations/0001_init.sql"),
     include_str!("../migrations/0002_leaderboard.sql"),
-    include_str!("../migrations/0003_user_plugins.sql")
+    include_str!("../migrations/0003_user_plugins.sql"),
+    include_str!("../migrations/0004_creds.sql")
 );
 
 struct Mock {
-    kv: RefCell<BTreeMap<String, KvEntry>>,
     /// D1 stand-in: SQLite in memory with the real migration applied.
     db: rusqlite::Connection,
     gh: RefCell<FakeGitHub>,
     now: Cell<u64>,
     logs: RefCell<Vec<String>>,
     rng: Cell<u8>,
-    /// When set, every write (D1 or KV) fails with this error.
+    /// When set, every D1 write fails with this error.
     write_error: RefCell<Option<String>>,
     /// D1 rows changed by successful writes outside the `cache` table.
     db_writes: Cell<usize>,
-    /// KV puts and deletes (both count against the KV write quota).
-    kv_writes: Cell<usize>,
 }
 
 impl Mock {
@@ -80,7 +73,6 @@ impl Mock {
         let db = rusqlite::Connection::open_in_memory().unwrap();
         db.execute_batch(SCHEMA).unwrap();
         Mock {
-            kv: RefCell::default(),
             db,
             gh: RefCell::default(),
             now: Cell::new(NOW),
@@ -88,13 +80,12 @@ impl Mock {
             rng: Cell::new(7),
             write_error: RefCell::default(),
             db_writes: Cell::new(0),
-            kv_writes: Cell::new(0),
         }
     }
 
-    /// All writes so far: (D1 rows, KV operations).
-    fn writes(&self) -> (usize, usize) {
-        (self.db_writes.get(), self.kv_writes.get())
+    /// D1 rows written so far (outside `cache`).
+    fn writes(&self) -> usize {
+        self.db_writes.get()
     }
 
     /// Test-side SQL (setup and inspection); not counted.
@@ -330,52 +321,6 @@ fn to_sqlite(a: &SqlArg) -> rusqlite::types::Value {
 }
 
 impl Backend for Mock {
-    async fn kv_get(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
-        let now = self.now.get();
-        Ok(self
-            .kv
-            .borrow()
-            .get(key)
-            .filter(|(_, exp)| exp.is_none_or(|e| e > now))
-            .map(|(v, _)| v.clone()))
-    }
-    async fn kv_put(&self, key: &str, value: &[u8], opts: PutOptions) -> Result<(), String> {
-        assert!(opts.ttl.is_none_or(|t| t >= 60), "KV TTL minimum is 60s");
-        self.write_failure()?;
-        self.kv_writes.set(self.kv_writes.get() + 1);
-        let exp = opts.ttl.map(|t| self.now.get() + t);
-        self.kv
-            .borrow_mut()
-            .insert(key.into(), (value.to_vec(), exp));
-        Ok(())
-    }
-    async fn kv_delete(&self, key: &str) -> Result<(), String> {
-        self.write_failure()?;
-        self.kv_writes.set(self.kv_writes.get() + 1);
-        self.kv.borrow_mut().remove(key);
-        Ok(())
-    }
-    async fn kv_list(
-        &self,
-        prefix: &str,
-        cursor: Option<&str>,
-        limit: usize,
-    ) -> Result<KvPage, String> {
-        let kv = self.kv.borrow();
-        let mut keys = kv
-            .keys()
-            .filter(|k| k.starts_with(prefix) && cursor.is_none_or(|c| k.as_str() > c));
-        let page: Vec<KvKey> = keys
-            .by_ref()
-            .take(limit)
-            .map(|k| KvKey { name: k.clone() })
-            .collect();
-        let more = keys.next().is_some();
-        Ok(KvPage {
-            cursor: more.then(|| page.last().unwrap().name.clone()),
-            keys: page,
-        })
-    }
     async fn db_query(&self, sql: &str, args: &[SqlArg]) -> Result<Vec<Row>, String> {
         use rusqlite::types::ValueRef;
         let mut stmt = self.db.prepare(sql).map_err(|e| e.to_string())?;
@@ -1029,11 +974,7 @@ fn app_mode_and_failures() {
             "results_url": format!("https://crucible.example.workers.dev/internal/results/{EID}")
         })
     );
-    assert!(
-        block_on(t.mock.kv_get(&format!("cred/{EID}")))
-            .unwrap()
-            .is_none()
-    );
+    assert_eq!(t.mock.count("SELECT COUNT(*) FROM creds"), 0);
     // While the scoring job runs.
     t.mock.gh.borrow_mut().runs[0].2 = "in_progress".into();
     let r = json_of(&t.as_user("GET", &format!("/evals/{EID}"), &alice, b""));
@@ -1250,8 +1191,12 @@ fn cred_expires_after_a_day() {
     );
     let path = format!("/internal/cred/{EID}");
     assert_eq!(t.as_user("GET", &path, WORKER_TOKEN, b"").status, 200);
+    // Expired: absent on read, deleted by the cron.
     t.mock.now.set(NOW + 86_400);
     assert_eq!(t.as_user("GET", &path, WORKER_TOKEN, b"").status, 404);
+    assert_eq!(t.mock.count("SELECT COUNT(*) FROM creds"), 1);
+    block_on(crucible_worker::app::scheduled(&t.mock));
+    assert_eq!(t.mock.count("SELECT COUNT(*) FROM creds"), 0);
 }
 
 #[test]
@@ -1883,156 +1828,10 @@ fn writes_per_eval() {
     t.mock.gh.borrow_mut().runs[0].3 = Some("success".into());
     detail();
 
-    let (db, kv) = t.mock.writes();
-    // upload + eval + running:stage-1 + running:stage-2 + scoring + results
-    assert_eq!(db - start.0, 6);
-    // credential put + delete (the results' own cleanup finds it gone)
-    assert_eq!(kv - start.1, 2);
-}
-
-/// Old KV records (as the KV-backed Worker wrote them) copied into D1 by
-/// `POST /internal/migrate-kv`, paging through every prefix; repeatable.
-#[test]
-fn migrate_kv_to_d1() {
-    let t = T::new();
-    let alice = token(42, "octocat");
-    let admin = token(1, "admin");
-    let put = |k: &str, v: Value| {
-        t.mock
-            .kv
-            .borrow_mut()
-            .insert(k.into(), (serde_json::to_vec(&v).unwrap(), None));
-    };
-    // 25 uploads (more than one page), Alice's being the last one.
-    for i in 0..24u8 {
-        put(
-            &format!("upload/{}", sha256_hex(&[i])),
-            json!({"owner_id": 7, "kind": "app", "size": 1, "created_at": "2026-10-01T00:00:00Z"}),
-        );
-    }
-    let site = sealed(b"old site");
-    let site_hash = sha256_hex(&site);
-    put(
-        &format!("upload/{site_hash}"),
-        json!({"owner_id": 42, "kind": "app", "size": site.len(), "created_at": "2026-10-01T00:00:00Z"}),
-    );
-    let record = |id: &str, created_s: u64, status: &str| {
-        json!({
-            "eval_id": id, "owner_id": 42, "owner_login": "octocat", "mode": "app",
-            "upload_hash": site_hash, "taskset": "github-full", "stages": 1,
-            "stage_names": ["stage-1"], "model": null, "replicas": 1, "budget": null,
-            "score_public": false, "created_at": util::rfc3339(created_s),
-            "created_s": created_s, "status": status, "run_id": 9000,
-            "run_url": "https://github.com/octos-org/octos-crucible/actions/runs/9000",
-            "updated_at": util::rfc3339(created_s)
-        })
-    };
-    // An eval with separate results, and an older one with inline results.
-    let (e1, e2) = (EID, "1b7e6a52-1f3c-4d2a-9e8b-7c6d5e4f3a21");
-    put(&format!("evals/{e1}"), record(e1, NOW - 100, "scoring"));
-    put(
-        &format!("results/{e1}"),
-        json!({"manifest": app_manifest(1), "download_sha256": "cd".repeat(32),
-               "status": "done", "updated_at": util::rfc3339(NOW - 50)}),
-    );
-    let mut old = record(e2, NOW - 200, "done");
-    let mut m2 = app_manifest(0);
-    m2["eval_id"] = json!(e2);
-    old["manifest"] = m2;
-    put(&format!("evals/{e2}"), old);
-    put(&format!("owner/42/{e1}"), json!(""));
-    put(
-        "tasksets/u-0123456789abcdef",
-        json!({"id": "u-0123456789abcdef", "owner_id": 42, "owner_login": "octocat",
-               "upload_hash": site_hash, "status": "ready", "public": false,
-               "title": "old", "taskset": packed("u-0123456789abcdef"),
-               "created_at": "2026-10-01T00:00:00Z", "updated_at": "2026-10-01T00:00:00Z"}),
-    );
-    let cli = format!("crt_{}_{}", "ab".repeat(8), "cd".repeat(32));
-    put(
-        &format!("token/{}", "ab".repeat(8)),
-        json!({"owner_id": 42, "login": "octocat", "name": "laptop",
-               "hash": sha256_hex(cli.as_bytes()), "created_at": "2026-10-01T00:00:00Z"}),
-    );
-    put(&format!("tokens/42/{}", "ab".repeat(8)), json!(""));
-    put(
-        "ban/99",
-        json!({"by": 1, "at": "2026-10-01T00:00:00Z", "reason": "spam"}),
-    );
-    put("ban/not-a-number", json!({}));
-    put("cache/tasksets", json!([]));
-
-    let migrate = |tok: &str, cursor: Option<&str>| {
-        let body = match cursor {
-            Some(c) => serde_json::to_vec(&json!({"cursor": c})).unwrap(),
-            None => vec![],
-        };
-        t.as_user("POST", "/internal/migrate-kv", tok, &body)
-    };
-    assert_eq!(migrate(&admin, None).status, 401);
-    assert_eq!(migrate(WORKER_TOKEN, Some("9")).status, 400);
-    let run_all = || {
-        let (mut calls, mut copied) = (0, 0);
-        let mut cursor: Option<String> = None;
-        loop {
-            let r = migrate(WORKER_TOKEN, cursor.as_deref());
-            assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
-            let v = json_of(&r);
-            copied += v["copied"].as_u64().unwrap();
-            calls += 1;
-            match v["next"].as_str() {
-                Some(c) => cursor = Some(c.to_string()),
-                None => return (calls, copied, v),
-            }
-        }
-    };
-    let kv_writes = t.mock.writes().1;
-    let (calls, copied, last) = run_all();
-    assert_eq!(copied, 25 + 2 + 1 + 1 + 1);
-    assert!(calls >= 6, "{calls}");
-    assert_eq!(last["skipped"], json!(["ban/not-a-number"]));
-    assert_eq!(t.mock.writes().1, kv_writes, "KV is only read");
-    // Again: nothing changes.
-    let rows = t.mock.writes().0;
-    run_all();
-    assert_eq!(t.mock.writes().0, rows);
-    assert_eq!(t.mock.count("SELECT COUNT(*) FROM uploads"), 25);
-
-    // The web page sees the old data as before.
-    let list = json_of(&t.as_user("GET", "/evals", &alice, b""));
-    assert_eq!(
-        list,
-        json!([
-            {"eval_id": e1, "mode": "app", "taskset": "github-full", "model": null,
-             "created_at": util::rfc3339(NOW - 100), "status": "done", "total_score": 1.0},
-            {"eval_id": e2, "mode": "app", "taskset": "github-full", "model": null,
-             "created_at": util::rfc3339(NOW - 200), "status": "done", "total_score": 0.0}
-        ])
-    );
-    let d = json_of(&t.as_user("GET", &format!("/evals/{e1}"), &alice, b""));
-    assert_eq!(d["download_available"], true);
-    assert_eq!(
-        d["manifest"]["replicas"][0]["stages"][0]["score"]["passed"],
-        1
-    );
-    assert!(d["run_url"].as_str().unwrap().ends_with("/runs/9000"));
-    let d = json_of(&t.as_user("GET", &format!("/evals/{e2}"), &alice, b""));
-    assert_eq!(
-        d["manifest"]["replicas"][0]["stages"][0]["score"]["passed"],
-        0
-    );
-    // Token, ban, taskset and upload claims carry over.
-    assert_eq!(
-        json_of(&t.as_user("GET", "/me", &cli, b""))["github_id"],
-        42
-    );
-    assert_eq!(
-        err_code(&t.as_user("GET", "/me", &token(99, "spam"), b"")),
-        "banned"
-    );
-    let ts = json_of(&t.as_user("GET", "/tasksets/u-0123456789abcdef", &alice, b""));
-    assert_eq!(ts["status"], "ready");
-    assert_eq!(upload_as(&t, &token(43, "bob"), &site).status, 409);
+    // upload + eval + credential put + running:stage-1 + running:stage-2
+    // + scoring + results + credential delete (the results' own cleanup
+    // finds it gone and writes nothing)
+    assert_eq!(t.mock.writes() - start, 8);
 }
 
 /// Submits an app-mode eval of stage 1 and posts a done result whose

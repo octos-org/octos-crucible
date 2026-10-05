@@ -14,11 +14,6 @@ on:
       - "Cargo.lock"
       - ".github/workflows/worker.yml"
   workflow_dispatch:
-    inputs:
-      migrate_kv:
-        description: "Copy the old KV records into D1 (one-off, repeatable)"
-        type: boolean
-        default: false
   push:
     branches: [main]
     paths:
@@ -87,7 +82,7 @@ jobs:
           cp .dev.vars.example .dev.vars
           npx --yes wrangler@4 d1 migrations apply octos-crucible --local
           node dev/mock-github.mjs 9911 > mock.log 2>&1 &
-          npx --yes wrangler@4 dev --port 8787 --ip 127.0.0.1 > wrangler.log 2>&1 &
+          npx --yes wrangler@4 dev --test-scheduled --port 8787 --ip 127.0.0.1 > wrangler.log 2>&1 &
           for _ in $(seq 1 90); do
             curl -s -o /dev/null http://localhost:8787/ && break
             sleep 2
@@ -122,30 +117,3 @@ jobs:
           set -euo pipefail
           npx --yes wrangler@4 d1 migrations apply octos-crucible --remote
           npx --yes wrangler@4 deploy
-
-  # One-off: copy the records of the KV-backed Worker into D1
-  # (`gh workflow run worker.yml -f migrate_kv=true`). Idempotent: rows
-  # already in D1 are kept; KV is only read.
-  migrate-kv:
-    if: github.event_name == 'workflow_dispatch' && inputs.migrate_kv
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - name: POST /internal/migrate-kv until done
-        env:
-          CRUCIBLE_WORKER_TOKEN: ${{ secrets.CRUCIBLE_WORKER_TOKEN }}
-          WORKER_URL: https://crucible-worker.stratosphericus.workers.dev
-        run: |
-          set -euo pipefail
-          body='{}'
-          for _ in $(seq 1 2000); do
-            resp=$(curl -sS --fail-with-body --retry 3 -X POST \
-              -H "Authorization: Bearer $CRUCIBLE_WORKER_TOKEN" \
-              -H "Content-Type: application/json" \
-              --data "$body" "$WORKER_URL/internal/migrate-kv")
-            echo "$resp" | jq -c '{prefix, copied, skipped}'
-            next=$(echo "$resp" | jq -r '.next // empty')
-            [ -z "$next" ] && { echo "migration done"; exit 0; }
-            body=$(jq -cn --arg c "$next" '{cursor: $c}')
-          done
-          echo "::error::migration did not finish"; exit 1

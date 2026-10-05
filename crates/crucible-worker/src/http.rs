@@ -180,24 +180,6 @@ impl HttpResponse {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct PutOptions {
-    /// Seconds; Workers KV requires at least 60.
-    pub ttl: Option<u64>,
-}
-
-#[derive(Debug, Clone)]
-pub struct KvKey {
-    pub name: String,
-}
-
-/// One page of `kv_list`; `cursor` is `None` on the last page.
-#[derive(Debug, Clone, Default)]
-pub struct KvPage {
-    pub keys: Vec<KvKey>,
-    pub cursor: Option<String>,
-}
-
 /// A bound SQL parameter (D1 / SQLite types).
 #[derive(Debug, Clone, PartialEq)]
 pub enum SqlArg {
@@ -221,18 +203,6 @@ pub struct Stmt {
 /// never contain request bodies or secrets.
 #[allow(async_fn_in_trait)] // single-threaded runtime; no Send bound wanted
 pub trait Backend {
-    /// Workers KV: only short-lived data with a TTL (the sealed credential)
-    /// and, for the one-off migration, reads of the old records.
-    async fn kv_get(&self, key: &str) -> Result<Option<Vec<u8>>, String>;
-    async fn kv_put(&self, key: &str, value: &[u8], opts: PutOptions) -> Result<(), String>;
-    async fn kv_delete(&self, key: &str) -> Result<(), String>;
-    /// Up to `limit` keys under `prefix`, continuing from `cursor`.
-    async fn kv_list(
-        &self,
-        prefix: &str,
-        cursor: Option<&str>,
-        limit: usize,
-    ) -> Result<KvPage, String>;
     /// D1: rows of a query.
     async fn db_query(&self, sql: &str, args: &[SqlArg]) -> Result<Vec<Row>, String>;
     /// D1: a write; returns the number of rows changed.

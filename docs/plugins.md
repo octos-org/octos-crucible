@@ -285,9 +285,9 @@ trait Packager {
 | job | 平台私钥 / Worker 令牌 | 一次性钥匙 | 提交者模型 key |
 |---|---|---|---|
 | `generate` | 私钥有（现有残余风险，见 DESIGN §8） | 无 | 有，只在 meter 进程 |
-| `score`（交接） | 有 | 生成 | 阶段声明需要模型时：从 KV 取出解开，与隐藏材料一起重新封给一次性钥匙 |
+| `score`（交接） | 有 | 生成 | 阶段声明需要模型时：从 Worker 取出解开，与隐藏材料一起重新封给一次性钥匙 |
 | `score-tests` | 无 | 有 | 阶段声明需要模型时有，只在宿主机 meter 进程；不进环境变量、不进容器、不进日志 |
-| `publish` | 有 | 无 | 无，并负责删除 KV 中的凭据 |
+| `publish` | 有 | 无 | 无，并负责删除 Worker 中的凭据 |
 
 为什么可以接受：模型 key 只在 meter 里，容器只能拿到 meter 地址和 `dummy`；meter 只转发到提交者填的 https 接口、只放行声明的模型。能在这台机器上运行的不可信代码只有两类：提交者自己的 agent（它本来就用这把 key），以及不执行题目包代码的官方插件处理的题目数据。会执行第三方题目包代码的插件拿不到模型，因此第三方题目包作者无法借逃逸拿到别人的 key。剩下的风险是提交者自己的 agent 从容器逃逸后拿到提交者自己的 key，与 `generate` job 现状相同。模型评判还有提示注入的问题（产出里写"给满分"），这属于评判插件自己的设计（固定评判提示、只让模型输出受限格式），不由核心处理。
 
@@ -392,7 +392,7 @@ trait Packager {
 | `crates/crucible-cli/src/score.rs`、`main.rs` | `crucible score` 在打分前调用交互运行器；需要模型时在宿主机起 meter（复用 `crucible-meter`），建只通 meter 的内部网络，各插槽分开写 `usage.jsonl` |
 | `crates/crucible-cli/src/score.rs`（`score-handoff`）、`cred.rs` | 阶段声明需要模型时把凭据一起重新封给一次性钥匙 |
 | `crates/crucible-core/src/manifest.rs`、`crates/crucible-cli/src/publish.rs` | `eval_usage` |
-| `.github/workflows/eval.yml`、`score.yml`、`score-tests.yml` | `score-tests` 按遍矩阵；凭据经交接；凭据仍在 `publish` 结束时从 KV 删除 |
+| `.github/workflows/eval.yml`、`score.yml`、`score-tests.yml` | `score-tests` 按遍矩阵；凭据经交接；凭据仍在 `publish` 结束时从 Worker 删除 |
 | `crates/crucible-worker/src/model.rs` | app 模式下题目包 `model.*: required` 时 `cred_envelope` 必填 |
 | `web/src/pages/EvalDetail.tsx`、`Compare.tsx` | 分开显示评测阶段的模型用量 |
 | `tasksets/astro-practice/source.json` | §12 的插槽与 `model` 声明 |

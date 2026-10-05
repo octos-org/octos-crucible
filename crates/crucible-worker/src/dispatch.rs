@@ -1,5 +1,5 @@
 //! `workflow_dispatch` inputs for an eval. Non-secret values only: the
-//! credential stays in KV and the workflow fetches it by `eval_id`.
+//! credential stays in the Worker (D1) and the workflow fetches it by `eval_id`.
 //!
 //! Agent mode targets `eval.yml` with exactly the inputs it declares
 //! (GitHub rejects undeclared inputs with 422):
@@ -17,8 +17,9 @@ use crate::config::Config;
 use crate::model::{EvalRecord, Mode};
 
 /// `cred_source` value telling the workflow to fetch the sealed
-/// credential from `GET /internal/cred/:eval_id`.
-pub const CRED_FROM_KV: &str = "workers-kv";
+/// credential from `GET /internal/cred/:eval_id`. The name is historical:
+/// the credential is stored in D1 now.
+pub const CRED_FROM_WORKER: &str = "workers-kv";
 
 pub fn results_url(worker_url: &str, eval_id: &str) -> String {
     format!("{worker_url}/internal/results/{eval_id}")
@@ -30,7 +31,7 @@ pub fn inputs(cfg: &Config, rec: &EvalRecord, has_cred: bool, worker_url: &str) 
     let score_public = rec.score_public.to_string();
     let source = format!("blob:{}", rec.upload_hash);
     let results = results_url(worker_url, &rec.eval_id);
-    let cred_source = if has_cred { CRED_FROM_KV } else { "none" };
+    let cred_source = if has_cred { CRED_FROM_WORKER } else { "none" };
     match rec.mode {
         Mode::Agent => {
             let mut options = json!({"stages": rec.stages, "results_url": results});

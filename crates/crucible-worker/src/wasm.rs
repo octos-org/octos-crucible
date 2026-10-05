@@ -1,27 +1,24 @@
 //! Workers runtime glue: converts requests/responses and implements
-//! [`Backend`] over D1, Workers KV and `fetch`. Everything else is in
+//! [`Backend`] over D1 and `fetch`. Everything else is in
 //! platform-independent modules.
 
 use worker::wasm_bindgen::JsValue;
 use worker::{
-    Context, D1Database, D1PreparedStatement, Date, Env, Fetch, Headers, KvStore, Method, Request,
-    RequestInit, Response, ResponseBuilder, console_error, console_log, event, js_sys,
+    Context, D1Database, D1PreparedStatement, Date, Env, Fetch, Headers, Method, Request,
+    RequestInit, Response, ResponseBuilder, ScheduleContext, ScheduledEvent, console_error,
+    console_log, event, js_sys,
 };
 
 use crate::app;
 use crate::config::Config;
-use crate::http::{
-    Backend, HttpRequest, HttpResponse, KvKey, KvPage, PutOptions, Req, Resp, Row, SqlArg, Stmt,
-};
+use crate::http::{Backend, HttpRequest, HttpResponse, Req, Resp, Row, SqlArg, Stmt};
 use crate::model::MAX_UPLOAD;
 
-const KV_BINDING: &str = "CRUCIBLE_KV";
 const DB_BINDING: &str = "CRUCIBLE_DB";
 /// Largest body read at all; per-route limits are enforced by the handlers.
 const MAX_BODY: usize = MAX_UPLOAD + 64 * 1024;
 
 struct WorkerBackend {
-    kv: KvStore,
     db: D1Database,
 }
 
@@ -43,43 +40,6 @@ impl WorkerBackend {
 }
 
 impl Backend for WorkerBackend {
-    async fn kv_get(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
-        self.kv.get(key).bytes().await.map_err(|e| e.to_string())
-    }
-
-    async fn kv_put(&self, key: &str, value: &[u8], opts: PutOptions) -> Result<(), String> {
-        let mut put = self.kv.put_bytes(key, value).map_err(|e| e.to_string())?;
-        if let Some(ttl) = opts.ttl {
-            put = put.expiration_ttl(ttl);
-        }
-        put.execute().await.map_err(|e| e.to_string())
-    }
-
-    async fn kv_delete(&self, key: &str) -> Result<(), String> {
-        self.kv.delete(key).await.map_err(|e| e.to_string())
-    }
-
-    async fn kv_list(
-        &self,
-        prefix: &str,
-        cursor: Option<&str>,
-        limit: usize,
-    ) -> Result<KvPage, String> {
-        let mut list = self.kv.list().prefix(prefix.to_owned()).limit(limit as u64);
-        if let Some(c) = cursor {
-            list = list.cursor(c.to_owned());
-        }
-        let resp = list.execute().await.map_err(|e| e.to_string())?;
-        Ok(KvPage {
-            keys: resp
-                .keys
-                .into_iter()
-                .map(|k| KvKey { name: k.name })
-                .collect(),
-            cursor: resp.cursor.filter(|c| !resp.list_complete && !c.is_empty()),
-        })
-    }
-
     async fn db_query(&self, sql: &str, args: &[SqlArg]) -> Result<Vec<Row>, String> {
         let res = self
             .stmt(sql, args)?
@@ -176,7 +136,6 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> worker::Result<Resp
         }
     };
     let backend = WorkerBackend {
-        kv: env.kv(KV_BINDING)?,
         db: env.d1(DB_BINDING)?,
     };
 
@@ -212,4 +171,13 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> worker::Result<Resp
         body,
     };
     to_worker(app::handle(&backend, &cfg, &r).await)
+}
+
+/// Cron Trigger (wrangler.toml `[triggers]`): purge expired rows.
+#[event(scheduled)]
+async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
+    match env.d1(DB_BINDING) {
+        Ok(db) => app::scheduled(&WorkerBackend { db }).await,
+        Err(e) => console_error!("cron: no D1 binding: {}", e),
+    }
 }
