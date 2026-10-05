@@ -14,11 +14,11 @@
     {
       "id": "stage-1",
       "inputs_blob": {
-        "sha256": "5e0a45f3427bc4abcb989e7579763b2b494533ff5b2275b3a8272fa193419a82",
+        "sha256": "51468ee73d0289e514889497960124d6c59eb9328d96a69acbc918d135b421db",
         "key_id": "1ffa702796eb5ee8"
       },
       "tests_blob": {
-        "sha256": "9b21d514dcf6fbb4fd55cc433dc4baa642971c89af712ccad7bb651f6abc1866",
+        "sha256": "b9927a34bbe629f8fe8a452fd6dca779b57108c9df42178c737fe950fb80b31d",
         "key_id": "1ffa702796eb5ee8"
       },
       "packager": "web-app",
@@ -28,11 +28,11 @@
     {
       "id": "stage-2",
       "inputs_blob": {
-        "sha256": "a274b4c2d3f63ae846068120b914f2edd59ff98958f231d185e75b6638e5751a",
+        "sha256": "3ee0d1e5b81f56b5ad5e0b5bd1ed732ff8d07ef6b3c85269f751034bf8f58998",
         "key_id": "1ffa702796eb5ee8"
       },
       "tests_blob": {
-        "sha256": "5b73c0e5735ec83382975fa55a420694e312c05a46ba4186814e189dd3a6bc08",
+        "sha256": "d27c3a41bedea917c971d2fbe6894ab35a66a26b5609b1451c24f7fa38ec07bd",
         "key_id": "1ffa702796eb5ee8"
       },
       "packager": "web-app",

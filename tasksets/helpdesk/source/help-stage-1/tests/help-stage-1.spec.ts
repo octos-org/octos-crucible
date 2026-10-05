@@ -86,7 +86,7 @@ test('REQ-2-1: staff may not open the new-ticket page', async ({ browser }) => {
     const page = await as(browser, user);
     const res = await page.goto('/tickets/new');
     expect(res?.status()).toBe(403);
-    await expect(page.getByText('Forbidden')).toBeVisible();
+    await expect(page.getByText('Forbidden').first()).toBeVisible();
   }
 });
 
@@ -106,10 +106,10 @@ test('REQ-2-2: other customers get 403, unknown tickets 404', async ({ browser }
   const dee = await as(browser, 'dee');
   const res = await dee.goto(url);
   expect(res?.status()).toBe(403);
-  await expect(dee.getByText('Forbidden')).toBeVisible();
+  await expect(dee.getByText('Forbidden').first()).toBeVisible();
   const res2 = await dee.goto('/tickets/no-such-ticket-424242');
   expect(res2?.status()).toBe(404);
-  await expect(dee.getByText('Ticket not found')).toBeVisible();
+  await expect(dee.getByText('Ticket not found').first()).toBeVisible();
 });
 
 test('REQ-2-3: the list shows what each role may see, newest first', async ({ browser }) => {
