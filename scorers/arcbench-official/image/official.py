@@ -51,6 +51,20 @@ def say(msg):
     print(f"[crucible] {msg}", flush=True)
 
 
+def as_non_root():
+    """The official runner runs as root and npm reads /root/.npmrc (the
+    registry). Where containers may not run as root (Kubernetes namespaces
+    that enforce the `restricted` Pod Security Standard) build and serve
+    run as an ordinary user: the same npm config (a readable copy, see the
+    Dockerfile) and a writable HOME for npm's cache. Root: nothing changes."""
+    if os.geteuid() == 0:
+        return
+    home = Path("/tmp/crucible-home")
+    home.mkdir(parents=True, exist_ok=True)
+    os.environ["HOME"] = str(home)
+    os.environ["NPM_CONFIG_USERCONFIG"] = "/opt/crucible/npmrc"
+
+
 def unpack(zip_path, dest):
     """Exit 1 = the zip is the submission's fault (bad paths, links, size)."""
     dest = Path(dest)
@@ -91,6 +105,7 @@ def unpack(zip_path, dest):
 
 def build():
     """Exit 0 = installed and built; 1 = the official step failed."""
+    as_non_root()
     r = load_official()
     r.ARC_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -119,6 +134,7 @@ def build():
 
 def serve():
     """Print 'app ready' and keep serving, or exit 3 if never ready."""
+    as_non_root()
     r = load_official()
     r.ARC_DIR.mkdir(parents=True, exist_ok=True)
     r.install_node_dependencies = lambda *_a, **_k: None  # done by `build`

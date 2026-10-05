@@ -294,7 +294,7 @@ Kubernetes 的网络隔离单位是 **Pod**（同一 Pod 里的容器共享网�
 | `--pids-limit 1024` | Pod 规格里没有进程数上限，只能在节点上设 kubelet 的 `podPidsLimit` | 沙箱节点池统一配置；`caps().pids_limit` 由部署声明 |
 | `--memory-swap 2g`（不用 swap） | 节点默认不开 swap，等价 | 无 |
 | `--init`（回收僵尸进程） | 没有对应选项 | 不影响隔离，接受；agent 自己负责 |
-| 测试容器加入服务容器的网络命名空间（ARC 官方） | 运行中的 Pod 不能再加普通容器 | 服务和测试放进同一个 Pod，测试容器等一个"就绪"文件再开始；或者分两个 Pod，用 NetworkPolicy 只放行测试 → 服务 |
+| 测试容器加入服务容器的网络命名空间（ARC 官方） | 运行中的 Pod 不能再加普通容器 | 已实现：测试容器成为服务 Pod 的临时容器（同一网络命名空间），挂载经 Pod 的备用卷拷入拷出（`docs/kubernetes.md`） |
 | 巡天 agent 与引擎各自无网络、靠 FIFO 对话 | 放进同一个 Pod 后它们共享 loopback | 二者本来就要对话，只是多了一条通道，接受；Pod 本身默认全拒，出不去 |
 | 每 15 分钟从宿主机直接读工作目录做快照 | 步骤 Pod 和 agent Pod 不在一起，读不到对方的卷 | agent Pod 里加一个可信的小边车容器（坩埚自己的镜像，只读挂工作目录），步骤进程经 Kubernetes exec 让它打 tar 流出来（`copy_out`）；不信任 agent 镜像里的任何程序。工作目录和 HOME 用每遍一个的 PVC（ReadWriteOnce 即可，各阶段的 agent Pod 是先后运行的） |
 
@@ -484,7 +484,7 @@ crucible eval local --root <仓库> --taskset hello-world --agent builtin:octos 
 
 ### 5.3 c. Kubernetes 后端
 
-**已实现（`crucible eval k8s`，`docs/kubernetes.md`）。** 与下面的计划相比：包搬运不走 blob 存储，每次评测一个命名空间和一个 PVC，所有步骤和容器都挂在 `/crucible`，驱动经装载 Pod 拷入拷出；快照不需要边车，步骤进程直接读卷上的工作目录（同一个卷，单节点或共享存储）；没有 MinIO、Pod Security 标签和 RuntimeClass；多节点时评测卷用 ReadWriteMany（`--rwx`），可信与沙箱步骤按 `--trusted-selector`/`--sandbox-selector` 分节点池（nodeSelector + 同名污点容忍）；新 Pod 的 NetworkPolicy 空窗由 init 容器 `netgate` 挡住；`--network container:` 不支持（arcbench-official 打分器只能用 Docker 后端）。
+**已实现（`crucible eval k8s`，`docs/kubernetes.md`）。** 与下面的计划相比：包搬运不走 blob 存储，每次评测一个命名空间和一个 PVC，所有步骤和容器都挂在 `/crucible`，驱动经装载 Pod 拷入拷出；快照不需要边车，步骤进程直接读卷上的工作目录（同一个卷，单节点或共享存储）；没有 MinIO；评测命名空间强制 Pod Security `restricted`（`--pod-security`），可选 RuntimeClass（`--runtime-class gvisor|kata`）；多节点时强制分节点池（默认 `crucible/pool=trusted|sandbox`，沙箱节点必须带同名污点，评测卷必须 `--rwx`），单节点时记一行日志照常运行；新 Pod 的 NetworkPolicy 空窗由 init 容器 `netgate` 挡住；`--network container:` 变成宿主 Pod 的临时容器（arcbench-official 打分器可用）。
 
 **要改什么：**
 

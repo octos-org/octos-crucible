@@ -75,3 +75,13 @@ TMPDIR=$HOME/tmp scorers/arcbench-official/score.sh \
 ```
 
 需要 docker（能跑 linux/amd64），首次会拉 4.8 GB 的官方镜像。`--artifacts` 下有 `build.log`、`egress.log`（代理放行/拒绝记录）、`app.log`、`test.log`、官方结果 `official.json` 与 Playwright 原始报告。
+
+## 6. Kubernetes 后端
+
+`score.sh` 不变，在 Kubernetes 后端（`crucible eval k8s`）上照样运行（`docs/kubernetes.md`）：
+
+- 测试容器的 `--network container:<应用容器>` 变成应用 Pod 里的临时容器，与应用共享网络命名空间，仍用 `127.0.0.1:3000` 访问应用，与官方相同；应用 Pod 是 `--network none`（默认全拒的 NetworkPolicy、没有 DNS），测试容器加入后同样出不去。测试材料和结果目录经应用 Pod 的备用卷拷入拷出（应用容器看不到它们，与 Docker 下相同）；应用 Pod 的资源上限原地加上测试容器的（2 GB / 1 CPU + 2 GB / 2 CPU）。
+- 构建容器的出网代理照旧：代理 Pod 在默认网络（只能出公网），经 `ctr net connect` 加入构建网络；构建 Pod 只能到代理。
+- 评测命名空间默认强制 Pod Security `restricted`：构建、启动容器以 1000 运行、没有 capability（官方 runner 里是 root）。`official.py` 只在非 root 时让 npm 读镜像里同一份 `.npmrc` 的可读副本（`/opt/crucible/npmrc`，`Dockerfile` 里从 `/root/.npmrc` 复制）、`HOME` 用可写目录；root 下（Docker 后端）不做任何改变。
+- 可用 `--runtime-class gvisor`：应用、测试、构建、代理 Pod 都在 gVisor 里。Docker 后端开 `CRUCIBLE_DOCKER_RUNTIME=runsc` 时这个打分器不能用（每个 gVisor 沙箱有自己的网络栈，两个容器共享不了 `127.0.0.1`），会直接报系统错误。
+

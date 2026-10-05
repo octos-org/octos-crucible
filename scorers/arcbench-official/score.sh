@@ -235,7 +235,10 @@ if [ -z "$STATUS" ]; then
   ctr logs --tail 5000 "$SERVE_CTR" >"$RESULTS/app.log" 2>&1 || true
   if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then set_outcome zero "test run exceeded ${RUN_TIMEOUT_S}s"
   elif [ "$rc" -eq 0 ] && [ -f "$RESULTS/official.json" ]; then set_outcome scored ""
-  else set_outcome system_error "test runner exited $rc without official results"; fi
+  else
+    set_outcome system_error "test runner exited $rc without official results"
+    sed 's/^/[test] /' "$RESULTS/test.log" | tail -5 >&2
+  fi
 fi
 
 # 5. result.json, whatever happened above.

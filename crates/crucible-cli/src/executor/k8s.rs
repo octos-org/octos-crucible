@@ -33,8 +33,15 @@
 //!   `/dev/shm` as memory `emptyDir`s, `shareProcessNamespace` for
 //!   `--init` (the pause process reaps zombies). No service account token,
 //!   no service links. The process limit is the node's (kubelet
-//!   `pod-max-pids`), declared with `CRUCIBLE_K8S_PIDS_LIMIT=1`. Joining
-//!   another container's network namespace is not supported.
+//!   `pod-max-pids`), declared with `CRUCIBLE_K8S_PIDS_LIMIT=1`. In a
+//!   namespace that enforces the `restricted` Pod Security Standard
+//!   (`CRUCIBLE_K8S_POD_SECURITY=restricted`) every container is made to
+//!   meet it ([`security_context`]); `CRUCIBLE_K8S_RUNTIME_CLASS` puts
+//!   every Pod under that RuntimeClass (gVisor, Kata).
+//! - **Shared network namespaces.** `--network container:<name>` (a test
+//!   reaching the app at 127.0.0.1) becomes an ephemeral container of
+//!   `<name>`'s Pod ([`guest_spec`]): same network namespace, same
+//!   policies, the host's resources grown by the guest's.
 //! - **Images.** `crucible-*` names map to `<registry>/crucible-*`; builds
 //!   go to BuildKit (`buildctl`), with `force-network-mode=none` for builds
 //!   without network, and are pushed there.
@@ -58,6 +65,8 @@ pub const PROBE_IMAGE: &str =
 /// The label prefix of network membership.
 const NET_PREFIX: &str = "net.crucible";
 const ALIAS_PREFIX: &str = "alias.crucible";
+/// A host Pod's label per guest container ([`guest_label`]).
+const GUEST_PREFIX: &str = "guest.crucible";
 /// Pods started by a step (not the step itself).
 const ROLE: &str = "crucible/role";
 /// Pods that may reach the internet.
@@ -95,6 +104,13 @@ pub struct Conf {
     pub same_node: bool,
     /// `CRUCIBLE_K8S_NODE_SELECTOR` (`k=v,...`): the sandbox pool's nodes.
     pub node_selector: Vec<(String, String)>,
+    /// `CRUCIBLE_K8S_POD_SECURITY=restricted`: the namespace enforces the
+    /// `restricted` Pod Security Standard, so every Pod is made to meet
+    /// it ([`restrict`]); anything else keeps the container's own flags.
+    pub restricted: bool,
+    /// `CRUCIBLE_K8S_RUNTIME_CLASS`: the RuntimeClass of every Pod a step
+    /// starts (gVisor `runsc`, Kata); empty: the cluster's default.
+    pub runtime_class: Option<String>,
 }
 
 impl Conf {
@@ -120,6 +136,8 @@ impl Conf {
             pids_limit: opt("CRUCIBLE_K8S_PIDS_LIMIT", "0") == "1",
             same_node: opt("CRUCIBLE_K8S_SAME_NODE", "1") != "0",
             node_selector: parse_selector(&opt("CRUCIBLE_K8S_NODE_SELECTOR", ""))?,
+            restricted: opt("CRUCIBLE_K8S_POD_SECURITY", "") == "restricted",
+            runtime_class: Some(opt("CRUCIBLE_K8S_RUNTIME_CLASS", "")).filter(|r| !r.is_empty()),
         })
     }
 }
@@ -289,6 +307,115 @@ pub fn map_image(registry: &str, name: &str) -> String {
     }
 }
 
+/// The uid a container runs as in a `restricted` namespace when it asks
+/// for root or for the image's user (the steps' own uid).
+pub const RESTRICTED_UID: i64 = 1000;
+
+/// A container's security context from Docker's flags. In a `restricted`
+/// namespace it is made to meet that Pod Security Standard: no privilege
+/// escalation, every capability dropped (only `NET_BIND_SERVICE` may be
+/// added back), a non-root user (root or the image's user becomes
+/// [`RESTRICTED_UID`]).
+pub fn security_context(c: &ContainerSpec, restricted: bool) -> Result<Value> {
+    let mut sc = json!({
+        "allowPrivilegeEscalation": !c.no_new_privileges,
+        "readOnlyRootFilesystem": c.read_only,
+        "capabilities": {"drop": c.cap_drop, "add": c.cap_add},
+        "seccompProfile": {"type": "RuntimeDefault"},
+    });
+    let mut ug = c.user.as_deref().map(user).transpose()?;
+    if restricted {
+        sc["allowPrivilegeEscalation"] = json!(false);
+        let add: Vec<&str> = c
+            .cap_add
+            .iter()
+            .filter(|x| {
+                x.trim_start_matches("CAP_")
+                    .eq_ignore_ascii_case("NET_BIND_SERVICE")
+            })
+            .map(|_| "NET_BIND_SERVICE")
+            .collect();
+        sc["capabilities"] = json!({"drop": ["ALL"], "add": add});
+        if ug.is_none_or(|(u, _)| u == 0) {
+            eprintln!(
+                "pod security restricted: {} runs as {RESTRICTED_UID}:{RESTRICTED_UID} (not as {})",
+                if c.name.is_empty() { &c.image } else { &c.name },
+                c.user.as_deref().unwrap_or("the image's user")
+            );
+            ug = Some((RESTRICTED_UID, Some(RESTRICTED_UID)));
+        }
+    }
+    if let Some((uid, gid)) = ug {
+        sc["runAsUser"] = json!(uid);
+        sc["runAsNonRoot"] = json!(uid != 0);
+        if let Some(g) = gid {
+            sc["runAsGroup"] = json!(g);
+        }
+    }
+    Ok(sc)
+}
+
+/// The mounts of `c`'s host paths and named volumes: subPaths of the
+/// evaluation's volume.
+fn data_mounts(conf: &Conf, c: &ContainerSpec) -> Result<Vec<Value>> {
+    let mut mounts = Vec::new();
+    for m in &c.mounts {
+        let sub = mount_sub(conf, &m.src)?;
+        let mut vm = json!({"name": DATA_VOLUME, "mountPath": m.dst, "readOnly": m.read_only});
+        if !sub.is_empty() {
+            vm["subPath"] = json!(sub);
+        }
+        mounts.push(vm);
+    }
+    Ok(mounts)
+}
+
+/// Where a mount's source is on the evaluation's volume (relative).
+fn mount_sub(conf: &Conf, src: &MountSrc) -> Result<String> {
+    Ok(match src {
+        MountSrc::Host(p) => {
+            let rel = p.strip_prefix(&conf.root).map_err(|_| {
+                anyhow!(
+                    "{} is not under {} (the evaluation's volume)",
+                    p.display(),
+                    conf.root.display()
+                )
+            })?;
+            if rel
+                .components()
+                .any(|c| c == std::path::Component::ParentDir)
+            {
+                bail!("{}: no `..` in mounted paths", p.display());
+            }
+            rel.display().to_string()
+        }
+        MountSrc::Volume(v) => format!(".volumes/{}", volume_dir(v)?),
+    })
+}
+
+/// The container of `c` (no resources): image, command, environment,
+/// security context, `mounts`.
+fn container(conf: &Conf, c: &ContainerSpec, name: &str, mounts: Vec<Value>) -> Result<Value> {
+    let mut ctr = json!({
+        "name": name,
+        "image": map_image(&conf.registry, &c.image),
+        "imagePullPolicy": "IfNotPresent",
+        "env": c.env.iter().map(|(k, v)| json!({"name": k, "value": v})).collect::<Vec<_>>(),
+        "securityContext": security_context(c, conf.restricted)?,
+        "volumeMounts": mounts,
+    });
+    if let Some(ep) = &c.entrypoint {
+        ctr["command"] = json!(ep);
+    }
+    if !c.args.is_empty() {
+        ctr["args"] = json!(c.args);
+    }
+    if let Some(w) = &c.workdir {
+        ctr["workingDir"] = json!(w);
+    }
+    Ok(ctr)
+}
+
 /// The Pod of a container. `aliases` are the `hostAliases` (alias, IP) of
 /// its network's other members.
 pub fn pod_spec(conf: &Conf, c: &ContainerSpec, aliases: &[(String, String)]) -> Result<Value> {
@@ -314,7 +441,9 @@ pub fn pod_spec(conf: &Conf, c: &ContainerSpec, aliases: &[(String, String)]) ->
             }
         }
         Network::Container(_) => {
-            bail!("--network container:<name> is not supported by the Kubernetes backend")
+            bail!(
+                "--network container:<name> joins that container's Pod (an ephemeral container), not a Pod of its own"
+            )
         }
     }
 
@@ -322,33 +451,12 @@ pub fn pod_spec(conf: &Conf, c: &ContainerSpec, aliases: &[(String, String)]) ->
         "name": DATA_VOLUME,
         "persistentVolumeClaim": {"claimName": conf.pvc},
     })];
-    let mut mounts = Vec::new();
-    for m in &c.mounts {
-        let sub = match &m.src {
-            MountSrc::Host(p) => {
-                let rel = p.strip_prefix(&conf.root).map_err(|_| {
-                    anyhow!(
-                        "{} is not under {} (the evaluation's volume)",
-                        p.display(),
-                        conf.root.display()
-                    )
-                })?;
-                if rel
-                    .components()
-                    .any(|c| c == std::path::Component::ParentDir)
-                {
-                    bail!("{}: no `..` in mounted paths", p.display());
-                }
-                rel.display().to_string()
-            }
-            MountSrc::Volume(v) => format!(".volumes/{}", volume_dir(v)?),
-        };
-        let mut vm = json!({"name": DATA_VOLUME, "mountPath": m.dst, "readOnly": m.read_only});
-        if !sub.is_empty() {
-            vm["subPath"] = json!(sub);
-        }
-        mounts.push(vm);
+    // Spare volumes for a container that may join this one's network
+    // namespace later (an ephemeral container cannot bring its own).
+    for i in 0..GUEST_SLOTS {
+        volumes.push(json!({"name": slot_volume(i), "emptyDir": {}}));
     }
+    let mut mounts = data_mounts(conf, c)?;
     for (i, t) in c.tmpfs.iter().enumerate() {
         let name = format!("tmpfs-{i}");
         let mut ed = json!({"medium": "Memory"});
@@ -372,37 +480,11 @@ pub fn pod_spec(conf: &Conf, c: &ContainerSpec, aliases: &[(String, String)]) ->
     if let Some(x) = &c.limits.cpus {
         limits.insert("cpu".into(), json!(cpus(x)?));
     }
-    let mut sc = json!({
-        "allowPrivilegeEscalation": !c.no_new_privileges,
-        "readOnlyRootFilesystem": c.read_only,
-        "capabilities": {"drop": c.cap_drop, "add": c.cap_add},
-        "seccompProfile": {"type": "RuntimeDefault"},
-    });
-    if let Some(u) = &c.user {
-        let (uid, gid) = user(u)?;
-        sc["runAsUser"] = json!(uid);
-        sc["runAsNonRoot"] = json!(uid != 0);
-        if let Some(g) = gid {
-            sc["runAsGroup"] = json!(g);
-        }
-    }
-    let mut ctr = json!({
-        "name": "main",
-        "image": map_image(&conf.registry, &c.image),
-        "imagePullPolicy": "IfNotPresent",
-        "env": c.env.iter().map(|(k, v)| json!({"name": k, "value": v})).collect::<Vec<_>>(),
-        "securityContext": sc,
-        "resources": {"limits": limits.clone(), "requests": limits},
-        "volumeMounts": mounts,
-    });
-    if let Some(ep) = &c.entrypoint {
-        ctr["command"] = json!(ep);
-    }
-    if !c.args.is_empty() {
-        ctr["args"] = json!(c.args);
-    }
-    if let Some(w) = &c.workdir {
-        ctr["workingDir"] = json!(w);
+    let mut ctr = container(conf, c, "main", mounts)?;
+    ctr["resources"] = json!({"limits": limits.clone(), "requests": limits});
+    let mut pod_sc = json!({"seccompProfile": {"type": "RuntimeDefault"}});
+    if conf.restricted {
+        pod_sc["runAsNonRoot"] = json!(true);
     }
     let mut spec = json!({
         "restartPolicy": "Never",
@@ -410,10 +492,13 @@ pub fn pod_spec(conf: &Conf, c: &ContainerSpec, aliases: &[(String, String)]) ->
         "enableServiceLinks": false,
         "shareProcessNamespace": c.init,
         "terminationGracePeriodSeconds": 30,
-        "securityContext": {"seccompProfile": {"type": "RuntimeDefault"}},
+        "securityContext": pod_sc,
         "containers": [ctr],
         "volumes": volumes,
     });
+    if let Some(rc) = &conf.runtime_class {
+        spec["runtimeClassName"] = json!(rc);
+    }
     for (k, v) in dns.as_object().expect("object") {
         spec[k] = v.clone();
     }
@@ -421,12 +506,14 @@ pub fn pod_spec(conf: &Conf, c: &ContainerSpec, aliases: &[(String, String)]) ->
         spec["initContainers"] = json!([netgate(conf)]);
     }
     // The step's node: with a ReadWriteOnce volume always; with a shared
-    // one for containers on a named volume, which may be node-local IPC
-    // (astro-v4's FIFOs: a FIFO on NFS connects only on one node).
+    // one for containers on a named volume or a directory holding FIFOs,
+    // which are node-local IPC (astro-v4's pipes: a FIFO on NFS connects
+    // only on one node).
     let pin = conf.same_node
-        || c.mounts
-            .iter()
-            .any(|m| matches!(m.src, MountSrc::Volume(_)));
+        || c.mounts.iter().any(|m| match &m.src {
+            MountSrc::Volume(_) => true,
+            MountSrc::Host(p) => holds_fifo(p),
+        });
     if pin {
         spec["affinity"] = json!({"nodeAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": {
             "nodeSelectorTerms": [{"matchExpressions": [{
@@ -455,6 +542,185 @@ pub fn pod_spec(conf: &Conf, c: &ContainerSpec, aliases: &[(String, String)]) ->
         "metadata": {"name": pod_name(c), "namespace": conf.namespace, "labels": labels},
         "spec": spec,
     }))
+}
+
+/// `p` is a FIFO or a directory holding one (node-local IPC).
+fn holds_fifo(p: &Path) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    let fifo = |p: &Path| std::fs::metadata(p).is_ok_and(|m| m.file_type().is_fifo());
+    fifo(p)
+        || std::fs::read_dir(p)
+            .map(|d| d.flatten().any(|e| fifo(&e.path())))
+            .unwrap_or(false)
+}
+
+/// The label a host Pod carries for each guest container it holds (so a
+/// guest is found by its own name).
+pub fn guest_label(guest: &str) -> String {
+    format!("{GUEST_PREFIX}/{}", label_value(guest))
+}
+
+/// Spare `emptyDir` volumes every Pod carries for a guest container's
+/// mounts (see [`guest_spec`]).
+pub const GUEST_SLOTS: usize = 4;
+
+fn slot_volume(i: usize) -> String {
+    format!("guest-{i}")
+}
+
+/// One mount of a guest: the Pod's spare volume `slot`, filled from
+/// `sub` (relative to the evaluation's volume) before the guest starts
+/// and, when `back`, copied back there after it ended. `sub` is `None`
+/// for a tmpfs (an empty slot).
+#[derive(Debug, Clone, PartialEq)]
+pub struct GuestCopy {
+    pub slot: usize,
+    pub sub: Option<String>,
+    pub back: bool,
+}
+
+/// A container that joins another container's network namespace
+/// (`--network container:<name>`): Kubernetes shares a network namespace
+/// only within a Pod, so it becomes an ephemeral container of that
+/// container's Pod. It reaches the host at 127.0.0.1 and nothing more than
+/// the host Pod may (same policies, same runtime class, same node).
+///
+/// Ephemeral containers may only use their Pod's volumes, without
+/// `subPath`, and have no resources of their own. So each of its mounts
+/// and tmpfs is one of the Pod's spare `emptyDir`s ([`GUEST_SLOTS`]),
+/// filled from the evaluation's volume before it starts and copied back
+/// (read-write mounts) after it ended, by a helper ([`copy_helper`]); its
+/// `--shm-size` is the Pod's `/dev/shm`; its limits are added to the
+/// host's ([`grown`]).
+pub fn guest_spec(conf: &Conf, c: &ContainerSpec) -> Result<(Value, Vec<GuestCopy>)> {
+    let name = pod_name(c);
+    let mut mounts = Vec::new();
+    let mut copies = Vec::new();
+    for m in &c.mounts {
+        let sub = mount_sub(conf, &m.src)?;
+        let slot = copies.len();
+        mounts
+            .push(json!({"name": slot_volume(slot), "mountPath": m.dst, "readOnly": m.read_only}));
+        copies.push(GuestCopy {
+            slot,
+            sub: Some(sub),
+            back: !m.read_only,
+        });
+    }
+    for t in &c.tmpfs {
+        let slot = copies.len();
+        mounts.push(json!({"name": slot_volume(slot), "mountPath": t.dst}));
+        copies.push(GuestCopy {
+            slot,
+            sub: None,
+            back: false,
+        });
+    }
+    if copies.len() > GUEST_SLOTS {
+        bail!(
+            "--network container: on Kubernetes: at most {GUEST_SLOTS} mounts and tmpfs ({} given)",
+            copies.len()
+        );
+    }
+    Ok((container(conf, c, &name, mounts)?, copies))
+}
+
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// The helper (ephemeral, crucible's own busybox command) that copies a
+/// guest's mounts between the evaluation's volume (`/data`) and the Pod's
+/// spare volumes: in (`back` false) every mount, out only the read-write
+/// ones. Directories copy their contents; a file mount is refused.
+pub fn copy_helper(name: &str, copies: &[GuestCopy], back: bool) -> Option<Value> {
+    let mut cmd = vec!["set -e".to_string()];
+    let mut mounts = vec![json!({"name": DATA_VOLUME, "mountPath": "/data", "readOnly": !back})];
+    for c in copies {
+        let Some(sub) = &c.sub else { continue };
+        if back && !c.back {
+            continue;
+        }
+        let (data, slot) = (sh_quote(&format!("/data/{sub}")), format!("/g{}", c.slot));
+        cmd.push(if back {
+            format!("cp -a {slot}/. {data}/")
+        } else {
+            format!("test -d {data} || {{ echo \"not a directory: {sub}\" >&2; exit 2; }}; cp -a {data}/. {slot}/")
+        });
+        mounts.push(json!({"name": slot_volume(c.slot), "mountPath": slot}));
+    }
+    if cmd.len() == 1 {
+        return None;
+    }
+    Some(json!({
+        "name": name,
+        "image": PROBE_IMAGE,
+        "imagePullPolicy": "IfNotPresent",
+        "command": ["sh", "-c", cmd.join("\n")],
+        "securityContext": {
+            "runAsUser": RESTRICTED_UID, "runAsGroup": RESTRICTED_UID, "runAsNonRoot": true,
+            "allowPrivilegeEscalation": false, "readOnlyRootFilesystem": true,
+            "capabilities": {"drop": ["ALL"]},
+            "seccompProfile": {"type": "RuntimeDefault"},
+        },
+        "volumeMounts": mounts,
+    }))
+}
+
+/// Kubernetes quantities in base units: bytes (`2Gi`, `512Mi`, `1000`)
+/// or millicores (`1500m`, `2`).
+fn parse_quantity(q: &str, milli: bool) -> Option<u64> {
+    let q = q.trim();
+    let (num, mul): (&str, f64) = if let Some(n) = q.strip_suffix('m') {
+        (n, 0.001)
+    } else {
+        let units = [
+            ("Ki", 1024.0),
+            ("Mi", 1024.0 * 1024.0),
+            ("Gi", 1024.0 * 1024.0 * 1024.0),
+            ("Ti", 1024.0f64.powi(4)),
+            ("k", 1e3),
+            ("M", 1e6),
+            ("G", 1e9),
+            ("T", 1e12),
+        ];
+        units
+            .iter()
+            .find_map(|(u, m)| q.strip_suffix(u).map(|n| (n, *m)))
+            .unwrap_or((q, 1.0))
+    };
+    let v: f64 = num.parse().ok()?;
+    Some((v * mul * if milli { 1000.0 } else { 1.0 }).round() as u64)
+}
+
+/// The host container's resources with a guest's limits added (`None`:
+/// nothing to add, or the host has no limit of that kind).
+pub fn grown(host: &Value, guest: &super::Limits) -> Result<Option<Value>> {
+    let lim = &host["limits"];
+    let mut out = serde_json::Map::new();
+    if let (Some(h), Some(g)) = (lim["memory"].as_str(), &guest.memory) {
+        let (h, g) = (
+            parse_quantity(h, false).ok_or_else(|| anyhow!("memory {h}"))?,
+            parse_quantity(&quantity(g)?, false).ok_or_else(|| anyhow!("memory {g}"))?,
+        );
+        out.insert("memory".into(), json!((h + g).to_string()));
+    }
+    if let (Some(h), Some(g)) = (lim["cpu"].as_str(), &guest.cpus) {
+        let (h, g) = (
+            parse_quantity(h, true).ok_or_else(|| anyhow!("cpu {h}"))?,
+            parse_quantity(&cpus(g)?, true).ok_or_else(|| anyhow!("cpu {g}"))?,
+        );
+        out.insert("cpu".into(), json!(format!("{}m", h + g)));
+    }
+    if out.is_empty() {
+        return Ok(None);
+    }
+    let mut res = host.clone();
+    for (k, v) in out {
+        res["limits"][&k] = v.clone();
+        res["requests"][&k] = v;
+    }
+    Ok(Some(res))
 }
 
 /// The Pod name of a container: its `--name`, or for an unnamed one a
@@ -727,12 +993,26 @@ struct PodState {
 }
 
 fn pod_state(v: &Value) -> PodState {
-    let st = &v["status"];
-    let cs = st["containerStatuses"]
+    let cs = v["status"]["containerStatuses"]
         .as_array()
         .and_then(|a| a.first())
         .cloned()
         .unwrap_or(Value::Null);
+    state_of(v, &cs)
+}
+
+/// The state of ephemeral container `name` of Pod `v`.
+fn guest_state(v: &Value, name: &str) -> PodState {
+    let cs = v["status"]["ephemeralContainerStatuses"]
+        .as_array()
+        .and_then(|a| a.iter().find(|c| c["name"] == name))
+        .cloned()
+        .unwrap_or(Value::Null);
+    state_of(v, &cs)
+}
+
+fn state_of(v: &Value, cs: &Value) -> PodState {
+    let st = &v["status"];
     let state = &cs["state"];
     PodState {
         exists: true,
@@ -742,6 +1022,15 @@ fn pod_state(v: &Value) -> PodState {
         waiting: state["waiting"]["reason"].as_str().map(str::to_owned),
         ip: st["podIP"].as_str().map(str::to_owned),
     }
+}
+
+/// Where a container is: its own Pod (`main`), or an ephemeral container
+/// of its host's Pod.
+#[derive(Debug, Clone, PartialEq)]
+struct Loc {
+    pod: String,
+    container: String,
+    guest: bool,
 }
 
 impl K8sExecutor {
@@ -755,13 +1044,207 @@ impl K8sExecutor {
         &self.conf.namespace
     }
 
-    async fn get_pod(&self, name: &str) -> Result<PodState> {
-        let name = dns_name(name);
-        match kubectl(&["-n", self.ns(), "get", "pod", &name, "-o", "json"], None).await {
-            Ok(out) => Ok(pod_state(&serde_json::from_str(&out)?)),
-            Err(e) if e.to_string().contains("NotFound") => Ok(PodState::default()),
+    async fn get_pod_json(&self, name: &str) -> Result<Option<Value>> {
+        match kubectl(&["-n", self.ns(), "get", "pod", name, "-o", "json"], None).await {
+            Ok(out) => Ok(Some(serde_json::from_str(&out)?)),
+            Err(e) if e.to_string().contains("NotFound") => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    async fn get_pod(&self, name: &str) -> Result<PodState> {
+        Ok(self
+            .get_pod_json(&dns_name(name))
+            .await?
+            .map(|v| pod_state(&v))
+            .unwrap_or_default())
+    }
+
+    /// Container `id`: its own Pod, else the Pod holding it as a guest
+    /// (`None`: neither exists).
+    async fn locate(&self, id: &str) -> Result<Option<(Loc, PodState)>> {
+        let name = dns_name(id);
+        if let Some(v) = self.get_pod_json(&name).await? {
+            let loc = Loc {
+                pod: name,
+                container: "main".into(),
+                guest: false,
+            };
+            return Ok(Some((loc, pod_state(&v))));
+        }
+        let out = kubectl(
+            &[
+                "-n",
+                self.ns(),
+                "get",
+                "pods",
+                "-l",
+                &format!("{}=1", guest_label(&name)),
+                "-o",
+                "json",
+            ],
+            None,
+        )
+        .await?;
+        let v: Value = serde_json::from_str(&out)?;
+        Ok(v["items"].as_array().and_then(|a| a.first()).map(|p| {
+            let loc = Loc {
+                pod: p["metadata"]["name"].as_str().unwrap_or("").to_owned(),
+                container: name.clone(),
+                guest: true,
+            };
+            (loc, guest_state(p, &name))
+        }))
+    }
+
+    /// Add ephemeral container `ctr` to Pod `host`.
+    async fn add_ephemeral(&self, host: &str, ctr: &Value) -> Result<()> {
+        let patch = json!({"spec": {"ephemeralContainers": [ctr]}});
+        kubectl(
+            &[
+                "-n",
+                self.ns(),
+                "patch",
+                "pod",
+                host,
+                "--subresource",
+                "ephemeralcontainers",
+                "--type",
+                "strategic",
+                "-p",
+                &patch.to_string(),
+            ],
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Wait until ephemeral container `name` of `host` runs (`until_end`:
+    /// has ended); its state.
+    async fn wait_ephemeral(&self, host: &str, name: &str, until_end: bool) -> Result<PodState> {
+        let t0 = Instant::now();
+        loop {
+            let s = self
+                .get_pod_json(host)
+                .await?
+                .map(|v| guest_state(&v, name))
+                .unwrap_or_default();
+            if !s.exists {
+                bail!("{host} went away before {name} ended");
+            }
+            if s.exit_code.is_some() || (s.running && !until_end) {
+                return Ok(s);
+            }
+            if let Some(w) = &s.waiting
+                && matches!(
+                    w.as_str(),
+                    "ErrImagePull"
+                        | "ImagePullBackOff"
+                        | "InvalidImageName"
+                        | "CreateContainerError"
+                )
+                && t0.elapsed() > Duration::from_secs(600)
+            {
+                bail!("{name} in {host}: {w}");
+            }
+            if !until_end && t0.elapsed() > Duration::from_secs(1800) {
+                bail!("{name} in {host} did not start within 30 minutes");
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    /// Run a copy helper ([`copy_helper`]) for guest `name` in `host`.
+    async fn copy(&self, host: &str, name: &str, copies: &[GuestCopy], back: bool) -> Result<()> {
+        let helper = format!("{}-{}", name, if back { "out" } else { "in" });
+        let helper = dns_name(&helper);
+        let Some(h) = copy_helper(&helper, copies, back) else {
+            return Ok(());
+        };
+        self.add_ephemeral(host, &h).await?;
+        let s = self.wait_ephemeral(host, &helper, true).await?;
+        if s.exit_code != Some(0) {
+            let why = kubectl(&["-n", self.ns(), "logs", host, "-c", &helper], None)
+                .await
+                .unwrap_or_default();
+            bail!(
+                "copying {name}'s mounts {}: {}",
+                if back { "back" } else { "in" },
+                why.trim()
+            );
+        }
+        Ok(())
+    }
+
+    /// Start `c` as an ephemeral container of `target`'s Pod (see
+    /// [`guest_spec`]): its name, host Pod and mounts.
+    async fn join(
+        &self,
+        c: &ContainerSpec,
+        target: &str,
+    ) -> Result<(String, String, Vec<GuestCopy>)> {
+        let host = dns_name(target);
+        let Some(pod) = self.get_pod_json(&host).await? else {
+            bail!("--network container:{target}: no such container");
+        };
+        if !pod_state(&pod).running {
+            bail!("--network container:{target}: it is not running");
+        }
+        if pod["spec"]["shareProcessNamespace"] == true {
+            // The host's processes would see the copy helper's mounts.
+            bail!(
+                "--network container:{target}: not with a host started with --init on Kubernetes"
+            );
+        }
+        let (ctr, copies) = guest_spec(&self.conf, c)?;
+        let name = ctr["name"].as_str().unwrap_or("").to_owned();
+        // Ephemeral containers have no resources: the host's grow by the
+        // guest's (in-place resize), so the Pod as a whole has both.
+        let main = pod["spec"]["containers"]
+            .as_array()
+            .and_then(|a| a.iter().find(|x| x["name"] == "main"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        if let Some(res) = grown(&main["resources"], &c.limits)? {
+            let patch = json!({"spec": {"containers": [{"name": "main", "resources": res}]}});
+            if let Err(e) = kubectl(
+                &[
+                    "-n",
+                    self.ns(),
+                    "patch",
+                    "pod",
+                    &host,
+                    "--subresource",
+                    "resize",
+                    "--type",
+                    "strategic",
+                    "-p",
+                    &patch.to_string(),
+                ],
+                None,
+            )
+            .await
+            {
+                eprintln!("warning: {name} shares {host}'s resources (resize failed: {e})");
+            }
+        }
+        self.copy(&host, &name, &copies, false).await?;
+        kubectl(
+            &[
+                "-n",
+                self.ns(),
+                "label",
+                "pod",
+                &host,
+                &format!("{}=1", guest_label(&name)),
+            ],
+            None,
+        )
+        .await?;
+        self.add_ephemeral(&host, &ctr).await?;
+        self.wait_ephemeral(&host, &name, false).await?;
+        Ok((name, host, copies))
     }
 
     /// (alias, IP) of the running members of `net` that have an alias.
@@ -802,6 +1285,10 @@ impl K8sExecutor {
 
     /// Create the Pod of `c`; wait until its container started (or ended).
     async fn create(&self, c: &ContainerSpec) -> Result<String> {
+        if let Network::Container(target) = &c.network {
+            // Detached: what it writes stays in the host Pod (not copied back).
+            return Ok(self.join(c, target).await?.0);
+        }
         if c.network == Network::Default {
             self.apply(&internet_policy(self.ns())).await?;
         }
@@ -965,14 +1452,34 @@ impl Executor for K8sExecutor {
     }
 
     async fn run_attached(&self, c: &ContainerSpec, rm: bool) -> Result<i32> {
-        let name = self.create(c).await?;
+        let (name, guest) = match &c.network {
+            Network::Container(target) => {
+                let (name, host, copies) = self.join(c, target).await?;
+                (name, Some((host, copies)))
+            }
+            _ => (self.create(c).await?, None),
+        };
         // Its output, while it runs and after it ended.
-        let _ = tokio::process::Command::new("kubectl")
-            .args(["-n", self.ns(), "logs", "-f", "-c", "main", &name])
-            .stdin(Stdio::null())
-            .status()
-            .await;
+        if let Some((loc, _)) = self.locate(&name).await? {
+            let _ = tokio::process::Command::new("kubectl")
+                .args([
+                    "-n",
+                    self.ns(),
+                    "logs",
+                    "-f",
+                    "-c",
+                    &loc.container,
+                    &loc.pod,
+                ])
+                .stdin(Stdio::null())
+                .status()
+                .await;
+        }
         let code = self.wait(&name).await?;
+        if let Some((host, copies)) = guest {
+            // What it wrote to its read-write mounts.
+            self.copy(&host, &name, &copies, true).await?;
+        }
         if rm {
             self.remove(&name).await;
         }
@@ -981,10 +1488,9 @@ impl Executor for K8sExecutor {
 
     async fn wait(&self, id: &str) -> Result<Option<i64>> {
         loop {
-            let s = self.get_pod(id).await?;
-            if !s.exists {
+            let Some((_, s)) = self.locate(id).await? else {
                 return Ok(None);
-            }
+            };
             if s.exit_code.is_some() {
                 return Ok(s.exit_code);
             }
@@ -997,6 +1503,13 @@ impl Executor for K8sExecutor {
     }
 
     async fn stop(&self, id: &str, _grace: Duration) {
+        // A guest cannot be stopped on its own (Kubernetes has no call for
+        // it): it ends with its process or with its host.
+        if let Ok(Some((loc, _))) = self.locate(id).await
+            && loc.guest
+        {
+            return;
+        }
         // The pod stays (logs, exit code): its deadline ends it now, with
         // its termination grace period.
         let _ = kubectl(
@@ -1017,10 +1530,9 @@ impl Executor for K8sExecutor {
     }
 
     async fn inspect(&self, id: &str) -> Result<State> {
-        let s = self.get_pod(id).await?;
-        if !s.exists {
+        let Some((_, s)) = self.locate(id).await? else {
             bail!("no such container: {id}");
-        }
+        };
         Ok(State {
             running: s.running,
             exit_code: s.exit_code,
@@ -1028,6 +1540,10 @@ impl Executor for K8sExecutor {
     }
 
     async fn logs(&self, id: &str, tail: usize, to: &Path) -> Result<()> {
+        let (loc, _) = self
+            .locate(id)
+            .await?
+            .ok_or_else(|| anyhow!("no such container: {id}"))?;
         let out = kubectl(
             &[
                 "-n",
@@ -1035,7 +1551,9 @@ impl Executor for K8sExecutor {
                 "logs",
                 "--tail",
                 &tail.to_string(),
-                &dns_name(id),
+                "-c",
+                &loc.container,
+                &loc.pod,
             ],
             None,
         )
@@ -1045,17 +1563,21 @@ impl Executor for K8sExecutor {
     }
 
     async fn print_logs(&self, id: &str, tail: Option<usize>) -> Result<i32> {
+        let Some((loc, _)) = self.locate(id).await? else {
+            eprintln!("no such container: {id}");
+            return Ok(1);
+        };
         let mut a = vec![
             "-n".to_string(),
             self.ns().to_owned(),
             "logs".into(),
             "-c".into(),
-            "main".into(),
+            loc.container,
         ];
         if let Some(t) = tail {
             a.extend(["--tail".into(), t.to_string()]);
         }
-        a.push(dns_name(id));
+        a.push(loc.pod);
         let st = tokio::process::Command::new("kubectl")
             .args(&a)
             .stdin(Stdio::null())
@@ -1065,6 +1587,13 @@ impl Executor for K8sExecutor {
     }
 
     async fn remove(&self, id: &str) {
+        // A guest stays in its host's Pod (ephemeral containers cannot be
+        // removed) and goes with it.
+        if let Ok(Some((loc, _))) = self.locate(id).await
+            && loc.guest
+        {
+            return;
+        }
         let _ = kubectl(
             &[
                 "-n",
@@ -1467,6 +1996,8 @@ mod tests {
             pids_limit: true,
             same_node: true,
             node_selector: vec![],
+            restricted: false,
+            runtime_class: None,
         }
     }
 
@@ -1585,6 +2116,28 @@ mod tests {
             s["tolerations"],
             json!([{"key": "crucible/pool", "operator": "Equal", "value": "sandbox", "effect": "NoSchedule"}])
         );
+        // A directory holding FIFOs (astro-v4's pipes): the step's node too.
+        let root = tempfile::tempdir().unwrap();
+        let (pipes, plain) = (root.path().join("pipes"), root.path().join("plain"));
+        std::fs::create_dir(&pipes).unwrap();
+        std::fs::create_dir(&plain).unwrap();
+        let st = std::process::Command::new("mkfifo")
+            .arg(pipes.join("to_agent"))
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let mut fc = cf.clone();
+        fc.root = root.path().to_path_buf();
+        let mut c = agent();
+        c.mounts = vec![Mount::host(&pipes, "/pipes", false)];
+        let s = pod_spec(&fc, &c, &[]).unwrap()["spec"].clone();
+        assert!(s.get("affinity").is_some());
+        c.mounts = vec![Mount::host(&plain, "/x", false)];
+        assert!(
+            pod_spec(&fc, &c, &[]).unwrap()["spec"]
+                .get("affinity")
+                .is_none()
+        );
         // --platform keeps the pool.
         let mut c = agent();
         c.platform = Some("linux/arm64".into());
@@ -1625,6 +2178,182 @@ mod tests {
         let mut c = agent();
         c.network = Network::Container("serve".into());
         assert!(pod_spec(&conf(), &c, &[]).is_err());
+    }
+
+    #[test]
+    fn restricted_pods_meet_the_standard() {
+        let mut cf = conf();
+        cf.restricted = true;
+        cf.runtime_class = Some("gvisor".into());
+        // arcbench-official's build container: root, three capabilities.
+        let build = ContainerSpec {
+            name: "crucible-build-1".into(),
+            image: "crucible-scorer-arcbench-official:local".into(),
+            network: Network::Named {
+                name: "crucible-bnet-1".into(),
+                aliases: vec![],
+            },
+            cap_drop: vec!["ALL".into()],
+            cap_add: vec![
+                "CHOWN".into(),
+                "DAC_OVERRIDE".into(),
+                "NET_BIND_SERVICE".into(),
+            ],
+            no_new_privileges: false,
+            ..Default::default()
+        };
+        let p = pod_spec(&cf, &build, &[]).unwrap();
+        let s = &p["spec"];
+        let sc = &s["containers"][0]["securityContext"];
+        assert_eq!(sc["runAsUser"], RESTRICTED_UID);
+        assert_eq!(sc["runAsGroup"], RESTRICTED_UID);
+        assert_eq!(sc["runAsNonRoot"], true);
+        assert_eq!(sc["allowPrivilegeEscalation"], false);
+        assert_eq!(
+            sc["capabilities"],
+            json!({"drop": ["ALL"], "add": ["NET_BIND_SERVICE"]})
+        );
+        assert_eq!(sc["seccompProfile"]["type"], "RuntimeDefault");
+        assert_eq!(s["securityContext"]["runAsNonRoot"], true);
+        assert_eq!(s["runtimeClassName"], "gvisor");
+        // The netgate init container meets it too.
+        let g = &s["initContainers"][0]["securityContext"];
+        assert_eq!(g["runAsNonRoot"], true);
+        assert_eq!(g["capabilities"]["drop"], json!(["ALL"]));
+        // A non-root user is kept.
+        let p = pod_spec(&cf, &agent(), &[]).unwrap();
+        assert_eq!(
+            p["spec"]["containers"][0]["securityContext"]["runAsUser"],
+            1000
+        );
+        // baseline: the container's own flags, as before.
+        let p = pod_spec(&conf(), &build, &[]).unwrap();
+        let sc = &p["spec"]["containers"][0]["securityContext"];
+        assert!(sc.get("runAsUser").is_none());
+        assert_eq!(
+            sc["capabilities"]["add"],
+            json!(["CHOWN", "DAC_OVERRIDE", "NET_BIND_SERVICE"])
+        );
+        assert!(p["spec"].get("runtimeClassName").is_none());
+    }
+
+    #[test]
+    fn a_shared_network_namespace_is_an_ephemeral_container() {
+        // arcbench-official's test container: --network container:<app>.
+        let t = ContainerSpec {
+            name: "crucible-test-1".into(),
+            image: "crucible-scorer-arcbench-official:local".into(),
+            network: Network::Container("crucible-serve-1".into()),
+            user: Some("1000:1000".into()),
+            cap_drop: vec!["ALL".into()],
+            no_new_privileges: true,
+            limits: Limits {
+                memory: Some("2g".into()),
+                cpus: Some("2".into()),
+                ..Default::default()
+            },
+            shm_size: Some("1g".into()),
+            tmpfs: vec![Tmpfs {
+                dst: "/workspace".into(),
+                opts: "tmpfs-mode=1777".into(),
+                via_mount: true,
+            }],
+            mounts: vec![
+                Mount::host(Path::new("/crucible/tmp/t/tests"), "/pack", true),
+                Mount::host(Path::new("/crucible/tmp/w/results"), "/results", false),
+            ],
+            env: vec![("HOME".into(), "/tmp".into())],
+            entrypoint: Some(vec!["python3".into()]),
+            args: vec!["/opt/crucible/official.py".into(), "test".into()],
+            ..Default::default()
+        };
+        let (c, copies) = guest_spec(&conf(), &t).unwrap();
+        assert_eq!(c["name"], "crucible-test-1");
+        assert_eq!(
+            c["image"],
+            "10.43.200.200:5000/crucible-scorer-arcbench-official:local"
+        );
+        assert!(c.get("resources").is_none());
+        // No subPath (not allowed for ephemeral containers): spare volumes.
+        assert_eq!(
+            c["volumeMounts"],
+            json!([
+                {"name": "guest-0", "mountPath": "/pack", "readOnly": true},
+                {"name": "guest-1", "mountPath": "/results", "readOnly": false},
+                {"name": "guest-2", "mountPath": "/workspace"},
+            ])
+        );
+        assert_eq!(
+            copies,
+            [
+                GuestCopy {
+                    slot: 0,
+                    sub: Some("tmp/t/tests".into()),
+                    back: false
+                },
+                GuestCopy {
+                    slot: 1,
+                    sub: Some("tmp/w/results".into()),
+                    back: true
+                },
+                GuestCopy {
+                    slot: 2,
+                    sub: None,
+                    back: false
+                },
+            ]
+        );
+        // Every Pod has the spare volumes.
+        let host = pod_spec(&conf(), &agent(), &[]).unwrap();
+        let vols = host["spec"]["volumes"].as_array().unwrap();
+        assert!(vols.contains(&json!({"name": "guest-3", "emptyDir": {}})));
+        // The helper copies in every mount, back only the read-write one.
+        let h = copy_helper("crucible-test-1-in", &copies, false).unwrap();
+        let cmd = h["command"][2].as_str().unwrap();
+        assert!(cmd.contains("cp -a '/data/tmp/t/tests'/. /g0/"), "{cmd}");
+        assert!(cmd.contains("cp -a '/data/tmp/w/results'/. /g1/"), "{cmd}");
+        assert_eq!(h["volumeMounts"][0]["readOnly"], true);
+        assert_eq!(h["securityContext"]["runAsNonRoot"], true);
+        let o = copy_helper("crucible-test-1-out", &copies, true).unwrap();
+        let cmd = o["command"][2].as_str().unwrap();
+        assert!(
+            cmd.contains("cp -a /g1/. '/data/tmp/w/results'/") && !cmd.contains("/g0"),
+            "{cmd}"
+        );
+        assert_eq!(o["volumeMounts"][0]["readOnly"], false);
+        let mut many = t.clone();
+        many.tmpfs = vec![many.tmpfs[0].clone(); 3];
+        assert!(guest_spec(&conf(), &many).is_err());
+        assert_eq!(c["securityContext"]["runAsUser"], 1000);
+        assert_eq!(c["command"], json!(["python3"]));
+        assert_eq!(
+            guest_label("crucible-test-1"),
+            "guest.crucible/crucible-test-1"
+        );
+        // Mounts outside the volume are refused as for any Pod.
+        let mut bad = t.clone();
+        bad.mounts = vec![Mount::host(Path::new("/etc"), "/x", true)];
+        assert!(guest_spec(&conf(), &bad).is_err());
+
+        // The host's resources grow by the guest's (API-normalised forms).
+        let host = json!({"limits": {"memory": "2Gi", "cpu": "1"}, "requests": {"memory": "2Gi", "cpu": "1"}});
+        let g = grown(&host, &t.limits).unwrap().unwrap();
+        assert_eq!(g["limits"], json!({"memory": "4294967296", "cpu": "3000m"}));
+        assert_eq!(g["requests"], g["limits"]);
+        let host = json!({"limits": {"memory": "512Mi", "cpu": "500m"}});
+        let g = grown(
+            &host,
+            &Limits {
+                memory: Some("512m".into()),
+                cpus: Some("0.5".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(g["limits"], json!({"memory": "1073741824", "cpu": "1000m"}));
+        assert!(grown(&json!({}), &t.limits).unwrap().is_none());
+        assert!(grown(&host, &Limits::default()).unwrap().is_none());
     }
 
     #[test]

@@ -76,6 +76,17 @@ pub struct K8sArgs {
     /// Upper bound of one step, seconds.
     #[arg(long, default_value_t = 6 * 3600)]
     pub step_timeout_s: u64,
+    /// The Pod Security Standard the evaluation's namespace enforces:
+    /// `restricted` (every Pod non-root, no capabilities but
+    /// NET_BIND_SERVICE, no privilege escalation, RuntimeDefault seccomp;
+    /// containers asking for root run as uid 1000) or `baseline` (the
+    /// containers' own flags, e.g. an app image that must run as root).
+    #[arg(long, default_value = "restricted", value_parser = ["restricted", "baseline"])]
+    pub pod_security: String,
+    /// RuntimeClass of every Pod the steps start (agents, apps, tests,
+    /// scorers): e.g. `gvisor` (runsc) or `kata`; it must exist.
+    #[arg(long)]
+    pub runtime_class: Option<String>,
 }
 
 /// Where the evaluation's volume is mounted in every Pod.
@@ -134,6 +145,9 @@ pub struct Cluster {
     pub rwx: bool,
     pub trusted: Vec<(String, String)>,
     pub sandbox: Vec<(String, String)>,
+    /// `restricted` or `baseline` (the namespace's Pod Security level).
+    pub pod_security: String,
+    pub runtime_class: Option<String>,
 }
 
 /// The Job of one step: `crucible step <name> --secrets-dir ... <args>`
@@ -186,6 +200,11 @@ pub fn job_spec(
             ),
             ("CRUCIBLE_K8S_SAME_NODE", if c.rwx { "0" } else { "1" }),
             ("CRUCIBLE_K8S_NODE_SELECTOR", &selector_string(&c.sandbox)),
+            ("CRUCIBLE_K8S_POD_SECURITY", &c.pod_security),
+            (
+                "CRUCIBLE_K8S_RUNTIME_CLASS",
+                c.runtime_class.as_deref().unwrap_or(""),
+            ),
         ] {
             env.push(json!({"name": k, "value": v}));
         }
@@ -250,6 +269,111 @@ pub fn job_spec(
     }))
 }
 
+/// A node selector (`key=value` pairs).
+pub type Selector = Vec<(String, String)>;
+
+/// The pools of a cluster with more than one node, unless given.
+pub const TRUSTED_POOL: &str = "crucible/pool=trusted";
+pub const SANDBOX_POOL: &str = "crucible/pool=sandbox";
+
+/// Node pools, from the cluster's nodes (`kubectl get nodes -o json`):
+/// `(trusted, sandbox, what to log)`. One node: nothing to split, the
+/// selectors stay as given and the log says so. More: trusted steps and
+/// sandbox steps (with every Pod they start) must go to disjoint pools,
+/// [`TRUSTED_POOL`] / [`SANDBOX_POOL`] unless given, each with at least
+/// one node, every sandbox node tainted with its labels (`NoSchedule`, so
+/// nothing else is scheduled there), and the volume must be ReadWriteMany
+/// (steps of one evaluation then run on different nodes).
+pub fn pools(
+    nodes: &Value,
+    trusted: &[(String, String)],
+    sandbox: &[(String, String)],
+    rwx: bool,
+) -> Result<(Selector, Selector, String)> {
+    let items = nodes["items"].as_array().cloned().unwrap_or_default();
+    let name = |n: &Value| n["metadata"]["name"].as_str().unwrap_or("?").to_owned();
+    if items.len() <= 1 {
+        let n = items.first().map(name).unwrap_or_default();
+        return Ok((
+            trusted.to_vec(),
+            sandbox.to_vec(),
+            format!(
+                "node pools: single node {n}: trusted and sandbox steps share it (pools cannot be split on one node)"
+            ),
+        ));
+    }
+    let pick = |given: &[(String, String)], default: &str| -> Selector {
+        if given.is_empty() {
+            parse_selector(default).expect("constant")
+        } else {
+            given.to_vec()
+        }
+    };
+    let (t, s) = (pick(trusted, TRUSTED_POOL), pick(sandbox, SANDBOX_POOL));
+    let matches = |n: &Value, sel: &[(String, String)]| {
+        sel.iter()
+            .all(|(k, v)| n["metadata"]["labels"][k].as_str() == Some(v.as_str()))
+    };
+    let (tn, sn): (Vec<&Value>, Vec<&Value>) = (
+        items.iter().filter(|n| matches(n, &t)).collect(),
+        items.iter().filter(|n| matches(n, &s)).collect(),
+    );
+    let fix = format!(
+        "label the nodes (kubectl label node <node> {} / {}), taint the sandbox nodes \
+         (kubectl taint node <node> {}:NoSchedule), see docs/kubernetes.md",
+        selector_string(&t),
+        selector_string(&s),
+        selector_string(&s)
+    );
+    if tn.is_empty() || sn.is_empty() {
+        bail!(
+            "{} nodes but no {} pool ({}): trusted and sandbox steps must run on separate nodes; {fix}",
+            items.len(),
+            if tn.is_empty() { "trusted" } else { "sandbox" },
+            selector_string(if tn.is_empty() { &t } else { &s })
+        );
+    }
+    if let Some(n) = tn.iter().find(|n| matches(n, &s)) {
+        bail!("node {} is in both pools; {fix}", name(n));
+    }
+    for n in &sn {
+        let taints = n["spec"]["taints"].as_array().cloned().unwrap_or_default();
+        let tainted = s.iter().all(|(k, v)| {
+            taints.iter().any(|x| {
+                x["key"] == k.as_str()
+                    && x["value"].as_str().unwrap_or("") == v
+                    && x["effect"] == "NoSchedule"
+            })
+        });
+        if !tainted {
+            bail!(
+                "sandbox node {} is not tainted {}:NoSchedule (other Pods could land next to untrusted code); {fix}",
+                name(n),
+                selector_string(&s)
+            );
+        }
+    }
+    if !rwx {
+        bail!(
+            "{} nodes: trusted and sandbox steps run on different nodes, so the evaluation's volume must be \
+             ReadWriteMany: --rwx --storage-class <shared class> (docs/kubernetes.md)",
+            items.len()
+        );
+    }
+    let names = |v: &[&Value]| v.iter().map(|n| name(n)).collect::<Vec<_>>().join(",");
+    Ok((
+        t.clone(),
+        s.clone(),
+        format!(
+            "node pools: trusted {} = [{}], sandbox {} = [{}]",
+            selector_string(&t),
+            names(&tn),
+            selector_string(&s),
+            names(&sn)
+        ),
+    ))
+}
+
 /// What the namespace is made with.
 pub struct NsOpts {
     pub volume_size: String,
@@ -258,6 +382,8 @@ pub struct NsOpts {
     pub rwx: bool,
     /// The loader's nodes (the trusted pool).
     pub trusted: Vec<(String, String)>,
+    /// The Pod Security level the namespace enforces.
+    pub pod_security: String,
 }
 
 /// The namespace's fixed objects: default deny, step Pods out, the
@@ -284,7 +410,13 @@ pub fn namespace_objects(ns: &str, eval_id: &str, a: &NsOpts) -> Vec<Value> {
     });
     place(&mut loader, &a.trusted);
     vec![
-        json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": ns, "labels": {"crucible/eval": label_value(eval_id)}}}),
+        json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": ns, "labels": {
+            "crucible/eval": label_value(eval_id),
+            "pod-security.kubernetes.io/enforce": a.pod_security,
+            "pod-security.kubernetes.io/enforce-version": "latest",
+            "pod-security.kubernetes.io/warn": a.pod_security,
+            "pod-security.kubernetes.io/audit": a.pod_security,
+        }}}),
         json!({"apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy",
                "metadata": {"name": "default-deny", "namespace": ns},
                "spec": {"podSelector": {}, "policyTypes": ["Ingress", "Egress"]}}),
@@ -381,6 +513,8 @@ impl K8s {
                 rwx: a.rwx,
                 trusted: trusted.clone(),
                 sandbox,
+                pod_security: a.pod_security.clone(),
+                runtime_class: a.runtime_class.clone().filter(|r| !r.is_empty()),
             },
             eval_id: String::new(),
             opts: NsOpts {
@@ -389,6 +523,7 @@ impl K8s {
                 step_image: a.step_image.clone(),
                 rwx: a.rwx,
                 trusted,
+                pod_security: a.pod_security.clone(),
             },
             ready: false,
         })
@@ -405,6 +540,7 @@ impl K8s {
         if self.ready {
             return Ok(());
         }
+        self.check_cluster().await?;
         for o in namespace_objects(&self.ns, &self.eval_id, &self.opts) {
             kubectl(&["create", "-f", "-"], Some(o.to_string().as_bytes()))
                 .await
@@ -456,6 +592,37 @@ impl K8s {
         .await
         .context("copying the evaluation to its volume")?;
         self.ready = true;
+        Ok(())
+    }
+
+    /// Node pools ([`pools`]) and the RuntimeClass, before anything is
+    /// created.
+    async fn check_cluster(&mut self) -> Result<()> {
+        let nodes: Value = serde_json::from_str(
+            &kubectl(&["get", "nodes", "-o", "json"], None)
+                .await
+                .context("listing the cluster's nodes")?,
+        )?;
+        let (t, s, note) = pools(
+            &nodes,
+            &self.cluster.trusted,
+            &self.cluster.sandbox,
+            self.cluster.rwx,
+        )?;
+        eprintln!("{note}");
+        self.cluster.trusted = t.clone();
+        self.cluster.sandbox = s;
+        self.opts.trusted = t;
+        if let Some(rc) = &self.cluster.runtime_class {
+            kubectl(&["get", "runtimeclass", rc, "-o", "name"], None)
+                .await
+                .with_context(|| format!("--runtime-class {rc}: no such RuntimeClass"))?;
+            eprintln!("runtime class {rc}: every Pod the steps start");
+        }
+        eprintln!(
+            "pod security: namespace enforces {}",
+            self.cluster.pod_security
+        );
         Ok(())
     }
 
@@ -659,6 +826,8 @@ mod tests {
             rwx: false,
             trusted: vec![],
             sandbox: vec![],
+            pod_security: "restricted".into(),
+            runtime_class: None,
         }
     }
 
@@ -751,6 +920,7 @@ mod tests {
         );
         let env = c["env"].to_string();
         assert!(env.contains("CRUCIBLE_EXECUTOR") && env.contains("status.podIP"));
+        assert!(env.contains(r#"{"name":"CRUCIBLE_K8S_POD_SECURITY","value":"restricted"}"#));
         // Trusted steps: no service account token, no executor.
         let h = job("handoff", &[Secret::PlatformKey]).unwrap();
         let p = &h["spec"]["template"]["spec"];
@@ -777,8 +947,12 @@ mod tests {
             step_image: "i".into(),
             rwx: false,
             trusted: vec![],
+            pod_security: "restricted".into(),
         };
         let objs = namespace_objects("ns", "e", &o);
+        let ns = &objs[0]["metadata"]["labels"];
+        assert_eq!(ns["pod-security.kubernetes.io/enforce"], "restricted");
+        assert_eq!(ns["pod-security.kubernetes.io/enforce-version"], "latest");
         let pvc = objs
             .iter()
             .find(|o| o["kind"] == "PersistentVolumeClaim")
@@ -828,6 +1002,49 @@ mod tests {
             loader["spec"]["nodeSelector"],
             json!({"crucible/pool": "trusted"})
         );
+    }
+
+    fn node(name: &str, labels: Value, taints: Value) -> Value {
+        json!({"metadata": {"name": name, "labels": labels}, "spec": {"taints": taints}})
+    }
+
+    #[test]
+    fn several_nodes_need_separate_tainted_pools() {
+        let none: Vec<(String, String)> = vec![];
+        // One node: nothing to split, the selectors as given.
+        let one = json!({"items": [node("n1", json!({}), json!([]))]});
+        let (t, s, note) = pools(&one, &none, &none, false).unwrap();
+        assert!(t.is_empty() && s.is_empty() && note.contains("single node n1"));
+
+        let taint = json!([{"key": "crucible/pool", "value": "sandbox", "effect": "NoSchedule"}]);
+        let good = json!({"items": [
+            node("srv", json!({"crucible/pool": "trusted"}), json!([])),
+            node("a0", json!({"crucible/pool": "sandbox"}), taint.clone()),
+        ]});
+        let (t, s, note) = pools(&good, &none, &none, true).unwrap();
+        assert_eq!(selector_string(&t), TRUSTED_POOL);
+        assert_eq!(selector_string(&s), SANDBOX_POOL);
+        assert!(note.contains("[srv]") && note.contains("[a0]"), "{note}");
+        // A ReadWriteOnce volume cannot follow steps across nodes.
+        assert!(pools(&good, &none, &none, false).is_err());
+        // No sandbox pool, an untainted sandbox node, a node in both.
+        let unlabeled =
+            json!({"items": [node("a", json!({}), json!([])), node("b", json!({}), json!([]))]});
+        assert!(pools(&unlabeled, &none, &none, true).is_err());
+        let untainted = json!({"items": [
+            node("srv", json!({"crucible/pool": "trusted"}), json!([])),
+            node("a0", json!({"crucible/pool": "sandbox"}), json!([])),
+        ]});
+        let e = pools(&untainted, &none, &none, true)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("not tainted"), "{e}");
+        let both = parse_selector("zone=a").unwrap();
+        let zoned = json!({"items": [
+            node("x", json!({"zone": "a"}), taint.clone()),
+            node("y", json!({"zone": "a"}), taint),
+        ]});
+        assert!(pools(&zoned, &both, &both, true).is_err());
     }
 
     #[test]

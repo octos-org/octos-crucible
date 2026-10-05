@@ -121,7 +121,9 @@ spec:
 ---
 # What a step may do in its evaluation's namespace (bound there by a
 # RoleBinding the driver creates): start and remove the Pods it runs and
-# the NetworkPolicies of its networks. Nothing else (no Secrets).
+# the NetworkPolicies of its networks; add an ephemeral container to one
+# of its Pods (a container sharing that Pod's network namespace) and grow
+# that Pod's resources by the guest's. Nothing else (no Secrets, no exec).
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -133,6 +135,9 @@ rules:
   - apiGroups: [""]
     resources: [pods/log]
     verbs: [get]
+  - apiGroups: [""]
+    resources: [pods/ephemeralcontainers, pods/resize]
+    verbs: [get, patch]
   - apiGroups: [networking.k8s.io]
     resources: [networkpolicies]
     verbs: [get, list, create, delete, patch]
