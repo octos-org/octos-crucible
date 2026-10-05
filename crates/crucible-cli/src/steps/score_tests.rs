@@ -4,6 +4,10 @@
 //! the handoff carries a model credential (the meter's port only), and
 //! runs `crucible score` on the handoff. Only `score.json` and the scoring
 //! meters' usage logs are written to `--out`.
+//!
+//! On failure only a category is printed and written to
+//! `<out>/<replica>/failure.json` (`{"category"}`; this machine holds the
+//! tests, so no details leave it); publish puts it into the manifest.
 
 use std::path::PathBuf;
 
@@ -33,7 +37,32 @@ pub struct Args {
 
 const METER_PORT: u16 = 8787;
 
+/// Failure categories (the manifest's `replicas[].failure`).
+pub const SCORER_BUILD: &str = "scorer image build failed";
+pub const SCORING: &str = "scoring failed";
+
 pub async fn run(a: Args, s: &Secrets) -> Result<()> {
+    let phase = std::cell::Cell::new(SCORING);
+    let r = score_tests(&a, s, &phase).await;
+    r.map_err(|_| {
+        let category = phase.get();
+        let dir = match a.replica {
+            Some(r) => a.out.join(r.to_string()),
+            None => a.out.clone(),
+        };
+        let f = serde_json::json!({ "category": category });
+        if std::fs::create_dir_all(&dir)
+            .and_then(|()| std::fs::write(dir.join("failure.json"), f.to_string()))
+            .is_err()
+        {
+            eprintln!("could not record the failure");
+        }
+        eprintln!("score-tests: {category}");
+        anyhow!("{category}")
+    })
+}
+
+async fn score_tests(a: &Args, s: &Secrets, phase: &std::cell::Cell<&'static str>) -> Result<()> {
     let h = std::fs::canonicalize(&a.handoff)?;
     let ts = crate::taskset_cmd::load(&h.join("taskset.json"))?;
     ts.validate(crucible_core::taskset::MAX_TOTAL_TIME_S)?;
@@ -44,6 +73,7 @@ pub async fn run(a: Args, s: &Secrets) -> Result<()> {
     // The container plugins the taskset uses: from the registry compiled
     // into crucible, or uploaded (their sealed packages are in the
     // handoff); `crucible score` hands each its image.
+    phase.set(SCORER_BUILD);
     for v in ts.plugin_versions() {
         let Some(p) = ts.plugins_of_kind(&v.kind, &v.name) else {
             bail!("{} {} is not registered", v.kind, v.name);
@@ -78,17 +108,13 @@ pub async fn run(a: Args, s: &Secrets) -> Result<()> {
                 ..Default::default()
             };
             if let Err(e) = exec.build(&b, log.path()).await {
-                let out = std::fs::read(log.path()).unwrap_or_default();
-                eprintln!(
-                    "{}",
-                    String::from_utf8_lossy(&out[out.len().saturating_sub(3000)..])
-                );
                 bail!("{} {}: image build failed: {e:#}", v.kind, p.name);
             }
         }
         eprintln!("{} {} ready", v.kind, p.name);
     }
 
+    phase.set(SCORING);
     let label = match &a.run_label {
         Some(l) if !l.is_empty() => l.clone(),
         _ => format!("score-{}", std::process::id()),

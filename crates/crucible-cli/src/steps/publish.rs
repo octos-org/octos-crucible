@@ -1,6 +1,7 @@
 //! `crucible step publish`: runs no agent or test code. Stores the sealed
 //! outputs as blobs, builds the manifest (scores, usage, times), packs the
-//! submitter's download zip (workers-kv credentials), archives the
+//! submitter's download zip (workers-kv credentials; skipped when no
+//! replica left an output), archives the
 //! manifest sealed to the platform key, and, as asked: commits it in clear
 //! to the data branch (only if score_public), delivers it to the Worker.
 //! Writes `<out>/manifest.json`.
@@ -273,6 +274,10 @@ fn data_branch(eval_id: &str, manifest: &[u8], token: &str) -> Result<()> {
     let dir = d.path();
     let mut m: crucible_core::Manifest = serde_json::from_slice(manifest)?;
     m.download = None;
+    // Details are for the submitter only.
+    for r in &mut m.replicas {
+        r.failure_detail = None;
+    }
     let auth = format!(
         "http.https://github.com/.extraheader=AUTHORIZATION: basic {}",
         crate::cred::base64_encode(format!("x-access-token:{token}").as_bytes())

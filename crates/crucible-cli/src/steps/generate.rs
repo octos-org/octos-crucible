@@ -5,7 +5,14 @@
 //! this process, run the stages, and seal every output to the platform
 //! key. Only sealed files are left in `<out>/<replica>/`, whatever
 //! happened; a failed run still seals what it left.
+//!
+//! On failure the public log and the step's error carry only a category
+//! ([`FETCH`], [`BUILD`], [`SETUP`], [`RUN`]); the details (error chain,
+//! the tail of the agent's image build log) go into `failure.json`, sealed
+//! with the agent facts in `agent.sealed`, and from there into the
+//! manifest's `failure_detail`, which only the submitter sees.
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -78,6 +85,15 @@ pub struct Args {
     pub out: PathBuf,
 }
 
+/// Failure categories (the manifest's `replicas[].failure`).
+pub const FETCH: &str = "agent package could not be fetched";
+pub const BUILD: &str = "agent image build failed";
+pub const SETUP: &str = "platform setup failed";
+pub const RUN: &str = "agent run failed";
+
+/// At most this much of the details is kept (the end of it).
+const MAX_DETAIL: usize = 6000;
+
 pub async fn run(a: Args, s: &Secrets) -> Result<()> {
     let tmp;
     let work = match &a.work {
@@ -96,15 +112,28 @@ pub async fn run(a: Args, s: &Secrets) -> Result<()> {
     let exec = crate::executor::backend()?;
     // Scoped: only what carries this run's label.
     exec.cleanup(&label);
-    let result = generate(&a, s, &work, &rdir, &label).await;
+    let phase = Cell::new(SETUP);
+    let result = generate(&a, s, &work, &rdir, &label, &phase).await;
     exec.cleanup(&label);
     exec.image_rm(&a.image_tag).await;
-    if let Err(e) = &result {
-        eprintln!("generate r{}: {e:#}", a.replica);
-    }
+    // Public log: the category only; details are sealed.
+    let result = result.map_err(|e| {
+        let category = phase.get();
+        let detail = format!("{e:#}");
+        let cut = detail.len().saturating_sub(MAX_DETAIL);
+        let cut = (cut..=detail.len())
+            .find(|&i| detail.is_char_boundary(i))
+            .unwrap_or(0);
+        let f = serde_json::json!({"category": category, "detail": &detail[cut..]});
+        if let Err(w) = std::fs::write(work.join("failure.json"), f.to_string()) {
+            eprintln!("could not record the failure: {w}");
+        }
+        eprintln!("generate r{}: {category}", a.replica);
+        anyhow!("{category}")
+    });
     // Seal whatever the run left, whatever happened.
     let out = a.out.join(a.replica.to_string());
-    let extra: Vec<PathBuf> = ["facts.json", "build.json"]
+    let extra: Vec<PathBuf> = ["facts.json", "build.json", "failure.json"]
         .iter()
         .map(|f| work.join(f))
         .filter(|p| p.is_file())
@@ -132,7 +161,15 @@ fn run_label(a: &Args) -> String {
     }
 }
 
-async fn generate(a: &Args, s: &Secrets, work: &Path, rdir: &Path, label: &str) -> Result<()> {
+/// `phase` is the failure category of what is being done.
+async fn generate(
+    a: &Args,
+    s: &Secrets,
+    work: &Path,
+    rdir: &Path,
+    label: &str,
+    phase: &Cell<&'static str>,
+) -> Result<()> {
     if super::has_test_material(&a.root)? {
         bail!("test material present in the generation step's root");
     }
@@ -141,6 +178,7 @@ async fn generate(a: &Args, s: &Secrets, work: &Path, rdir: &Path, label: &str) 
     let store = s.store(&a.store, false)?;
 
     // The agent package.
+    phase.set(FETCH);
     let src = agentpkg::Source::parse(&a.agent_source)?;
     let pkg = work.join("agent-pkg");
     let blob_access = match &src {
@@ -165,6 +203,7 @@ async fn generate(a: &Args, s: &Secrets, work: &Path, rdir: &Path, label: &str) 
     }
 
     // Build (nothing from the package runs on the host).
+    phase.set(BUILD);
     let mut opts = build::BuildOpts {
         log: Some(work.join("build.log")),
         timeout: Some(Duration::from_secs(3600)),
@@ -202,10 +241,10 @@ async fn generate(a: &Args, s: &Secrets, work: &Path, rdir: &Path, label: &str) 
     let facts = match built {
         Ok(f) => f,
         Err(e) => {
+            // The submitter's own build output: sealed, never printed.
             let log = std::fs::read(work.join("build.log")).unwrap_or_default();
-            let tail = &log[log.len().saturating_sub(3000)..];
-            eprintln!("{}", String::from_utf8_lossy(tail));
-            bail!("agent image build failed: {e:#}");
+            let tail = String::from_utf8_lossy(&log[log.len().saturating_sub(4000)..]);
+            bail!("{e:#}\n--- build log (end) ---\n{tail}");
         }
     };
     std::fs::write(work.join("build.json"), serde_json::to_vec(&facts)?)?;
@@ -215,6 +254,7 @@ async fn generate(a: &Args, s: &Secrets, work: &Path, rdir: &Path, label: &str) 
     );
 
     // Stage inputs, never the tests.
+    phase.set(SETUP);
     let keys = s.keys(Secret::PlatformKey)?;
     let inputs = work.join("inputs");
     crate::taskset_cmd::fetch_inputs(&ts, a.stages, &store, &keys, &inputs).await?;
@@ -284,6 +324,7 @@ async fn generate(a: &Args, s: &Secrets, work: &Path, rdir: &Path, label: &str) 
             });
         }
     };
+    phase.set(RUN);
     let r = tokio::time::timeout(
         Duration::from_secs(a.run_timeout_min * 60),
         runners::run_with(&exec, &args, &cred, &on_stage),

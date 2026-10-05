@@ -131,6 +131,7 @@ export function EvalDetailPage({ id }: { id: string }) {
         <p class="muted">{FINAL.has(d.status) ? "没有结果数据。" : "还没有结果，完成第一个阶段后会显示在这里。"}</p>
       ) : (
         <>
+          <Failures replicas={replicas} />
           <Overview replicas={replicas} f={f} complete={d.complete !== false} />
           <StageTable replicas={replicas} f={f} />
           {replicas.map((r) => (
@@ -140,6 +141,48 @@ export function EvalDetailPage({ id }: { id: string }) {
       )}
       {!FINAL.has(d.status) && <p class="muted small">每 15 秒自动刷新。</p>}
     </div>
+  );
+}
+
+/** Known failure categories (crucible step generate / score-tests). */
+const FAILURE_LABELS: Record<string, string> = {
+  "agent package could not be fetched": "agent 包获取失败",
+  "agent image build failed": "agent 镜像构建失败",
+  "platform setup failed": "平台准备失败",
+  "agent run failed": "agent 运行失败",
+  "scorer image build failed": "打分器镜像构建失败",
+  "scoring failed": "打分失败",
+};
+
+function Failures({ replicas }: { replicas: ReplicaEntry[] }) {
+  const reps = replicas.filter((r) => r.failure || (r.stages ?? []).some((s) => s.reason));
+  if (reps.length === 0) return null;
+  return (
+    <Card title="失败原因">
+      {reps.map((r) => (
+        <div class="stack">
+          {r.failure && (
+            <p>
+              <strong>第 {r.replica} 遍：</strong>
+              {FAILURE_LABELS[r.failure] ?? r.failure}
+            </p>
+          )}
+          {(r.stages ?? [])
+            .filter((s) => s.reason)
+            .map((s) => (
+              <p class="small">
+                第 {r.replica} 遍 {s.stage}：{s.reason}
+              </p>
+            ))}
+          {r.failure_detail && (
+            <details>
+              <summary class="small">详细信息（只有你能看到）</summary>
+              <pre class="log">{r.failure_detail}</pre>
+            </details>
+          )}
+        </div>
+      ))}
+    </Card>
   );
 }
 

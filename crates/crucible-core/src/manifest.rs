@@ -174,9 +174,16 @@ pub struct ReplicaEntry {
     /// Timestamps of the generation job, from the GitHub API.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job: Option<JobTiming>,
-    /// Why the replica produced no usable result, if it did not.
+    /// Why the replica produced no usable result, if it did not: a short
+    /// category (e.g. "agent image build failed"), safe for public logs and
+    /// the data branch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<String>,
+    /// Details for the submitter only (e.g. the tail of the agent's image
+    /// build log). Never from a machine that held the tests; dropped from
+    /// the data branch and never printed in public logs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_detail: Option<String>,
     pub stages: Vec<StageEntry>,
 }
 
@@ -225,6 +232,11 @@ pub struct StageEntry {
     /// kept apart from `usage` (the agent producing its output).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eval_usage: Option<EvalUsage>,
+    /// Why the stage has no test result (output rejected, app did not
+    /// build, scoring error): the scorer's own message when its tests are
+    /// public, else only the category.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// Model use while scoring, per slot (docs/plugins.md §10).
@@ -287,6 +299,7 @@ mod tests {
                 replica: 1,
                 job: None,
                 failure: None,
+                failure_detail: None,
                 stages: vec![StageEntry {
                     stage: "stage-1".into(),
                     score: serde_json::from_str(r#"{"status":"failed","passed":27,"total":30}"#)
@@ -303,6 +316,7 @@ mod tests {
                     exit_code: Some(0),
                     checkpoint_source: Some("final".into()),
                     eval_usage: None,
+                    reason: None,
                 }],
             }],
         };
@@ -379,11 +393,13 @@ mod tests {
             exit_code: None,
             checkpoint_source: None,
             eval_usage: None,
+            reason: None,
         };
         let rep = |n: u32, stages: Vec<StageEntry>| ReplicaEntry {
             replica: n,
             job: None,
             failure: None,
+            failure_detail: None,
             stages,
         };
         let reps = vec![

@@ -185,10 +185,16 @@ export interface StageEntry {
   eval_usage?: { interactive?: SlotUsage | null; scorer?: SlotUsage | null } | null;
   output?: BlobRef | null;
   logs?: BlobRef | null;
+  /** Why the stage has no test result (scorer's fixed message or category). */
+  reason?: string | null;
 }
 
 export interface ReplicaEntry {
   replica: number;
+  /** Why the replica produced no usable result (a category). */
+  failure?: string | null;
+  /** Details for the submitter (e.g. the end of the agent image build log). */
+  failure_detail?: string | null;
   stages?: StageEntry[] | null;
 }
 
