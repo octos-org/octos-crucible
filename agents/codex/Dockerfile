@@ -21,7 +21,11 @@ RUN set -eu; \
     printf '{"commit": "%s", "repo": "openai/codex", "patches": "%s"}\n' \
       "$(git -C /src rev-parse HEAD)" "$(cat /patches/*.patch | sha256sum | cut -c1-16)" > /agent-build.json
 # codex-rs/rust-toolchain.toml pins the toolchain; rustup installs it here.
-RUN cd /src/codex-rs && cargo build --release --locked -p codex-cli --bin codex \
+# The release tag bumps the workspace version (0.0.0 -> 0.93.0) in Cargo.toml
+# but not in Cargo.lock, so `--locked` fails as is. `cargo update --workspace`
+# rewrites only the workspace members' own versions; every external
+# dependency stays at the locked version.
+RUN cd /src/codex-rs && cargo update --workspace && cargo build --release --locked -p codex-cli --bin codex \
     && install -m 0755 target/release/codex /usr/local/bin/codex \
     && rm -rf target
 
