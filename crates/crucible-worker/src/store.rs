@@ -843,7 +843,7 @@ impl<B: Backend> Db<'_, B> {
             .rows(
                 &format!(
                     "SELECT e.eval_id, e.owner_id, e.owner_login, e.model, e.created_at, \
-                     e.created_s, r.total_score, r.display, \
+                     e.created_s, e.stage_names, r.total_score, r.display, \
                      json_extract(r.manifest, '$.agent.name') AS agent, \
                      json_extract(r.manifest, '$.agent.version') AS agent_version, \
                      json_extract(r.manifest, '$.scoring.display.stage') AS stage_display \
@@ -868,6 +868,7 @@ impl<B: Backend> Db<'_, B> {
                     total_score: real(r, "total_score")?,
                     created_at: text(r, "created_at").unwrap_or_default(),
                     created_s: uint(r, "created_s").unwrap_or(0),
+                    stage_names: json_col(r, "stage_names").unwrap_or_default(),
                 })
             })
             .collect();

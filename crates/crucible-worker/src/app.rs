@@ -472,28 +472,69 @@ impl<'a, B: Backend> App<'a, B> {
                 .await
                 .map_err(|e| self.storage_err(e))?;
             let direction = display.as_ref().map(|d| d.direction).unwrap_or_default();
-            let ranked = leaderboard::rank(cands, direction);
-            let ids: Vec<&str> = ranked.iter().map(|(_, c)| c.eval_id.as_str()).collect();
-            let manifests = db.manifests(&ids).await.map_err(|e| self.storage_err(e))?;
-            let entries = ranked
-                .into_iter()
-                .map(|(r, c)| {
-                    let m = manifests
-                        .iter()
-                        .find(|(id, _)| *id == c.eval_id)
-                        .and_then(|(_, m)| serde_json::from_value(m.clone()).ok());
-                    leaderboard::entry(r, c, m.as_ref())
-                })
-                .collect();
+            let all = self.taskset_stage_names(taskset).await?;
+            let (complete, groups) = leaderboard::split(cands, all.as_deref());
+            let entries = self.board_entries(complete, direction).await?;
+            let mut partial = Vec::with_capacity(groups.len());
+            for (stages, cands) in groups {
+                partial.push(leaderboard::PartialGroup {
+                    stages,
+                    entries: self.board_entries(cands, direction).await?,
+                });
+            }
             Ok(json!(leaderboard::Board {
                 taskset: taskset.to_owned(),
                 direction,
                 display,
                 stage_display,
                 entries,
+                partial,
             }))
         })
         .await
+    }
+
+    /// Ranked entries of these candidates, with their manifests' details.
+    async fn board_entries(
+        &self,
+        cands: Vec<leaderboard::Candidate>,
+        direction: crucible_core::taskset::Direction,
+    ) -> Result<Vec<leaderboard::Entry>> {
+        let ranked = leaderboard::rank(cands, direction);
+        let ids: Vec<&str> = ranked.iter().map(|(_, c)| c.eval_id.as_str()).collect();
+        let manifests = self
+            .db()
+            .manifests(&ids)
+            .await
+            .map_err(|e| self.storage_err(e))?;
+        Ok(ranked
+            .into_iter()
+            .map(|(r, c)| {
+                let m = manifests
+                    .iter()
+                    .find(|(id, _)| *id == c.eval_id)
+                    .and_then(|(_, m)| serde_json::from_value(m.clone()).ok());
+                leaderboard::entry(r, c, m.as_ref())
+            })
+            .collect())
+    }
+
+    /// All stage names of a taskset (built-in or uploaded); `None` when it
+    /// is unknown.
+    async fn taskset_stage_names(&self, taskset: &str) -> Result<Option<Vec<String>>> {
+        let info = if is_user_taskset_id(taskset) {
+            self.load_user_taskset(taskset)
+                .await?
+                .map(|u| user_taskset_info(&u))
+        } else {
+            self.tasksets()
+                .await?
+                .into_iter()
+                .find(|t| t.name == taskset)
+        };
+        Ok(info
+            .map(|t| t.stages.into_iter().map(|s| s.name).collect::<Vec<_>>())
+            .filter(|v| !v.is_empty()))
     }
 
     // ---- user tasksets --------------------------------------------------
@@ -1217,6 +1258,14 @@ impl<'a, B: Backend> App<'a, B> {
         }
         if let Some(s) = rec.total_score() {
             o.insert("total_score".into(), json!(s));
+        }
+        // Ran every stage of the taskset (the taskset's total name applies
+        // only then). Absent when the taskset is unknown.
+        if let Ok(Some(all)) = self.taskset_stage_names(&rec.taskset).await {
+            o.insert(
+                "complete".into(),
+                json!(all.iter().all(|s| rec.stage_names.contains(s))),
+            );
         }
         Ok(Resp::json(200, &out))
     }

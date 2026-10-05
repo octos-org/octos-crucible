@@ -1835,8 +1835,17 @@ fn writes_per_eval() {
 }
 
 /// Submits an app-mode eval of stage 1 and posts a done result whose
-/// total is `passed`/2 (agent `agent`).
+/// total is `passed`/2 (agent `agent`). It counts as having run every stage
+/// of github-full (as an agent eval would), so it goes on the main board.
 fn scored_eval(t: &T, tok: &str, id: &str, public: bool, agent: &str, passed: u32) {
+    partial_eval(t, tok, id, public, agent, passed);
+    t.mock.sql(&format!(
+        "UPDATE evals SET stage_names = '[\"stage-1\",\"stage-2\"]' WHERE eval_id = '{id}'"
+    ));
+}
+
+/// Like [`scored_eval`], but only stage 1 of github-full's 2 stages ran.
+fn partial_eval(t: &T, tok: &str, id: &str, public: bool, agent: &str, passed: u32) {
     let hash = json_of(&upload_as(t, tok, &sealed(id.as_bytes())))["hash"]
         .as_str()
         .unwrap()
@@ -1933,6 +1942,21 @@ fn leaderboard() {
         json_of(&t.call("GET", "/leaderboard/nothing-here", &[], b""))["entries"],
         json!([])
     );
+
+    // Evals of only some stages are ranked apart, by the stages they ran.
+    partial_eval(&t, &alice, &id(7), true, "z", 2);
+    t.mock.sql("DELETE FROM cache;");
+    let b = json_of(&t.call("GET", "/leaderboard/github-full", &[], b""));
+    assert_eq!(b["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(b["partial"].as_array().unwrap().len(), 1);
+    assert_eq!(b["partial"][0]["stages"], json!(["stage-1"]));
+    assert_eq!(b["partial"][0]["entries"][0]["eval_id"], id(7).as_str());
+    assert_eq!(b["partial"][0]["entries"][0]["rank"], 1);
+    // The eval itself says it is partial.
+    let d = json_of(&t.as_user("GET", &format!("/evals/{}", id(7)), &alice, b""));
+    assert_eq!(d["complete"], false);
+    let d = json_of(&t.as_user("GET", &format!("/evals/{}", id(2)), &alice, b""));
+    assert_eq!(d["complete"], true);
 }
 
 #[test]

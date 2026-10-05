@@ -91,13 +91,15 @@ GitHub 回调。换取 token、读取用户之后，用户的 GitHub token 立�
    "model": "glm-5.3", "total_score": 0.9,
    "stages": [{"stage": "stage-1", "score": 27, "max": 30}],
    "replicas": 3, "wall_s": 1834.5, "cost_usd": 0.42,
-   "created_at": "...", "eval_id": "..."}]}
+   "created_at": "...", "eval_id": "..."}],
+ "partial": [{"stages": ["stage-1"], "entries": [ ... ]}]}
 ```
+- `entries` 只含**跑完题目包全部阶段**的评测（按题目包当前的阶段列表判断：评测的 `stage_names` 覆盖全部阶段）。只跑了部分阶段的评测（agent 模式只跑前 N 个阶段、app 模式单阶段打分）放在 `partial`：按所跑的阶段集合分组，每组单独排名，组按阶段在题目包中的顺序排列；没有时不带该字段。题目包的展示名（`display.name`，如“四卡总分”）只用于 `entries`。
 - 候选为该题目包最近 2000 次公开完成的评测。每个（用户, agent 名）只取最好的一次：方向 `direction` 取最近一次公开评测快照里总分的 `display.direction`（没有快照时为 `higher`），`higher` 取总分最大、`lower` 取最小；总分相同取更早的那次。最多 100 行。
 - 排序同上；总分相同的名次并列（1, 1, 3），更早的排前。
 - `total_score` 即结果表里按快照 aggregate 算出的总分（同 `GET /evals`）；`display` / `stage_display` 是最近一次公开评测快照里的总分与阶段分展示方式（没有快照的旧评测不带，按百分比与 `通过数/总数` 显示）。
 - `stages`：每阶段在各遍之间的平均分（没有一遍打出分时为 `null`）和满分；`replicas` 为遍数；`wall_s` / `cost_usd` 为每遍各阶段之和的平均，有一遍价格未知时 `cost_usd` 为 `null`。`model` 在 app 模式未填时为 `null`。
-- 名称不合法 → 404；没有公开成绩 → `entries: []`。
+- 名称不合法 → 404；没有公开成绩 → `entries: []`。题目包已不存在（查不到阶段列表）时全部视为完整评测。
 
 ## 用户上传的题目包
 
@@ -206,9 +208,9 @@ manifest（`schema: 2`）的阶段分数 `replicas[].stages[].score` 是 result 
  "manifest": { ... }, "total_score": 0.775,
  "mode": "agent", "taskset": "...", "stages": 2, "stage_names": ["stage-1","stage-2"],
  "model": "...", "replicas": 1, "score_public": false, "owner_login": "...",
- "created_at": "...", "updated_at": "...", "download_available": false}
+ "created_at": "...", "updated_at": "...", "download_available": false, "complete": true}
 ```
-`run_url`、`manifest`、`total_score` 可能不存在。评测未结束时，Worker 会顺便查询 GitHub 上对应的 run（按 run-name 中的 eval_id 匹配），据此粗略估计状态：
+`run_url`、`manifest`、`total_score` 可能不存在。`complete`：这次评测是否跑了题目包的全部阶段（题目包已不存在时不带）；为 `false` 时总分只是已跑阶段的合计，网页不用题目包的总分名称（如“四卡总分”），也不进完整排行榜。评测未结束时，Worker 会顺便查询 GitHub 上对应的 run（按 run-name 中的 eval_id 匹配），据此粗略估计状态：
 - run 排队中 → `queued`
 - 当前 job 名以 `generate`/`run` 开头 → `running:<第一个阶段>`
 - 当前 job 名以 `score`/`publish` 开头 → `scoring`
