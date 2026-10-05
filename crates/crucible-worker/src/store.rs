@@ -198,7 +198,7 @@ const PUBLIC_DONE: &str = "FROM evals e JOIN results r ON r.eval_id = e.eval_id 
      WHERE e.score_public = 1 AND r.status = 'done' AND r.total_score IS NOT NULL \
      AND b.github_id IS NULL AND (t.id IS NULL OR (t.public = 1 AND t.status = 'ready'))";
 
-// ---- statements (shared by the handlers and the KV migration) ----------
+// ---- statements ------------------------------------------------------------
 
 const INSERT_UPLOAD: &str = "INSERT INTO uploads (hash, owner_id, kind, size, created_at) \
      VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT (hash) DO NOTHING";
@@ -370,6 +370,53 @@ impl<B: Backend> Db<'_, B> {
         )
         .await
         .map(drop)
+    }
+
+    // ---- sealed credentials ---------------------------------------------
+
+    /// The sealed credential of an eval; an expired row counts as absent
+    /// (the hourly cron deletes it later).
+    pub async fn cred(&self, eval_id: &str, now: u64) -> R<Option<String>> {
+        let row = self
+            .first(
+                "SELECT envelope FROM creds WHERE eval_id = ?1 AND expires_s > ?2",
+                args![eval_id, now],
+            )
+            .await?;
+        Ok(row.and_then(|r| text(&r, "envelope")))
+    }
+
+    pub async fn put_cred(&self, eval_id: &str, envelope: &str, expires_s: u64) -> R<()> {
+        self.exec(
+            "INSERT INTO creds (eval_id, envelope, expires_s) VALUES (?1, ?2, ?3) \
+             ON CONFLICT (eval_id) DO UPDATE SET envelope = excluded.envelope, \
+             expires_s = excluded.expires_s",
+            args![eval_id, envelope, expires_s],
+        )
+        .await
+        .map(drop)
+    }
+
+    /// Deleting a missing row writes nothing, so callers need not check.
+    pub async fn delete_cred(&self, eval_id: &str) -> R<()> {
+        self.exec("DELETE FROM creds WHERE eval_id = ?1", args![eval_id])
+            .await
+            .map(drop)
+    }
+
+    /// Cron: drops expired credentials and cache entries; returns the
+    /// number of rows deleted.
+    pub async fn purge_expired(&self, now: u64) -> R<u64> {
+        let creds = self
+            .exec("DELETE FROM creds WHERE expires_s <= ?1", args![now])
+            .await?;
+        let cache = self
+            .exec(
+                "DELETE FROM cache WHERE expires_s IS NOT NULL AND expires_s <= ?1",
+                args![now],
+            )
+            .await?;
+        Ok(creds + cache)
     }
 
     // ---- bans -----------------------------------------------------------

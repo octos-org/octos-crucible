@@ -591,8 +591,8 @@ pub fn parse_plugin_result(body: &[u8], id: &str) -> Result<PluginResult, ApiErr
     }
 }
 
-/// D1 `evals`. `manifest` and `download_sha256` are only ever set on
-/// records read from the old KV store (see `/internal/migrate-kv`).
+/// D1 `evals`. `manifest` and `download_sha256` are filled in from the
+/// `results` row (see `with_results`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EvalRecord {
     pub eval_id: String,

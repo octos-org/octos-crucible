@@ -156,6 +156,10 @@ assert.ok(dl.headers.get("location").endsWith(`/releases/download/blobs-${String
 const dlj = await call(`/evals/${evalId}/download`, { token, headers: { accept: "application/json" } });
 assert.equal(dlj.json.url, dl.headers.get("location"));
 
+step("cron (expired credentials)");
+const cron = await fetch(`${W}/__scheduled?cron=${encodeURIComponent("17 * * * *")}`);
+assert.equal(cron.status, 200, await cron.text());
+
 step("ban");
 assert.equal((await call("/admin/ban", { method: "POST", token: admin, body: JSON.stringify({ github_id: 42 }) })).status, 200);
 assert.equal((await call("/me", { token })).json.error.code, "banned");

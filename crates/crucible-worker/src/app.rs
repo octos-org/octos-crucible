@@ -7,8 +7,7 @@ use crate::authz::{self, Principal};
 use crate::config::Config;
 use crate::dispatch;
 use crate::github::{GitHub, RunView, TasksetInfo, UploadOutcome, view_run};
-use crate::http::Stmt;
-use crate::http::{ApiError, Backend, PutOptions, Req, Resp};
+use crate::http::{ApiError, Backend, Req, Resp};
 use crate::keys;
 use crate::leaderboard;
 use crate::model::{
@@ -22,7 +21,7 @@ use crate::model::{
 };
 use crate::session;
 use crate::shard::{release_tag, sha256_hex};
-use crate::store::{self, Claim, Db};
+use crate::store::{Claim, Db};
 use crate::tokens::{self, TokenRecord, TokenSummary};
 use crate::util::{ct_eq, parse_query, query_get, rfc3339};
 use crucible_core::taskset::is_user_taskset_id;
@@ -35,11 +34,6 @@ const LEADERBOARD_TTL_S: u64 = 300;
 const MAX_LISTED_USER_TASKSETS: usize = 50;
 /// How long a run may be finished before missing results count as failure.
 const RESULTS_GRACE_S: u64 = 600;
-/// Old KV prefixes copied by `POST /internal/migrate-kv`, in this order.
-const MIGRATE_PREFIXES: [&str; 5] = ["upload/", "evals/", "tasksets/", "token/", "ban/"];
-/// Keys per migration call: at most 2 KV reads and 2 D1 statements each,
-/// well inside the free plan's per-request limits.
-const MIGRATE_BATCH: usize = 20;
 
 type Result<T> = std::result::Result<T, ApiError>;
 
@@ -184,7 +178,6 @@ impl<'a, B: Backend> App<'a, B> {
             ("DELETE", ["tokens", id]) => self.delete_token(req, id).await,
             ("POST", ["admin", "ban"]) => self.ban(req, true).await,
             ("POST", ["admin", "unban"]) => self.ban(req, false).await,
-            ("POST", ["internal", "migrate-kv"]) => self.migrate_kv(req).await,
             (
                 _,
                 ["auth", ..]
@@ -216,8 +209,8 @@ impl<'a, B: Backend> App<'a, B> {
         self.b.log(&format!("storage error: {e}"));
         let l = e.to_ascii_lowercase();
         if (l.contains("exceed") && l.contains("limit")) || l.contains("quota") {
-            // A daily free-plan quota (D1 rows written, or KV writes for the
-            // credential); resets at 00:00 UTC. Not a bug in the request.
+            // A daily free-plan quota (D1 rows written); resets at 00:00
+            // UTC. Not a bug in the request.
             return ApiError::new(
                 503,
                 "storage_quota",
@@ -251,14 +244,10 @@ impl<'a, B: Backend> App<'a, B> {
         self.db().results(id).await.map_err(|e| self.storage_err(e))
     }
 
-    /// Deletes the sealed credential once the eval is over. Read first: a
-    /// KV delete counts against the daily write quota, and usually the
-    /// workflow has deleted it already.
+    /// Deletes the sealed credential once the eval is over (usually the
+    /// workflow has deleted it already; deleting nothing writes nothing).
     async fn drop_cred(&self, id: &str) {
-        let key = format!("cred/{id}");
-        if let Ok(Some(_)) = self.b.kv_get(&key).await {
-            let _ = self.b.kv_delete(&key).await;
-        }
+        let _ = self.db().delete_cred(id).await;
     }
 
     // ---- auth -----------------------------------------------------------
@@ -1147,17 +1136,11 @@ impl<'a, B: Backend> App<'a, B> {
         };
         if let Some(cred) = &v.cred {
             // Stored exactly as sealed by the page; returned unchanged by
-            // GET /internal/cred/:id. KV, so it expires on its own.
-            let put = self
-                .b
-                .kv_put(
-                    &format!("cred/{}", v.eval_id),
-                    cred,
-                    PutOptions {
-                        ttl: Some(CRED_TTL_S),
-                    },
-                )
-                .await;
+            // GET /internal/cred/:id until it expires.
+            let put = match std::str::from_utf8(cred) {
+                Ok(text) => self.db().put_cred(&v.eval_id, text, now + CRED_TTL_S).await,
+                Err(_) => Err("sealed credential is not UTF-8".to_owned()),
+            };
             if let Err(e) = put {
                 fail(&mut rec);
                 let _ = self.db().save_refresh(&rec).await;
@@ -1173,7 +1156,7 @@ impl<'a, B: Backend> App<'a, B> {
         let (workflow, inputs) = dispatch::inputs(self.cfg, &rec, v.cred.is_some(), &worker_url);
         if let Err(e) = self.gh().dispatch(&workflow, &inputs).await {
             if v.cred.is_some() {
-                let _ = self.b.kv_delete(&format!("cred/{}", rec.eval_id)).await;
+                self.drop_cred(&rec.eval_id).await;
             }
             fail(&mut rec);
             let _ = self.db().save_refresh(&rec).await;
@@ -1348,30 +1331,20 @@ impl<'a, B: Backend> App<'a, B> {
     async fn internal_get_cred(&self, req: &Req, id: &str) -> Result<Resp> {
         let id = self.internal_id(req, id)?;
         let cred = self
-            .b
-            .kv_get(&format!("cred/{id}"))
+            .db()
+            .cred(id, self.b.now_s())
             .await
             .map_err(|e| self.storage_err(e))?
             .ok_or_else(|| ApiError::not_found("no credential for this eval"))?;
-        Ok(Resp::bytes(cred))
+        Ok(Resp::bytes(cred.into_bytes()))
     }
 
     async fn internal_delete_cred(&self, req: &Req, id: &str) -> Result<Resp> {
         let id = self.internal_id(req, id)?;
-        let key = format!("cred/{id}");
-        // Read first: a delete is a KV write even when nothing is there.
-        if self
-            .b
-            .kv_get(&key)
+        self.db()
+            .delete_cred(id)
             .await
-            .map_err(|e| self.storage_err(e))?
-            .is_some()
-        {
-            self.b
-                .kv_delete(&key)
-                .await
-                .map_err(|e| self.storage_err(e))?;
-        }
+            .map_err(|e| self.storage_err(e))?;
         Ok(Resp::empty(204))
     }
 
@@ -1611,147 +1584,13 @@ impl<'a, B: Backend> App<'a, B> {
             &json!({"ok": true, "github_id": body.github_id, "banned": ban}),
         ))
     }
+}
 
-    // ---- one-off KV → D1 migration --------------------------------------
-
-    /// `POST /internal/migrate-kv {"cursor"?}`: copies up to [`MIGRATE_BATCH`]
-    /// records of the old KV store into D1 per call and answers with the
-    /// cursor of the next call (`null` when done). Rows already in D1 are
-    /// kept (`ON CONFLICT DO NOTHING`), so calls can be repeated freely.
-    /// KV is only read.
-    async fn migrate_kv(&self, req: &Req) -> Result<Resp> {
-        #[derive(Deserialize, Default)]
-        #[serde(deny_unknown_fields)]
-        struct Body {
-            #[serde(default)]
-            cursor: Option<String>,
-        }
-        self.internal_auth(req)?;
-        if req.body.len() > 4096 {
-            return Err(ApiError::too_large(4096));
-        }
-        let body: Body = if req.body.iter().all(u8::is_ascii_whitespace) {
-            Body::default()
-        } else {
-            serde_json::from_slice(&req.body)
-                .map_err(|e| ApiError::bad_request(format!("invalid request body: {e}")))?
-        };
-        let bad = || ApiError::bad_request("cursor must come from a previous answer");
-        let cursor = body.cursor.unwrap_or_default();
-        let (stage, kv_cursor) = match cursor.split_once(':') {
-            Some((s, c)) => (s.parse::<usize>().map_err(|_| bad())?, Some(c)),
-            None if cursor.is_empty() => (0, None),
-            None => (cursor.parse::<usize>().map_err(|_| bad())?, None),
-        };
-        let prefix = *MIGRATE_PREFIXES.get(stage).ok_or_else(bad)?;
-        let page = self
-            .b
-            .kv_list(prefix, kv_cursor, MIGRATE_BATCH)
-            .await
-            .map_err(|e| self.storage_err(e))?;
-        let mut stmts = Vec::new();
-        let mut skipped = Vec::new();
-        for k in &page.keys {
-            match self.migration_stmts(prefix, &k.name).await? {
-                Some(mut s) => stmts.append(&mut s),
-                None => skipped.push(k.name.clone()),
-            }
-        }
-        self.db()
-            .batch(&stmts)
-            .await
-            .map_err(|e| self.storage_err(e))?;
-        let next = match page.cursor {
-            Some(c) => Some(format!("{stage}:{c}")),
-            None if stage + 1 < MIGRATE_PREFIXES.len() => Some((stage + 1).to_string()),
-            None => None,
-        };
-        self.b.log(&format!(
-            "migrated {} keys under {prefix}",
-            page.keys.len() - skipped.len()
-        ));
-        Ok(Resp::json(
-            200,
-            &json!({
-                "prefix": prefix,
-                "copied": page.keys.len() - skipped.len(),
-                "skipped": skipped,
-                "next": next,
-            }),
-        ))
-    }
-
-    async fn kv_record<T: for<'de> Deserialize<'de>>(&self, key: &str) -> Result<Option<T>> {
-        let raw = self.b.kv_get(key).await.map_err(|e| self.storage_err(e))?;
-        Ok(raw.and_then(|r| serde_json::from_slice(&r).ok()))
-    }
-
-    /// The D1 inserts for one old KV key; `None` for a key that is not a
-    /// record of that kind (or no longer readable).
-    async fn migration_stmts(&self, prefix: &str, key: &str) -> Result<Option<Vec<Stmt>>> {
-        let name = &key[prefix.len()..];
-        Ok(match prefix {
-            "upload/" if crate::shard::is_hash(name) => self
-                .kv_record::<UploadRecord>(key)
-                .await?
-                .map(|u| vec![store::insert_upload(name, &u)]),
-            "evals/" if is_uuid_v4(name) => {
-                let Some(mut rec) = self.kv_record::<EvalRecord>(key).await? else {
-                    return Ok(None);
-                };
-                // Results: the results key, else what older records kept
-                // inline.
-                let results = match self
-                    .kv_record::<StoredResults>(&format!("results/{name}"))
-                    .await?
-                {
-                    Some(mut r) => {
-                        if r.download_sha256.is_none() {
-                            r.download_sha256.clone_from(&rec.download_sha256);
-                        }
-                        Some(r)
-                    }
-                    None => rec.manifest.take().map(|m| StoredResults {
-                        manifest: m,
-                        download_sha256: rec.download_sha256.clone(),
-                        status: rec.status.clone(),
-                        updated_at: rec.updated_at.clone(),
-                    }),
-                };
-                let mut out = vec![store::insert_eval(&rec)];
-                out.extend(results.map(|r| store::insert_results(name, &r)));
-                Some(out)
-            }
-            "tasksets/" if is_user_taskset_id(name) => self
-                .kv_record::<UserTaskset>(key)
-                .await?
-                .filter(|u| u.id == name)
-                .map(|u| vec![store::insert_taskset(&u)]),
-            "token/" if tokens::is_id(name) => self
-                .kv_record::<TokenRecord>(key)
-                .await?
-                .map(|t| vec![store::insert_token(name, &t)]),
-            "ban/" => {
-                #[derive(Deserialize)]
-                struct Ban {
-                    #[serde(default)]
-                    by: u64,
-                    #[serde(default)]
-                    at: String,
-                    #[serde(default)]
-                    reason: Option<String>,
-                }
-                match (name.parse::<u64>(), self.kv_record::<Ban>(key).await?) {
-                    (Ok(gid), Some(b)) if gid > 0 => Some(vec![store::insert_ban(
-                        gid,
-                        b.by,
-                        &b.at,
-                        b.reason.as_deref(),
-                    )]),
-                    _ => None,
-                }
-            }
-            _ => None,
-        })
+/// Cron Trigger (wrangler.toml `[triggers]`): deletes expired credentials
+/// and cache entries.
+pub async fn scheduled<B: Backend>(b: &B) {
+    match Db(b).purge_expired(b.now_s()).await {
+        Ok(n) => b.log(&format!("cron: purged {n} expired rows")),
+        Err(e) => b.log(&format!("cron: purge failed: {e}")),
     }
 }
