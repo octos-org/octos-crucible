@@ -50,6 +50,10 @@ export interface UserPlugin {
   model?: boolean;
   accepts?: string[];
   selftest?: { status: string; score?: number | null; max?: number | null; detail?: string } | null;
+  /** Review material exists (GET /plugins/:id/review). */
+  reviewable?: boolean;
+  /** Who made it public after the review checklist. */
+  approval?: { by_login: string; at: string; note?: string } | null;
   created_at: string;
   updated_at: string;
 }
@@ -270,4 +274,24 @@ export interface NewApiToken extends ApiToken {
 
 export interface ApiErrorBody {
   error: { code: string; message: string };
+}
+
+/** GET /plugins/:id/review: what an admin reads before making a plugin public. */
+export interface PluginReview {
+  id: string;
+  status: string;
+  review: {
+    files: { path: string; size: number }[];
+    dockerfile: string;
+    texts: { path: string; content: string }[];
+    truncated?: boolean;
+  } | null;
+  approval?: { by_login: string; at: string; note?: string } | null;
+  checklist: string[];
+}
+
+/** The review confirmation of POST /plugins/:id/public. */
+export interface ReviewConfirm {
+  checked: string[];
+  note: string;
 }

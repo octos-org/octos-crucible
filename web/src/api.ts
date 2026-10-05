@@ -14,6 +14,8 @@ import type {
   TaskSet,
   UploadKind,
   UserPlugin,
+  PluginReview,
+  ReviewConfirm,
 } from "./types";
 import type { PublicKeyInfo } from "./crypto";
 import { mockBackend } from "./mock";
@@ -92,7 +94,10 @@ export interface Backend {
   /** Uploaded plugins: own and public (`all`: admins list every one). */
   plugins(all?: boolean): Promise<UserPlugin[]>;
   registerPlugin(upload_hash: string): Promise<{ id: string; status: string }>;
-  setPluginPublic(id: string, on: boolean): Promise<{ id: string; public: boolean }>;
+  /** Making it public needs the review checklist confirmed (admins). */
+  setPluginPublic(id: string, on: boolean, review?: ReviewConfirm): Promise<{ id: string; public: boolean }>;
+  /** Review material (the uploader and admins). */
+  pluginReview(id: string): Promise<PluginReview>;
   createEval(body: CreateEval): Promise<{ eval_id: string }>;
   evals(): Promise<EvalSummary[]>;
   evalDetail(id: string): Promise<EvalDetail>;
@@ -165,12 +170,13 @@ export const httpBackend: Backend = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ upload_hash }),
     }),
-  setPluginPublic: (id, on) =>
+  setPluginPublic: (id, on, review) =>
     json(`/plugins/${enc(id)}/public`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ public: on }),
+      body: JSON.stringify(on && review ? { public: on, review } : { public: on }),
     }),
+  pluginReview: (id) => json(`/plugins/${enc(id)}/review`),
   upload: (kind, sealed) =>
     json("/uploads", {
       method: "POST",

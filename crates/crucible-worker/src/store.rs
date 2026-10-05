@@ -175,6 +175,8 @@ fn plugin_of(r: &Row) -> R<UserPluginRecord> {
         title: text(r, "title"),
         plugin: json_col(r, "plugin"),
         info: json_col(r, "info"),
+        review: json_col(r, "review"),
+        approval: json_col(r, "approval"),
         created_at: text(r, "created_at").unwrap_or_default(),
         updated_at: text(r, "updated_at").unwrap_or_default(),
     })
@@ -654,7 +656,7 @@ impl<B: Backend> Db<'_, B> {
         Ok(self
             .exec(
                 "UPDATE user_plugins SET status = ?2, error = ?3, title = ?4, plugin = ?5, \
-                 info = ?6, updated_at = ?7 WHERE id = ?1 AND status = 'building'",
+                 info = ?6, updated_at = ?7, review = ?8 WHERE id = ?1 AND status = 'building'",
                 args![
                     &u.id,
                     &u.status,
@@ -663,16 +665,26 @@ impl<B: Backend> Db<'_, B> {
                     u.plugin.as_ref().map(json_text),
                     u.info.as_ref().map(json_text),
                     &u.updated_at,
+                    u.review.as_ref().map(json_text),
                 ],
             )
             .await?
             == 1)
     }
 
-    pub async fn set_plugin_public(&self, id: &str, public: bool, at: &str) -> R<()> {
+    /// `approval`: recorded when made public; kept when made private again
+    /// (`None` leaves the column as it is).
+    pub async fn set_plugin_public(
+        &self,
+        id: &str,
+        public: bool,
+        at: &str,
+        approval: Option<&Value>,
+    ) -> R<()> {
         self.exec(
-            "UPDATE user_plugins SET public = ?2, updated_at = ?3 WHERE id = ?1",
-            args![id, public, at],
+            "UPDATE user_plugins SET public = ?2, updated_at = ?3, \
+             approval = COALESCE(?4, approval) WHERE id = ?1",
+            args![id, public, at, approval.map(json_text)],
         )
         .await
         .map(drop)

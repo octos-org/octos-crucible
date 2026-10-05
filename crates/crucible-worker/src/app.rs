@@ -16,8 +16,9 @@ use crate::model::{
     parse_results, status_rank,
 };
 use crate::model::{
-    PL_BUILDING, PL_FAILED, PL_READY, PackResult, PluginResult, TS_FAILED, TS_PACKING, TS_READY,
-    UploadKind, UserPluginRecord, UserTaskset, parse_pack_result, parse_plugin_result,
+    PL_BUILDING, PL_FAILED, PL_READY, PackResult, PluginResult, REVIEW_CHECKLIST, TS_FAILED,
+    TS_PACKING, TS_READY, UploadKind, UserPluginRecord, UserTaskset, parse_pack_result,
+    parse_plugin_result,
 };
 use crate::session;
 use crate::shard::{release_tag, sha256_hex};
@@ -161,6 +162,7 @@ impl<'a, B: Backend> App<'a, B> {
             ("GET", ["plugins"]) => self.list_plugins(req).await,
             ("POST", ["plugins"]) => self.create_plugin(req).await,
             ("GET", ["plugins", id]) => self.get_plugin(req, id).await,
+            ("GET", ["plugins", id, "review"]) => self.get_plugin_review(req, id).await,
             ("POST", ["plugins", id, "public"]) => self.set_plugin_public(req, id).await,
             ("GET", ["internal", "plugins", id]) => self.internal_get_plugin(req, id).await,
             ("POST", ["internal", "plugins", id]) => self.internal_plugin_result(req, id).await,
@@ -835,6 +837,8 @@ impl<'a, B: Backend> App<'a, B> {
             title: None,
             plugin: None,
             info: None,
+            review: None,
+            approval: None,
             created_at: now.clone(),
             updated_at: now,
         };
@@ -876,15 +880,50 @@ impl<'a, B: Backend> App<'a, B> {
         Ok(Resp::json(200, &u.view()))
     }
 
-    /// `POST /plugins/:id/public {"public": bool}` (admins only).
+    /// `GET /plugins/:id/review`: the review material (the uploader and
+    /// admins).
+    async fn get_plugin_review(&self, req: &Req, id: &str) -> Result<Resp> {
+        let p = self.principal(req).await?;
+        let u = self
+            .load_plugin(id)
+            .await?
+            .filter(|u| p.is_admin || u.owner_id == p.github_id)
+            .ok_or_else(|| ApiError::not_found("no such plugin"))?;
+        Ok(Resp::json(
+            200,
+            &json!({
+                "id": u.id,
+                "status": u.status,
+                "review": u.review,
+                "approval": u.approval,
+                "checklist": REVIEW_CHECKLIST,
+            }),
+        ))
+    }
+
+    /// `POST /plugins/:id/public {"public": bool, "review"?: {"checked",
+    /// "note"}}` (admins only). Making it public needs every item of
+    /// [`REVIEW_CHECKLIST`] checked; making it private does not.
     async fn set_plugin_public(&self, req: &Req, id: &str) -> Result<Resp> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Review {
+            checked: Vec<String>,
+            #[serde(default)]
+            note: String,
+        }
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Body {
             public: bool,
+            #[serde(default)]
+            review: Option<Review>,
         }
         let p = self.principal(req).await?;
         authz::require_admin(&p)?;
+        if req.body.len() > 8192 {
+            return Err(ApiError::too_large(8192));
+        }
         let body: Body = serde_json::from_slice(&req.body)
             .map_err(|e| ApiError::bad_request(format!("invalid request body: {e}")))?;
         let u = self
@@ -894,8 +933,36 @@ impl<'a, B: Backend> App<'a, B> {
         if body.public && u.status != PL_READY {
             return Err(ApiError::conflict("only a ready plugin can be made public"));
         }
+        let now = rfc3339(self.b.now_s());
+        let approval = if body.public {
+            let r = body.review.ok_or_else(|| {
+                ApiError::bad_request(format!(
+                    "making a plugin public needs the review: {{\"review\": {{\"checked\": {REVIEW_CHECKLIST:?}, \"note\": \"...\"}}}} (read GET /plugins/{id}/review first)"
+                ))
+            })?;
+            let missing: Vec<&str> = REVIEW_CHECKLIST
+                .iter()
+                .copied()
+                .filter(|c| !r.checked.iter().any(|x| x == c))
+                .collect();
+            if !missing.is_empty() {
+                return Err(ApiError::bad_request(format!(
+                    "review checklist incomplete: {} not checked",
+                    missing.join(", ")
+                )));
+            }
+            Some(json!({
+                "by_id": p.github_id,
+                "by_login": p.login,
+                "at": now,
+                "checked": REVIEW_CHECKLIST,
+                "note": r.note.chars().filter(|c| !c.is_control() || *c == '\n').take(1000).collect::<String>(),
+            }))
+        } else {
+            None
+        };
         self.db()
-            .set_plugin_public(&u.id, body.public, &rfc3339(self.b.now_s()))
+            .set_plugin_public(&u.id, body.public, &now, approval.as_ref())
             .await
             .map_err(|e| self.storage_err(e))?;
         self.b.log(&format!(
@@ -958,6 +1025,7 @@ impl<'a, B: Backend> App<'a, B> {
                 plugin,
                 title,
                 info,
+                review,
             } => {
                 if plugin.blob.sha256 != u.upload_hash {
                     return Err(ApiError::bad_request("plugin.blob must be the upload"));
@@ -965,6 +1033,7 @@ impl<'a, B: Backend> App<'a, B> {
                 u.plugin = Some(*plugin);
                 u.title = Some(title).filter(|t| !t.is_empty());
                 u.info = Some(info);
+                u.review = review;
                 u.status = PL_READY.into();
             }
             PluginResult::Failed(e) => {

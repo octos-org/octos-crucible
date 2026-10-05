@@ -52,7 +52,8 @@ const SCHEMA: &str = concat!(
     include_str!("../migrations/0001_init.sql"),
     include_str!("../migrations/0002_leaderboard.sql"),
     include_str!("../migrations/0003_user_plugins.sql"),
-    include_str!("../migrations/0004_creds.sql")
+    include_str!("../migrations/0004_creds.sql"),
+    include_str!("../migrations/0005_plugin_review.sql")
 );
 
 struct Mock {
@@ -2033,7 +2034,10 @@ fn user_plugins() {
     wrong["blob"]["sha256"] = json!("cd".repeat(32));
     let ready = |p: &Value| {
         json!({"status": "ready", "plugin": p, "title": "keyword", "description": "d",
-        "selftest": {"status": "scored", "score": 1.0, "max": 2.0, "detail": "ok"}})
+        "selftest": {"status": "scored", "score": 1.0, "max": 2.0, "detail": "ok"},
+        "review": {"files": [{"path": "Dockerfile", "size": 40}, {"path": "score.py", "size": 12}],
+                   "dockerfile": "FROM python:3.12-slim\nCOPY score.py /s.py",
+                   "texts": [{"path": "score.py", "content": "print('<b>')"}]}})
     };
     assert_eq!(
         ipost(format!("/internal/plugins/{pid}"), ready(&wrong)).status,
@@ -2103,16 +2107,72 @@ fn user_plugins() {
         200
     );
 
-    // Public: anyone's tasksets may use it.
-    let public = |tok: &str| {
+    // The review material: the uploader and admins, nobody else.
+    let rv = t.as_user("GET", &format!("/plugins/{pid}/review"), &alice, b"");
+    assert_eq!(rv.status, 200);
+    let rv = json_of(&rv);
+    assert_eq!(rv["review"]["texts"][0]["content"], "print('<b>')");
+    assert_eq!(
+        rv["review"]["dockerfile"],
+        "FROM python:3.12-slim\nCOPY score.py /s.py"
+    );
+    assert_eq!(rv["checklist"].as_array().unwrap().len(), 4);
+    assert_eq!(
+        t.as_user("GET", &format!("/plugins/{pid}/review"), &bob, b"")
+            .status,
+        404
+    );
+    assert_eq!(
+        t.as_user("GET", &format!("/plugins/{pid}/review"), &admin, b"")
+            .status,
+        200
+    );
+
+    // Public: anyone's tasksets may use it, after the review checklist.
+    let reviewed = br#"{"public": true, "review": {"checked": ["source", "dockerfile", "detail_leak", "model_use"], "note": "read it"}}"#;
+    let public = |tok: &str| t.as_user("POST", &format!("/plugins/{pid}/public"), tok, reviewed);
+    assert_eq!(public(&alice).status, 403);
+    let r = t.as_user(
+        "POST",
+        &format!("/plugins/{pid}/public"),
+        &admin,
+        br#"{"public": true}"#,
+    );
+    assert_eq!(r.status, 400, "no review");
+    let r = t.as_user(
+        "POST",
+        &format!("/plugins/{pid}/public"),
+        &admin,
+        br#"{"public": true, "review": {"checked": ["source", "dockerfile"]}}"#,
+    );
+    assert_eq!(r.status, 400);
+    assert!(
+        json_of(&r)["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("detail_leak, model_use")
+    );
+    assert_eq!(public(&admin).status, 200);
+    let v = json_of(&t.as_user("GET", &format!("/plugins/{pid}"), &bob, b""));
+    assert_eq!(
+        (
+            v["approval"]["by_id"].as_u64(),
+            v["approval"]["note"].as_str()
+        ),
+        (Some(1), Some("read it"))
+    );
+    // Making it private needs no review; the approval stays on record.
+    assert_eq!(
         t.as_user(
             "POST",
             &format!("/plugins/{pid}/public"),
-            tok,
-            br#"{"public": true}"#,
+            &admin,
+            br#"{"public": false}"#
         )
-    };
-    assert_eq!(public(&alice).status, 403);
+        .status,
+        200
+    );
+    assert_eq!(listed(&bob), Vec::<String>::new());
     assert_eq!(public(&admin).status, 200);
     assert_eq!(listed(&bob), vec![pid.clone()]);
     assert_eq!(
@@ -2138,13 +2198,8 @@ fn user_plugins() {
     );
     assert_eq!(public(&admin).status, 200);
     assert_eq!(
-        t.as_user(
-            "POST",
-            &format!("/plugins/{pid2}/public"),
-            &admin,
-            br#"{"public": true}"#
-        )
-        .status,
+        t.as_user("POST", &format!("/plugins/{pid2}/public"), &admin, reviewed)
+            .status,
         409
     );
 }
