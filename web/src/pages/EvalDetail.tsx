@@ -131,7 +131,7 @@ export function EvalDetailPage({ id }: { id: string }) {
         <p class="muted">{FINAL.has(d.status) ? "没有结果数据。" : "还没有结果，完成第一个阶段后会显示在这里。"}</p>
       ) : (
         <>
-          <Overview replicas={replicas} f={f} />
+          <Overview replicas={replicas} f={f} complete={d.complete !== false} />
           <StageTable replicas={replicas} f={f} />
           {replicas.map((r) => (
             <ReplicaCard r={r} f={f} />
@@ -143,7 +143,7 @@ export function EvalDetailPage({ id }: { id: string }) {
   );
 }
 
-function Overview({ replicas, f }: { replicas: ReplicaEntry[]; f: Formats }) {
+function Overview({ replicas, f, complete }: { replicas: ReplicaEntry[]; f: Formats; complete: boolean }) {
   const totals: ReplicaTotals[] = replicas.map((r) => replicaTotals(r, f.aggregate));
   const score = summarize(totals.map((t) => t.score));
   const wall = summarize(totals.map((t) => t.wall_s));
@@ -158,10 +158,16 @@ function Overview({ replicas, f }: { replicas: ReplicaEntry[]; f: Formats }) {
     <Card title={n > 1 ? `总览（${n} 遍）` : "总览"}>
       <div class="tiles">
         <Tile
-          label={f.total.name || "总分"}
+          label={complete ? f.total.name || "总分" : "已跑阶段合计"}
           s={score}
           fmt={(x) => fmtValue(f.total, x)}
-          note={score && score.n < n ? `${score.n}/${n} 遍完整打分` : undefined}
+          note={
+            !complete
+              ? "只跑了部分阶段，不计入排行榜"
+              : score && score.n < n
+                ? `${score.n}/${n} 遍完整打分`
+                : undefined
+          }
         />
         <Tile label="用时" s={wall} fmt={fmtDuration} />
         <Tile label="token" s={tokens} fmt={fmtCount} note={reqs ? `请求 ${fmtMeanStd(reqs, fmtCount)}` : undefined} />

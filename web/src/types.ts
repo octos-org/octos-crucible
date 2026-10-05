@@ -93,6 +93,8 @@ export interface EvalDetail {
   status: string;
   run_url?: string | null;
   manifest?: Partial<Manifest> | null;
+  /** Ran every stage of the taskset; absent when the taskset is unknown. */
+  complete?: boolean;
 }
 
 // --- crucible-core::manifest ---
@@ -242,7 +244,10 @@ export interface Leaderboard {
   /** Total's display (newest public eval's snapshot); absent = 0–1 ratio. */
   display?: ScoreFormat | null;
   stage_display?: ScoreFormat | null;
+  /** Evals that ran every stage of the taskset. */
   entries: LeaderboardEntry[];
+  /** Evals that ran only some stages, one group per set of stages. */
+  partial?: { stages: string[]; entries: LeaderboardEntry[] }[];
 }
 
 /** A personal API token for the command line (GET /tokens). */

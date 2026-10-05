@@ -5,6 +5,11 @@
 //! each (owner, agent name) the best one counts, by the direction of the
 //! taskset's display (`higher`: the largest total, `lower`: the smallest);
 //! ties go to the earlier eval, and equal totals share a rank.
+//!
+//! The main board only ranks evals that ran every stage of the taskset; the
+//! taskset's display (e.g. its total's name) describes those. Evals that ran
+//! only some stages (an app-mode eval of one stage, an agent eval of the
+//! first N) are ranked separately, one group per set of stages run.
 
 use crucible_core::Manifest;
 use crucible_core::taskset::{Direction, ScoreFormat};
@@ -27,6 +32,8 @@ pub struct Candidate {
     pub total_score: f64,
     pub created_at: String,
     pub created_s: u64,
+    /// Stages the eval ran.
+    pub stage_names: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -65,6 +72,17 @@ pub struct Board {
     pub display: Option<ScoreFormat>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage_display: Option<ScoreFormat>,
+    /// Evals that ran every stage.
+    pub entries: Vec<Entry>,
+    /// Evals that ran only some stages, grouped by the stages run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub partial: Vec<PartialGroup>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PartialGroup {
+    /// The stages these evals ran, in taskset order.
+    pub stages: Vec<String>,
     pub entries: Vec<Entry>,
 }
 
@@ -86,6 +104,42 @@ fn better(a: &Candidate, b: &Candidate, dir: Direction) -> bool {
         .then_with(|| b.created_s.cmp(&a.created_s))
         .then_with(|| b.eval_id.cmp(&a.eval_id))
         .is_gt()
+}
+
+/// Splits candidates into those that ran every stage of `all` (the
+/// taskset's stages; `None` when unknown: all count as complete) and groups
+/// of those that ran the same subset, ordered by the taskset's stage order.
+#[allow(clippy::type_complexity)]
+pub fn split(
+    cands: Vec<Candidate>,
+    all: Option<&[String]>,
+) -> (Vec<Candidate>, Vec<(Vec<String>, Vec<Candidate>)>) {
+    let Some(all) = all else {
+        return (cands, Vec::new());
+    };
+    let (mut complete, mut groups) = (Vec::new(), Vec::<(Vec<String>, Vec<Candidate>)>::new());
+    for c in cands {
+        if all.iter().all(|s| c.stage_names.contains(s)) {
+            complete.push(c);
+            continue;
+        }
+        let key: Vec<String> = all
+            .iter()
+            .filter(|s| c.stage_names.contains(s))
+            .cloned()
+            .collect();
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, g)) => g.push(c),
+            None => groups.push((key, vec![c])),
+        }
+    }
+    let pos = |k: &[String]| -> Vec<usize> {
+        k.iter()
+            .map(|s| all.iter().position(|a| a == s).unwrap_or(usize::MAX))
+            .collect()
+    };
+    groups.sort_by_key(|(k, _)| pos(k));
+    (complete, groups)
 }
 
 /// The best candidate of each (owner, agent), best first, with ranks
@@ -188,7 +242,41 @@ mod tests {
             total_score: score,
             created_at: String::new(),
             created_s: at,
+            stage_names: vec!["s1".into(), "s2".into()],
         }
+    }
+
+    #[test]
+    fn split_by_stages_run() {
+        let all: Vec<String> = vec!["s1".into(), "s2".into(), "s3".into()];
+        let with = |id: &str, st: &[&str]| Candidate {
+            stage_names: st.iter().map(|s| s.to_string()).collect(),
+            ..c(id, 1, "x", 1.0, 0)
+        };
+        let cands = vec![
+            with("full", &["s1", "s2", "s3"]),
+            with("only3", &["s3"]),
+            with("first2", &["s1", "s2"]),
+            with("only1", &["s1"]),
+            with("only3b", &["s3"]),
+        ];
+        let (full, groups) = split(cands.clone(), Some(&all));
+        assert_eq!(full.len(), 1);
+        let g: Vec<(Vec<String>, Vec<&str>)> = groups
+            .iter()
+            .map(|(k, v)| (k.clone(), v.iter().map(|c| c.eval_id.as_str()).collect()))
+            .collect();
+        let v = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            g,
+            [
+                (v(&["s1"]), vec!["only1"]),
+                (v(&["s1", "s2"]), vec!["first2"]),
+                (v(&["s3"]), vec!["only3", "only3b"]),
+            ]
+        );
+        // Unknown taskset: nothing is split off.
+        assert_eq!(split(cands, None).0.len(), 5);
     }
 
     fn ids(v: &[(u32, Candidate)]) -> Vec<(u32, &str)> {
