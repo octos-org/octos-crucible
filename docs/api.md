@@ -101,6 +101,24 @@ GitHub 回调。换取 token、读取用户之后，用户的 GitHub token 立�
 - `stages`：每阶段在各遍之间的平均分（没有一遍打出分时为 `null`）和满分；`replicas` 为遍数；`wall_s` / `cost_usd` 为每遍各阶段之和的平均，有一遍价格未知时 `cost_usd` 为 `null`。`model` 在 app 模式未填时为 `null`。
 - 名称不合法 → 404；没有公开成绩 → `entries: []`。题目包已不存在（查不到阶段列表）时全部视为完整评测。
 
+## 配额
+
+每个用户的用量直接从现有表统计（过去 24 小时滑动窗口；进行中的评测按未结束的状态），超限的请求返回 `429 quota_exceeded`，错误信息（中英文）写明哪一项、上限、已用、何时恢复（最早一次用量移出 24 小时窗口的时刻，UTC；进行中的评测数则是"进行中的评测结束一个后"）。
+
+| 项 | 默认 | 检查于 |
+|---|---|---|
+| `uploads_per_day` | 50 | `POST /uploads`（重传自己已上传的同一份不计） |
+| `upload_bytes_per_day` | 500 MiB | `POST /uploads`（加上本次大小） |
+| `evals_running` | 3 | `POST /evals` |
+| `evals_per_day` | 20 | `POST /evals` |
+| `plugins_per_day` | 10 | `POST /plugins` |
+| `tasksets_per_day` | 10 | `POST /tasksets` |
+
+默认值在 `wrangler.toml` 的 `QUOTA_*`（如 `QUOTA_EVALS_RUNNING`）。管理员默认豁免；管理员可按用户覆盖任一项或豁免（D1 表 `quotas`，见“管理”）。
+
+### `GET /quota`
+→ `{"github_id", "exempt": bool, "window_s": 86400, "items": [{"name", "description", "limit", "used", "remaining", "frees_at"?}]}`。`frees_at`：最早一次计入的用量移出窗口的时刻。网页在提交评测、上传题目包、上传插件处显示剩余额度；命令行 `crucible quota`。
+
 ## 用户上传的题目包
 
 zip 的格式同 `tasksets/hello-world/source`（`source.json` + 各阶段目录），检查规则即 `crucible taskset validate`：格式（未知字段拒绝）、阶段 id、每阶段的输入与测试都存在且不重叠、无符号链接、各阶段限时之和 ≤ 总限时 ≤ 18000 s、插件只能是注册表里 `user: true` 的，或上传者能用的上传插件（`u-...`，见下节）。命令行：`crucible taskset upload <zip 或目录> --wait`。
@@ -222,7 +240,7 @@ manifest（`schema: 2`）的阶段分数 `replicas[].stages[].score` 是 result 
  "model": "...", "replicas": 1, "score_public": false, "owner_login": "...",
  "created_at": "...", "updated_at": "...", "download_available": false, "complete": true}
 ```
-`run_url`、`manifest`、`total_score` 可能不存在。`complete`：这次评测是否跑了题目包的全部阶段（题目包已不存在时不带）；为 `false` 时总分只是已跑阶段的合计，网页不用题目包的总分名称（如“四卡总分”），也不进完整排行榜。评测未结束时，Worker 会顺便查询 GitHub 上对应的 run（按 run-name 中的 eval_id 匹配），据此粗略估计状态：
+`run_url`、`manifest`、`total_score` 可能不存在。被平台判定卡住而标为失败的评测另有 `error`（原因，见“定时清理”）。`complete`：这次评测是否跑了题目包的全部阶段（题目包已不存在时不带）；为 `false` 时总分只是已跑阶段的合计，网页不用题目包的总分名称（如“四卡总分”），也不进完整排行榜。评测未结束时，Worker 会顺便查询 GitHub 上对应的 run（按 run-name 中的 eval_id 匹配），据此粗略估计状态：
 - run 排队中 → `queued`
 - 当前 job 名以 `generate`/`run` 开头 → `running:<第一个阶段>`
 - 当前 job 名以 `score`/`publish` 开头 → `scoring`
@@ -285,17 +303,18 @@ workflow 通过 `/internal/status` 上报的精确状态优先。估计值只能
 
 ### D1（绑定名 `CRUCIBLE_DB`，数据库 `octos-crucible`）
 
-表结构见 `crates/crucible-worker/migrations/`（`0001_init.sql` … `0004_creds.sql`，`wrangler d1 migrations apply` 按序执行）。
+表结构见 `crates/crucible-worker/migrations/`（`0001_init.sql` … `0006_quotas.sql`，`wrangler d1 migrations apply` 按序执行）。
 
 | 表 | 内容 | 索引 |
 |---|---|---|
 | `uploads` | 主键 `hash`；`owner_id, kind, size, created_at` | 主键 |
-| `evals` | 主键 `eval_id`；提交参数、`status`、`run_id`、`run_url`、`run_completed_s`、时间 | `(owner_id, created_s DESC)`（本人列表）、`(created_s DESC)`（管理员 `?all=1`）、`(taskset, created_s DESC) WHERE score_public = 1`（排行榜） |
+| `evals` | 主键 `eval_id`；提交参数、`status`、`run_id`、`run_url`、`run_completed_s`、时间、`error`（平台判定卡住时的原因） | `(owner_id, created_s DESC)`（本人列表、配额）、`(created_s DESC)`（管理员 `?all=1`）、`(taskset, created_s DESC) WHERE score_public = 1`（排行榜）、`(status, updated_at)`（定时清理） |
 | `results` | 主键 `eval_id`；`manifest`（JSON）、`download_sha256`、`status`、`total_score`、`display`、`updated_at` | 主键（列表 JOIN） |
 | `user_tasksets` | 主键 `id`；用户题目包 | `(owner_id)`、`(public, status)` |
 | `user_plugins` | 主键 `id`；用户插件：`status`、`public`、`title`、`plugin`（固定形式 JSON）、`info`（说明与自检结果）、`review`（审核材料 JSON）、`approval`（设为公开时的审核记录 JSON） | `(owner_id)`、`(public, status)` |
 | `tokens` | 主键 `id`；`owner_id, login, name, hash, created_at`（hash = SHA-256(令牌)） | `(owner_id)` |
 | `bans` | 主键 `github_id`；`by_id, at, reason` | 主键 |
+| `quotas` | 主键 `github_id`；各项覆盖值（空 = 默认）、`exempt`（空 = 管理员豁免、其他人不豁免；1 豁免；0 不豁免，管理员也不豁免）、`by_id, at` | 主键 |
 | `cache` | 主键 `key`；`tasksets`、`leaderboard`、`leaderboard/<题目包>`（5 分钟）、`release/<tag>`（不过期） | 主键 |
 | `creds` | 主键 `eval_id`；`envelope`（凭据 envelope 字节的标准 base64）、`expires_s`（提交时 + 24 小时）。读时过期即视为不存在；run 结束时删除 | `(expires_s)`（Cron 清理） |
 
@@ -305,7 +324,11 @@ workflow 通过 `/internal/status` 上报的精确状态优先。估计值只能
 
 ### 定时清理（Cron Trigger）
 
-`wrangler.toml` 的 `[triggers] crons = ["17 * * * *"]`：每小时一次，删除 `creds` 与 `cache` 中已过期的行，日志写 `cron: purged N expired rows`。
+`wrangler.toml` 的 `[triggers] crons = ["17 * * * *"]`：每小时一次：
+
+1. 删除 `creds` 与 `cache` 中已过期的行，日志写 `cron: purged N expired rows`。
+2. 卡住的登记：创建超过 `STUCK_REGISTRATION_S`（默认 2 小时）仍是 `packing` 的题目包、`building` 的插件标为 `failed`，`error` 写明"打包/构建超时（N 小时内没有收到结果），请重新上传"。
+3. 卡住的评测：未结束、且超过 1 小时没有任何更新（记录和结果都没动）的评测，每次最多 15 个，先按 `GET /evals/:id` 同样的逻辑查 GitHub run（run 已结束的照常收尾）；仍未结束的，若找不到 run 且已超过 `STUCK_REGISTRATION_S`，或提交已超过 `STUCK_EVAL_S`（默认 30 小时），标为 `failed`，原因写入 `evals.error`（网页详情和 `crucible status` 显示），并删除残留凭据。
 
 Worker 不再使用 Workers KV（免费版每天 1000 次写入，曾因此整天无法提交）。带凭据的评测额外写 D1 2 行（写入 + 删除）。
 
@@ -313,6 +336,8 @@ Worker 不再使用 Workers KV（免费版每天 1000 次写入，曾因此整�
 
 - `POST /admin/ban`：`{"github_id": 123, "reason"?: "..."}` → `{"ok":true,"github_id":123,"banned":true}`。只有管理员能调用；不能封禁管理员。
 - `POST /admin/unban`：`{"github_id": 123}` → `{"ok":true,"github_id":123,"banned":false}`。
+- `GET /admin/quotas/:github_id` → 该用户的 `GET /quota` 视图，另带 `override`（覆盖行）。
+- `PUT /admin/quotas/:github_id`：`{"evals_per_day"?: n|null, ...各项, "exempt"?: true|false|null}`，整行替换（缺省或 null = 用默认）；`{}` 删除覆盖。→ 同 GET。管理员接口只接受网页会话，不接受命令行令牌。
 
 管理员名单来自环境变量 `ADMIN_GITHUB_IDS`。
 
@@ -333,6 +358,8 @@ Worker 不再使用 Workers KV（免费版每天 1000 次写入，曾因此整�
 | `GITHUB_TOKEN` | secret | 细粒度 token，只授权本仓库 |
 | `SESSION_HMAC_KEY` | secret | ≥ 32 字节随机值 |
 | `CRUCIBLE_WORKER_TOKEN` | secret | ≥ 32 个字符；Actions 里存同一个值 |
+| `QUOTA_UPLOADS_PER_DAY`、`QUOTA_UPLOAD_BYTES_PER_DAY`、`QUOTA_EVALS_RUNNING`、`QUOTA_EVALS_PER_DAY`、`QUOTA_PLUGINS_PER_DAY`、`QUOTA_TASKSETS_PER_DAY` | var，可选 | 每个用户的默认配额（见“配额”），缺省 50 / 500 MiB / 3 / 20 / 10 / 10 |
+| `STUCK_REGISTRATION_S`、`STUCK_EVAL_S` | var，可选 | 定时清理的时限（秒，≥ 600），缺省 7200 / 108000 |
 | `DEV_AUTH`、`GITHUB_API_BASE`、`GITHUB_WEB_BASE` | 仅本地 | 开启 dev-login，并把 GitHub 指向 mock；只对 localhost 的请求生效，生产环境不要设置 |
 
 配置缺失或格式不对时，所有请求都返回 500 `internal`，日志里只写出有问题的配置名，不写值。

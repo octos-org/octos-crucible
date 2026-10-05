@@ -114,6 +114,7 @@ export function EvalDetailPage({ id }: { id: string }) {
         )}
       </dl>
 
+      {d.error && <p class="notice bad">{d.error}</p>}
       {d.status === "done" && m.download && (
         <Card title="下载产出">
           <p class="muted small">

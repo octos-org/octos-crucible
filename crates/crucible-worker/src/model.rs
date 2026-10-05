@@ -718,6 +718,9 @@ pub struct EvalRecord {
     #[serde(default)]
     pub download_sha256: Option<String>,
     pub updated_at: String,
+    /// Why the platform failed it (the hourly sweep), if it did.
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 /// D1 `results`: what the workflow posted to `POST /internal/results`.

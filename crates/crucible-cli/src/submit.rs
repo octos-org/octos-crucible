@@ -566,6 +566,50 @@ pub async fn status_cmd(a: StatusArgs) -> Result<()> {
     Ok(())
 }
 
+#[derive(clap::Args)]
+pub struct QuotaArgs {
+    #[command(flatten)]
+    pub api: ApiArgs,
+    /// Print the raw GET /quota JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// `crucible quota`: your limits, what you used and what is left.
+pub async fn quota_cmd(a: QuotaArgs) -> Result<()> {
+    let api = Api::new(&a.api)?;
+    let q = api.ok_json(Method::GET, "/quota", &[], None).await?;
+    if a.json {
+        println!("{}", serde_json::to_string_pretty(&q)?);
+    } else {
+        print!("{}", render_quota(&q));
+    }
+    Ok(())
+}
+
+pub fn render_quota(q: &Value) -> String {
+    let mut out = String::new();
+    if q["exempt"] == true {
+        out += "exempt from quotas (limits below are not enforced)\n";
+    }
+    out += &format!(
+        "{:<22} {:>12} {:>12} {:>12}  {}\n",
+        "quota", "limit", "used", "remaining", "frees at (UTC)"
+    );
+    for i in q["items"].as_array().into_iter().flatten() {
+        let n = |k: &str| i[k].as_u64().map_or("-".to_owned(), |v| v.to_string());
+        out += &format!(
+            "{:<22} {:>12} {:>12} {:>12}  {}\n",
+            i["name"].as_str().unwrap_or("?"),
+            n("limit"),
+            n("used"),
+            n("remaining"),
+            i["frees_at"].as_str().unwrap_or("")
+        );
+    }
+    out
+}
+
 // ---- uploaded tasksets and plugins ------------------------------------------
 
 /// What `crucible plugin` / `crucible taskset upload` registers.
@@ -786,6 +830,9 @@ pub fn render(d: &Value) -> String {
     );
     if let Some(u) = d["run_url"].as_str() {
         out += &format!("run    {u}\n");
+    }
+    if let Some(e) = d["error"].as_str() {
+        out += &format!("error  {e}\n");
     }
     let empty = vec![];
     let replicas = d["manifest"]["replicas"].as_array().unwrap_or(&empty);

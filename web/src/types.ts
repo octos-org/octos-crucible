@@ -96,6 +96,8 @@ export interface EvalDetail {
   eval_id: string;
   status: string;
   run_url?: string | null;
+  /** Why the platform failed it (e.g. no result long after submission). */
+  error?: string | null;
   manifest?: Partial<Manifest> | null;
   /** Ran every stage of the taskset; absent when the taskset is unknown. */
   complete?: boolean;
@@ -294,4 +296,21 @@ export interface PluginReview {
 export interface ReviewConfirm {
   checked: string[];
   note: string;
+}
+
+/** GET /quota: per-user limits (docs/api.md "配额"). */
+export interface QuotaItem {
+  name: string;
+  description: string;
+  limit: number;
+  used: number;
+  remaining: number;
+  /** When the oldest counted use leaves the 24-hour window. */
+  frees_at?: string;
+}
+
+export interface Quota {
+  exempt: boolean;
+  window_s: number;
+  items: QuotaItem[];
 }

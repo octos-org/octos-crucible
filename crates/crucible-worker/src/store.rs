@@ -14,7 +14,9 @@ use crate::model::{
     Budget, EvalRecord, EvalSummary, Mode, StoredResults, UploadKind, UploadRecord,
     UserPluginRecord, UserTaskset, score_of, shown_status,
 };
+use crate::quota::{DAY_S, Override, Usage, Used};
 use crate::tokens::{TokenRecord, TokenSummary};
+use crate::util::{parse_rfc3339, rfc3339};
 use crucible_core::taskset::ScoreFormat;
 
 type R<T> = Result<T, String>;
@@ -133,6 +135,7 @@ fn eval_of(r: &Row) -> R<EvalRecord> {
         manifest: None,
         download_sha256: None,
         updated_at: need(text(r, "updated_at"), t, "updated_at")?,
+        error: text(r, "error"),
     })
 }
 
@@ -419,6 +422,186 @@ impl<B: Backend> Db<'_, B> {
             )
             .await?;
         Ok(creds + cache)
+    }
+
+    // ---- quotas ---------------------------------------------------------
+
+    pub async fn quota_override(&self, github_id: u64) -> R<Option<Override>> {
+        let Some(r) = self
+            .first(
+                "SELECT * FROM quotas WHERE github_id = ?1",
+                args![github_id],
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Override {
+            uploads_per_day: uint(&r, "uploads_per_day"),
+            upload_bytes_per_day: uint(&r, "upload_bytes_per_day"),
+            evals_running: uint(&r, "evals_running"),
+            evals_per_day: uint(&r, "evals_per_day"),
+            plugins_per_day: uint(&r, "plugins_per_day"),
+            tasksets_per_day: uint(&r, "tasksets_per_day"),
+            exempt: int(&r, "exempt").map(|v| v == 1),
+        }))
+    }
+
+    /// Replaces a user's override row; an empty override deletes it.
+    pub async fn set_quota_override(
+        &self,
+        github_id: u64,
+        o: &Override,
+        by: u64,
+        at: &str,
+    ) -> R<()> {
+        if o.is_empty() {
+            return self
+                .exec("DELETE FROM quotas WHERE github_id = ?1", args![github_id])
+                .await
+                .map(drop);
+        }
+        self.exec(
+            "INSERT INTO quotas (github_id, uploads_per_day, upload_bytes_per_day, evals_running, \
+             evals_per_day, plugins_per_day, tasksets_per_day, exempt, by_id, at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+             ON CONFLICT (github_id) DO UPDATE SET uploads_per_day = excluded.uploads_per_day, \
+             upload_bytes_per_day = excluded.upload_bytes_per_day, \
+             evals_running = excluded.evals_running, evals_per_day = excluded.evals_per_day, \
+             plugins_per_day = excluded.plugins_per_day, \
+             tasksets_per_day = excluded.tasksets_per_day, exempt = excluded.exempt, \
+             by_id = excluded.by_id, at = excluded.at",
+            args![
+                github_id,
+                o.uploads_per_day,
+                o.upload_bytes_per_day,
+                o.evals_running,
+                o.evals_per_day,
+                o.plugins_per_day,
+                o.tasksets_per_day,
+                o.exempt,
+                by,
+                at,
+            ],
+        )
+        .await
+        .map(drop)
+    }
+
+    /// What a user has used: the last 24 hours (from `now`), and the evals
+    /// not settled. One query.
+    pub async fn usage(&self, github_id: u64, now: u64) -> R<Usage> {
+        let since_s = now.saturating_sub(DAY_S);
+        let since = rfc3339(since_s);
+        let r = self
+            .first(
+                "SELECT \
+                 (SELECT COUNT(*) FROM uploads WHERE owner_id = ?1 AND created_at > ?2) AS up_n, \
+                 (SELECT COALESCE(SUM(size), 0) FROM uploads WHERE owner_id = ?1 AND created_at > ?2) AS up_b, \
+                 (SELECT MIN(created_at) FROM uploads WHERE owner_id = ?1 AND created_at > ?2) AS up_t, \
+                 (SELECT COUNT(*) FROM evals e LEFT JOIN results r ON r.eval_id = e.eval_id \
+                   WHERE e.owner_id = ?1 AND e.status NOT IN ('done', 'failed') \
+                   AND (r.status IS NULL OR r.status NOT IN ('done', 'failed'))) AS ev_run, \
+                 (SELECT COUNT(*) FROM evals WHERE owner_id = ?1 AND created_s > ?3) AS ev_n, \
+                 (SELECT MIN(created_s) FROM evals WHERE owner_id = ?1 AND created_s > ?3) AS ev_t, \
+                 (SELECT COUNT(*) FROM user_plugins WHERE owner_id = ?1 AND created_at > ?2) AS pl_n, \
+                 (SELECT MIN(created_at) FROM user_plugins WHERE owner_id = ?1 AND created_at > ?2) AS pl_t, \
+                 (SELECT COUNT(*) FROM user_tasksets WHERE owner_id = ?1 AND created_at > ?2) AS ts_n, \
+                 (SELECT MIN(created_at) FROM user_tasksets WHERE owner_id = ?1 AND created_at > ?2) AS ts_t",
+                args![github_id, since, since_s],
+            )
+            .await?
+            .unwrap_or_default();
+        let frees = |t: Option<u64>| t.map(|t| t + DAY_S);
+        let at = |c: &str| frees(text(&r, c).as_deref().and_then(parse_rfc3339));
+        let n = |c: &str| uint(&r, c).unwrap_or(0);
+        Ok(Usage([
+            Used {
+                used: n("up_n"),
+                frees_at: at("up_t"),
+            },
+            Used {
+                used: n("up_b"),
+                frees_at: at("up_t"),
+            },
+            Used {
+                used: n("ev_run"),
+                frees_at: None,
+            },
+            Used {
+                used: n("ev_n"),
+                frees_at: frees(uint(&r, "ev_t")),
+            },
+            Used {
+                used: n("pl_n"),
+                frees_at: at("pl_t"),
+            },
+            Used {
+                used: n("ts_n"),
+                frees_at: at("ts_t"),
+            },
+        ]))
+    }
+
+    // ---- the sweep (hourly cron) ----------------------------------------
+
+    /// Fails taskset and plugin registrations still unsettled `older` than
+    /// their creation; returns how many.
+    pub async fn fail_stuck_registrations(&self, now: u64, older: u64) -> R<u64> {
+        let before = rfc3339(now.saturating_sub(older));
+        let at = rfc3339(now);
+        let hours = older / 3600;
+        let ts = self
+            .exec(
+                "UPDATE user_tasksets SET status = 'failed', error = ?3, updated_at = ?2 \
+                 WHERE status = 'packing' AND created_at < ?1",
+                args![
+                    &before,
+                    &at,
+                    format!("packing timed out: no result from the packing workflow within {hours} h; please upload again / 打包超时（{hours} 小时内没有收到结果），请重新上传")
+                ],
+            )
+            .await?;
+        let pl = self
+            .exec(
+                "UPDATE user_plugins SET status = 'failed', error = ?3, updated_at = ?2 \
+                 WHERE status = 'building' AND created_at < ?1",
+                args![
+                    &before,
+                    &at,
+                    format!("building timed out: no result from the build workflow within {hours} h; please upload again / 构建超时（{hours} 小时内没有收到结果），请重新上传")
+                ],
+            )
+            .await?;
+        Ok(ts + pl)
+    }
+
+    /// Evals not settled (neither the record nor posted results) whose last
+    /// update is before `before`, oldest first.
+    pub async fn unsettled_evals(&self, before: &str, limit: usize) -> R<Vec<EvalRecord>> {
+        let rows = self
+            .rows(
+                "SELECT e.* FROM evals e LEFT JOIN results r ON r.eval_id = e.eval_id \
+                 WHERE e.status NOT IN ('done', 'failed') \
+                 AND (r.status IS NULL OR r.status NOT IN ('done', 'failed')) \
+                 AND e.updated_at < ?1 AND (r.updated_at IS NULL OR r.updated_at < ?1) \
+                 ORDER BY e.updated_at LIMIT ?2",
+                args![before, limit as u64],
+            )
+            .await?;
+        rows.iter().map(eval_of).collect()
+    }
+
+    /// Fails an eval that has not settled, with the reason; false if it had.
+    pub async fn fail_eval(&self, id: &str, error: &str, at: &str) -> R<bool> {
+        Ok(self
+            .exec(
+                "UPDATE evals SET status = 'failed', error = ?2, updated_at = ?3 \
+                 WHERE eval_id = ?1 AND status NOT IN ('done', 'failed')",
+                args![id, error, at],
+            )
+            .await?
+            == 1)
     }
 
     // ---- bans -----------------------------------------------------------

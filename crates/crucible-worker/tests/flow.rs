@@ -53,7 +53,8 @@ const SCHEMA: &str = concat!(
     include_str!("../migrations/0002_leaderboard.sql"),
     include_str!("../migrations/0003_user_plugins.sql"),
     include_str!("../migrations/0004_creds.sql"),
-    include_str!("../migrations/0005_plugin_review.sql")
+    include_str!("../migrations/0005_plugin_review.sql"),
+    include_str!("../migrations/0006_quotas.sql")
 );
 
 struct Mock {
@@ -1198,7 +1199,7 @@ fn cred_expires_after_a_day() {
     t.mock.now.set(NOW + 86_400);
     assert_eq!(t.as_user("GET", &path, WORKER_TOKEN, b"").status, 404);
     assert_eq!(t.mock.count("SELECT COUNT(*) FROM creds"), 1);
-    block_on(crucible_worker::app::scheduled(&t.mock));
+    block_on(crucible_worker::app::scheduled(&t.mock, None));
     assert_eq!(t.mock.count("SELECT COUNT(*) FROM creds"), 0);
 }
 
@@ -2201,5 +2202,246 @@ fn user_plugins() {
         t.as_user("POST", &format!("/plugins/{pid2}/public"), &admin, reviewed)
             .status,
         409
+    );
+}
+
+#[test]
+fn quotas() {
+    let t = T::new();
+    let alice = token(42, "octocat");
+    let admin = token(1, "admin");
+    let id = |n: u8| format!("{n:08x}-1f3c-4d2a-9e8b-7c6d5e4f3a21");
+    let q = |tok: &str| json_of(&t.as_user("GET", "/quota", tok, b""));
+    let item = |v: &Value, name: &str| {
+        v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["name"] == name)
+            .unwrap()
+            .clone()
+    };
+    let v = q(&alice);
+    assert_eq!(v["exempt"], false);
+    assert_eq!(item(&v, "evals_running")["limit"], 3);
+    assert_eq!(item(&v, "evals_running")["remaining"], 3);
+    assert_eq!(q(&admin)["exempt"], true);
+
+    // Only admins (by session) set overrides.
+    let set = |tok: &str, gid: u64, body: &str| {
+        t.as_user("PUT", &format!("/admin/quotas/{gid}"), tok, body.as_bytes())
+    };
+    assert_eq!(set(&alice, 42, "{}").status, 403);
+    assert_eq!(
+        set(&admin, 42, r#"{"evals_running": 1, "bogus": 1}"#).status,
+        400
+    );
+    let r = set(&admin, 42, r#"{"evals_running": 1, "evals_per_day": 2}"#);
+    assert_eq!(r.status, 200);
+    assert_eq!(item(&json_of(&r), "evals_running")["limit"], 1);
+
+    let submit = |n: u8| {
+        let hash = json_of(&upload_as(&t, &alice, &sealed(&[b's', n])))["hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let eval = json!({
+            "mode": "app", "eval_id": id(n), "upload_hash": hash, "taskset": "github-full",
+            "stages": 1, "score_public": false, "consent": true
+        });
+        t.as_user(
+            "POST",
+            "/evals",
+            &alice,
+            &serde_json::to_vec(&eval).unwrap(),
+        )
+    };
+    assert_eq!(submit(1).status, 201);
+    // One in progress: the second waits.
+    let r = submit(2);
+    assert_eq!((r.status, err_code(&r).as_str()), (429, "quota_exceeded"));
+    let msg = json_of(&r)["error"]["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        msg.contains("evals_running") && msg.contains("limit 1"),
+        "{msg}"
+    );
+    assert_eq!(item(&q(&alice), "evals_running")["remaining"], 0);
+    // Settled: the next may start; then the daily limit (2) is reached.
+    let r = t.as_user(
+        "POST",
+        &format!("/internal/status/{}", id(1)),
+        WORKER_TOKEN,
+        br#"{"status": "failed"}"#,
+    );
+    assert_eq!(r.status, 200);
+    assert_eq!(submit(3).status, 201);
+    t.as_user(
+        "POST",
+        &format!("/internal/status/{}", id(3)),
+        WORKER_TOKEN,
+        br#"{"status": "failed"}"#,
+    );
+    let r = submit(4);
+    assert_eq!(r.status, 429);
+    let msg = json_of(&r)["error"]["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        msg.contains("evals_per_day") && msg.contains("2026-10-04T00:00:00Z"),
+        "{msg}"
+    );
+    // A day later the window has moved on.
+    t.mock.now.set(NOW + 86_400);
+    let alice = issue_session(SESSION_KEY.as_bytes(), 42, "octocat", NOW + 86_400);
+    let admin = issue_session(SESSION_KEY.as_bytes(), 1, "admin", NOW + 86_400);
+    assert_eq!(item(&q(&alice), "evals_per_day")["used"], 0);
+
+    // Uploads: count and bytes; a retry of one's own upload is not counted.
+    set(
+        &admin,
+        42,
+        r#"{"uploads_per_day": 1, "upload_bytes_per_day": 100000}"#,
+    );
+    let body = sealed(b"one");
+    assert_eq!(upload_as(&t, &alice, &body).status, 201);
+    assert_eq!(upload_as(&t, &alice, &body).status, 200);
+    let r = upload_as(&t, &alice, &sealed(b"two"));
+    assert_eq!(r.status, 429);
+    assert!(
+        json_of(&r)["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("uploads_per_day")
+    );
+    set(&admin, 42, r#"{"upload_bytes_per_day": 10}"#);
+    let r = upload_as(&t, &alice, &sealed(b"three"));
+    assert!(
+        json_of(&r)["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("upload_bytes_per_day")
+    );
+    // Exempt; and an admin can be made subject to quotas.
+    set(
+        &admin,
+        42,
+        r#"{"upload_bytes_per_day": 10, "exempt": true}"#,
+    );
+    assert_eq!(upload_as(&t, &alice, &sealed(b"four")).status, 201);
+    set(&admin, 1, r#"{"plugins_per_day": 0, "exempt": false}"#);
+    let v = json_of(&t.as_user("GET", "/admin/quotas/1", &admin, b""));
+    assert_eq!(
+        (
+            v["exempt"].as_bool(),
+            v["override"]["plugins_per_day"].as_u64()
+        ),
+        (Some(false), Some(0))
+    );
+    let auth = format!("Bearer {admin}");
+    let r = t.call(
+        "POST",
+        "/uploads",
+        &[("Authorization", &auth), ("X-Upload-Kind", "plugin")],
+        &sealed(b"plugin"),
+    );
+    let hash = json_of(&r)["hash"].as_str().unwrap().to_string();
+    let r = t.as_user(
+        "POST",
+        "/plugins",
+        &admin,
+        &serde_json::to_vec(&json!({"upload_hash": hash})).unwrap(),
+    );
+    assert_eq!(r.status, 429);
+    assert!(
+        json_of(&r)["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("plugins_per_day")
+    );
+    // `{}` removes the override.
+    assert_eq!(set(&admin, 1, "{}").status, 200);
+    assert_eq!(
+        t.mock
+            .count("SELECT COUNT(*) FROM quotas WHERE github_id = 1"),
+        0
+    );
+}
+
+#[test]
+fn sweep_fails_stuck_records() {
+    let t = T::new();
+    let alice = token(42, "octocat");
+    let cron = || block_on(crucible_worker::app::scheduled(&t.mock, Some(&t.cfg)));
+    let up = |kind: &str, body: &[u8]| {
+        let auth = format!("Bearer {alice}");
+        let r = t.call(
+            "POST",
+            "/uploads",
+            &[("Authorization", &auth), ("X-Upload-Kind", kind)],
+            body,
+        );
+        json_of(&r)["hash"].as_str().unwrap().to_string()
+    };
+    let reg = |path: &str, hash: &str| {
+        let r = t.as_user(
+            "POST",
+            path,
+            &alice,
+            &serde_json::to_vec(&json!({"upload_hash": hash})).unwrap(),
+        );
+        json_of(&r)["id"].as_str().unwrap().to_string()
+    };
+    let ts = reg("/tasksets", &up("taskset", &sealed(b"ts")));
+    let pl = reg("/plugins", &up("plugin", &sealed(b"pl")));
+    submit_app(&t, &alice); // EID, its run stays queued
+    // Within the limits nothing changes.
+    t.mock.now.set(NOW + 3600);
+    cron();
+    assert_eq!(
+        t.mock
+            .count("SELECT COUNT(*) FROM user_plugins WHERE status = 'building'"),
+        1
+    );
+    // Past 2 h: both registrations fail with a reason.
+    t.mock.now.set(NOW + 2 * 3600 + 1);
+    cron();
+    let v = json_of(&t.as_user("GET", &format!("/plugins/{pl}"), &alice, b""));
+    assert_eq!(v["status"], "failed");
+    assert!(v["error"].as_str().unwrap().contains("building timed out"));
+    let v = json_of(&t.as_user("GET", &format!("/tasksets/{ts}"), &alice, b""));
+    assert_eq!(v["status"], "failed");
+    assert!(v["error"].as_str().unwrap().contains("packing timed out"));
+    // The eval has a run (queued on GitHub): kept until the absolute limit.
+    let detail = || json_of(&t.as_user("GET", &format!("/evals/{EID}"), &alice, b""));
+    assert_eq!(detail()["status"], "queued");
+    t.mock.now.set(NOW + 30 * 3600 + 1);
+    cron();
+    let alice = issue_session(SESSION_KEY.as_bytes(), 42, "octocat", NOW + 30 * 3600);
+    let d = json_of(&t.as_user("GET", &format!("/evals/{EID}"), &alice, b""));
+    assert_eq!(d["status"], "failed");
+    assert!(
+        d["error"].as_str().unwrap().contains("no result 30 h"),
+        "{d}"
+    );
+}
+
+#[test]
+fn sweep_settles_finished_runs() {
+    let t = T::new();
+    let alice = token(42, "octocat");
+    submit_app(&t, &alice);
+    t.mock.gh.borrow_mut().runs[0].2 = "completed".into();
+    t.mock.gh.borrow_mut().runs[0].3 = Some("failure".into());
+    t.mock.now.set(NOW + 3601);
+    block_on(crucible_worker::app::scheduled(&t.mock, Some(&t.cfg)));
+    assert_eq!(
+        t.mock.count(&format!(
+            "SELECT COUNT(*) FROM evals WHERE eval_id = '{EID}' AND status = 'failed'"
+        )),
+        1
     );
 }

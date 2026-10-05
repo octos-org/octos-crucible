@@ -1,3 +1,4 @@
+import { QuotaNote } from "./QuotaNote";
 import { useState } from "preact/hooks";
 import { api, getToken } from "../api";
 import { submitPlugin } from "../submit";
@@ -219,6 +220,7 @@ function UploadPlugin({ onDone }: { onDone: () => void }) {
   return (
     <Card title="上传打分器插件">
       <form class="stack" onSubmit={submit}>
+        <QuotaNote names={["plugins_per_day", "uploads_per_day"]} />
         <p class="muted small">
           zip，根目录（或唯一的顶层文件夹）放 <code>plugin.json</code>（名字、类型 <code>scorer</code>、版本、<code>runs_taskset_code</code>、<code>model</code>、
           <code>accepts</code>）和 <code>Dockerfile</code>。镜像的入口会收到 <code>--artifact /in/artifact --tests /in/tests --out /out/result.json</code>{" "}

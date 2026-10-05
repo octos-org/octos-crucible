@@ -20,6 +20,7 @@ use crate::model::{
     TS_PACKING, TS_READY, UploadKind, UserPluginRecord, UserTaskset, parse_pack_result,
     parse_plugin_result,
 };
+use crate::quota::{self, Quota};
 use crate::session;
 use crate::shard::{release_tag, sha256_hex};
 use crate::store::{Claim, Db};
@@ -82,7 +83,7 @@ fn cors(cfg: &Config, req: &Req, resp: &mut Resp) {
     if req.method == "OPTIONS" {
         h.push((
             "access-control-allow-methods".into(),
-            "GET, POST, DELETE, OPTIONS".into(),
+            "GET, POST, PUT, DELETE, OPTIONS".into(),
         ));
         h.push((
             "access-control-allow-headers".into(),
@@ -178,12 +179,16 @@ impl<'a, B: Backend> App<'a, B> {
             ("POST", ["tokens"]) => self.create_token(req).await,
             ("GET", ["tokens"]) => self.list_tokens(req).await,
             ("DELETE", ["tokens", id]) => self.delete_token(req, id).await,
+            ("GET", ["quota"]) => self.get_quota(req).await,
+            ("GET", ["admin", "quotas", gid]) => self.admin_get_quota(req, gid).await,
+            ("PUT", ["admin", "quotas", gid]) => self.admin_set_quota(req, gid).await,
             ("POST", ["admin", "ban"]) => self.ban(req, true).await,
             ("POST", ["admin", "unban"]) => self.ban(req, false).await,
             (
                 _,
                 ["auth", ..]
                 | ["me"]
+                | ["quota"]
                 | ["pubkey"]
                 | ["tasksets"]
                 | ["plugins", ..]
@@ -227,6 +232,30 @@ impl<'a, B: Backend> App<'a, B> {
             .is_banned(github_id)
             .await
             .map_err(|e| self.storage_err(e))
+    }
+
+    /// A user's limits and usage now.
+    async fn quota_of(&self, github_id: u64) -> Result<Quota> {
+        let db = self.db();
+        let o = db
+            .quota_override(github_id)
+            .await
+            .map_err(|e| self.storage_err(e))?;
+        let usage = db
+            .usage(github_id, self.b.now_s())
+            .await
+            .map_err(|e| self.storage_err(e))?;
+        Ok(Quota::new(
+            &self.cfg.quota,
+            o.as_ref(),
+            self.cfg.is_admin(github_id),
+            usage,
+        ))
+    }
+
+    /// Refuse (429) when adding `n` of `item` would exceed the caller's quota.
+    async fn check_quota(&self, p: &Principal, item: quota::Item, n: u64) -> Result<()> {
+        self.quota_of(p.github_id).await?.check(item, n)
     }
 
     async fn load_record(&self, id: &str) -> Result<EvalRecord> {
@@ -597,6 +626,7 @@ impl<'a, B: Backend> App<'a, B> {
                 upload.kind.as_str()
             )));
         }
+        self.check_quota(&p, quota::Item::TasksetsPerDay, 1).await?;
         let id = format!("u-{}", hex::encode(self.b.random_bytes(8)));
         let now = rfc3339(self.b.now_s());
         let mut u = UserTaskset {
@@ -824,6 +854,7 @@ impl<'a, B: Backend> App<'a, B> {
                 upload.kind.as_str()
             )));
         }
+        self.check_quota(&p, quota::Item::PluginsPerDay, 1).await?;
         let id = format!("u-{}", hex::encode(self.b.random_bytes(8)));
         let now = rfc3339(self.b.now_s());
         let mut u = UserPluginRecord {
@@ -1085,6 +1116,18 @@ impl<'a, B: Backend> App<'a, B> {
             }
         }
         let hash = sha256_hex(&req.body);
+        // A retry of the caller's own earlier upload is not a new one.
+        let own_retry = self
+            .db()
+            .upload(&hash)
+            .await
+            .map_err(|e| self.storage_err(e))?
+            .is_some_and(|u| u.owner_id == p.github_id);
+        if !own_retry {
+            let q = self.quota_of(p.github_id).await?;
+            q.check(quota::Item::UploadsPerDay, 1)?;
+            q.check(quota::Item::UploadBytesPerDay, req.body.len() as u64)?;
+        }
         let tag = release_tag(&hash).expect("sha256 hex");
         let gh = self.gh();
         let release = gh.release(&tag).await?;
@@ -1151,6 +1194,11 @@ impl<'a, B: Backend> App<'a, B> {
         let v: ValidEval = EvalRequest::parse(&req.body)?.validate(&keys::current().key_id)?;
 
         let upload = self.own_upload(&p, &v.upload_hash).await?;
+        {
+            let q = self.quota_of(p.github_id).await?;
+            q.check(quota::Item::EvalsRunning, 1)?;
+            q.check(quota::Item::EvalsPerDay, 1)?;
+        }
         if upload.kind != UploadKind::from(v.mode) {
             return Err(ApiError::bad_request(format!(
                 "upload_hash was uploaded as {}, not {}",
@@ -1230,6 +1278,7 @@ impl<'a, B: Backend> App<'a, B> {
             manifest: None,
             download_sha256: None,
             updated_at: rfc3339(now),
+            error: None,
         };
         // The primary key claims the eval id.
         if !self
@@ -1322,6 +1371,9 @@ impl<'a, B: Backend> App<'a, B> {
         let o = out.as_object_mut().expect("object");
         if let Some(u) = &rec.run_url {
             o.insert("run_url".into(), json!(u));
+        }
+        if let Some(e) = &rec.error {
+            o.insert("error".into(), json!(e));
         }
         if let Some(m) = &rec.manifest {
             o.insert("manifest".into(), m.clone());
@@ -1658,6 +1710,124 @@ impl<'a, B: Backend> App<'a, B> {
         Ok(Resp::empty(204))
     }
 
+    // ---- quotas ---------------------------------------------------------
+
+    /// `GET /quota`: the caller's limits, usage and what is left.
+    async fn get_quota(&self, req: &Req) -> Result<Resp> {
+        let p = self.principal(req).await?;
+        let mut v = self.quota_of(p.github_id).await?.view();
+        v["github_id"] = json!(p.github_id);
+        Ok(Resp::json(200, &v))
+    }
+
+    fn quota_target(&self, gid: &str) -> Result<u64> {
+        gid.parse::<u64>()
+            .ok()
+            .filter(|g| *g > 0)
+            .ok_or_else(|| ApiError::bad_request("github_id must be a positive integer"))
+    }
+
+    /// `GET /admin/quotas/:github_id`: a user's quota and override row.
+    async fn admin_get_quota(&self, req: &Req, gid: &str) -> Result<Resp> {
+        let p = self.principal(req).await?;
+        authz::require_admin(&p)?;
+        let gid = self.quota_target(gid)?;
+        let o = self
+            .db()
+            .quota_override(gid)
+            .await
+            .map_err(|e| self.storage_err(e))?;
+        let mut v = self.quota_of(gid).await?.view();
+        v["github_id"] = json!(gid);
+        v["override"] = json!(o.unwrap_or_default());
+        Ok(Resp::json(200, &v))
+    }
+
+    /// `PUT /admin/quotas/:github_id {<item>?: n|null, "exempt"?: bool|null}`:
+    /// replaces the user's override (missing or null: the default; `{}`
+    /// removes it).
+    async fn admin_set_quota(&self, req: &Req, gid: &str) -> Result<Resp> {
+        let p = self.principal(req).await?;
+        authz::require_admin(&p)?;
+        let gid = self.quota_target(gid)?;
+        if req.body.len() > 4096 {
+            return Err(ApiError::too_large(4096));
+        }
+        let o: quota::Override = serde_json::from_slice(&req.body)
+            .map_err(|e| ApiError::bad_request(format!("invalid request body: {e}")))?;
+        self.db()
+            .set_quota_override(gid, &o, p.github_id, &rfc3339(self.b.now_s()))
+            .await
+            .map_err(|e| self.storage_err(e))?;
+        self.b
+            .log(&format!("admin {} set the quota of {gid}", p.github_id));
+        let mut v = self.quota_of(gid).await?.view();
+        v["github_id"] = json!(gid);
+        v["override"] = json!(o);
+        Ok(Resp::json(200, &v))
+    }
+
+    // ---- the sweep ------------------------------------------------------
+
+    /// Evals refreshed per sweep (each costs up to two GitHub calls; a cron
+    /// invocation has a subrequest budget).
+    const SWEEP_EVALS: usize = 15;
+
+    /// Hourly: fail registrations stuck in packing/building, settle evals
+    /// whose run is over, and fail evals that never got a run or ran past
+    /// the limit, each with the reason.
+    async fn sweep(&self) {
+        let now = self.b.now_s();
+        match self
+            .db()
+            .fail_stuck_registrations(now, self.cfg.stuck_registration_s)
+            .await
+        {
+            Ok(0) => {}
+            Ok(n) => self.b.log(&format!("cron: failed {n} stuck registrations")),
+            Err(e) => self.b.log(&format!("cron: registrations: {e}")),
+        }
+        // Not updated for an hour: ask GitHub (refresh settles a finished run).
+        let before = rfc3339(now.saturating_sub(3600));
+        let evals = match self.db().unsettled_evals(&before, Self::SWEEP_EVALS).await {
+            Ok(v) => v,
+            Err(e) => return self.b.log(&format!("cron: evals: {e}")),
+        };
+        for mut rec in evals {
+            self.refresh(&mut rec).await;
+            if is_terminal(&rec.status) {
+                continue;
+            }
+            let age = now.saturating_sub(rec.created_s);
+            let reason = if rec.run_id.is_none() && age >= self.cfg.stuck_registration_s {
+                Some(format!(
+                    "the workflow run never started (no GitHub run found within {} h); please submit again / 评测流程未启动（{} 小时内没有找到运行），请重新提交",
+                    self.cfg.stuck_registration_s / 3600,
+                    self.cfg.stuck_registration_s / 3600
+                ))
+            } else if age >= self.cfg.stuck_eval_s {
+                Some(format!(
+                    "no result {} h after submission (the run is stuck or its results were lost); please submit again / 提交 {} 小时后仍无结果（运行卡住或结果丢失），请重新提交",
+                    self.cfg.stuck_eval_s / 3600,
+                    self.cfg.stuck_eval_s / 3600
+                ))
+            } else {
+                None
+            };
+            if let Some(r) = reason {
+                match self.db().fail_eval(&rec.eval_id, &r, &rfc3339(now)).await {
+                    Ok(true) => {
+                        self.b
+                            .log(&format!("cron: failed stuck eval {}", rec.eval_id));
+                        self.drop_cred(&rec.eval_id).await;
+                    }
+                    Ok(false) => {}
+                    Err(e) => self.b.log(&format!("cron: eval {}: {e}", rec.eval_id)),
+                }
+            }
+        }
+    }
+
     // ---- admin ----------------------------------------------------------
 
     async fn ban(&self, req: &Req, ban: bool) -> Result<Resp> {
@@ -1707,10 +1877,14 @@ impl<'a, B: Backend> App<'a, B> {
 }
 
 /// Cron Trigger (wrangler.toml `[triggers]`): deletes expired credentials
-/// and cache entries.
-pub async fn scheduled<B: Backend>(b: &B) {
+/// and cache entries; with a configuration also fails stuck registrations
+/// and evals (see `App::sweep`).
+pub async fn scheduled<B: Backend>(b: &B, cfg: Option<&Config>) {
     match Db(b).purge_expired(b.now_s()).await {
         Ok(n) => b.log(&format!("cron: purged {n} expired rows")),
         Err(e) => b.log(&format!("cron: purge failed: {e}")),
+    }
+    if let Some(cfg) = cfg {
+        App { b, cfg }.sweep().await;
     }
 }
